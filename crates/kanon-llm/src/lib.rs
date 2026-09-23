@@ -33,7 +33,7 @@ pub use gateway::{
     Role, TokenUsage, ToolCall, ToolDefinition,
 };
 pub use memory::{ConversationManager, Memory, SessionMemory, SlidingWindowMemory};
-pub use sqlite_memory::SqliteMemory;
+pub use sqlite_memory::{PersistentMemory, SqliteMemory};
 pub use summary::{ContextSummarizer, SummaryConfig, SummaryHook};
 pub use token::{
     estimate_conversation_tokens, estimate_message_tokens, estimate_text_tokens, estimate_tokens,

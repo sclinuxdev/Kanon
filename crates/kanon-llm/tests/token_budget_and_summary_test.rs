@@ -197,3 +197,48 @@ async fn test_summary_hook_with_agent_integration() {
         .unwrap_or(false)));
 }
 
+#[tokio::test]
+async fn test_agent_builder_summary_config_fluent_api() {
+    let memory: Arc<dyn Memory> = Arc::new(SlidingWindowMemory::new(50));
+    let provider = Arc::new(MockSummarizingProvider);
+
+    let session_id = "fluent_summary_session";
+    memory
+        .set_system_prompt(session_id, "Tutor".to_string())
+        .await;
+
+    for i in 1..=6 {
+        memory
+            .push_message(session_id, ChatMessage::user(format!("Question {i}")))
+            .await;
+    }
+
+    // Use fluent .summary_config(...) directly on AgentBuilder
+    let agent = Agent::builder("fluent_summary_agent", provider)
+        .system_prompt("Tutor")
+        .memory(memory.clone())
+        .summary_config(SummaryConfig {
+            enabled: true,
+            trigger_token_budget: 40,
+            preserve_recent_messages: 2,
+            summary_model: None,
+            custom_instruction: None,
+        })
+        .build();
+
+    let output = agent
+        .run_standalone(session_id, "What about question 7?")
+        .await
+        .expect("Agent execution failed");
+
+    assert_eq!(output.content, "Final assistant answer.");
+
+    let msgs = memory.get_messages(session_id).await;
+    assert!(msgs.iter().any(|m| m
+        .content
+        .as_deref()
+        .map(|c| c.contains("Context Summary of Previous Conversation"))
+        .unwrap_or(false)));
+}
+
+

@@ -1,6 +1,8 @@
-//! Kanon Storage Module (Skeleton)
+//! Kanon Storage Module.
 //!
-//! Provides embedded KV persistence and per-plugin isolated data directories.
+//! Provides embedded persistence and per-plugin isolated data directories.
 
-pub mod kv;
 pub mod dir;
+pub mod kv;
+
+pub use dir::PluginDataDir;

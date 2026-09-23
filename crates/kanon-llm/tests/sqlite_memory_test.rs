@@ -207,3 +207,72 @@ async fn test_sqlite_memory_clear_and_session_count() {
     assert!(memory.get_messages("s1").await.is_empty());
     assert_eq!(memory.get_messages("s2").await.len(), 1);
 }
+
+#[tokio::test]
+async fn test_sqlite_memory_lru_cache_eviction_and_reload() {
+    let dir = tempdir().expect("Failed to create temporary directory");
+    let db_path = dir.path().join("lru_test.db");
+
+    // Configure memory with capacity for only 2 cached sessions in RAM
+    let memory = SqliteMemory::open(&db_path, 10)
+        .expect("Failed to open SQLite database")
+        .with_cache_capacity(2);
+
+    assert_eq!(memory.cache_capacity(), 2);
+
+    // Populate session 1
+    memory.set_system_prompt("s1", "Prompt 1".to_string()).await;
+    memory.push_message("s1", ChatMessage::user("Hello from 1")).await;
+
+    // Populate session 2
+    memory.set_system_prompt("s2", "Prompt 2".to_string()).await;
+    memory.push_message("s2", ChatMessage::user("Hello from 2")).await;
+
+    // Populate session 3 (this triggers LRU eviction of the least recently used session, s1)
+    memory.set_system_prompt("s3", "Prompt 3".to_string()).await;
+    memory.push_message("s3", ChatMessage::user("Hello from 3")).await;
+
+    // Total sessions tracked in SQLite is 3
+    assert_eq!(memory.session_count().await, 3);
+
+    // Now query s1: It was evicted from RAM cache, but should be transparently
+    // reloaded from SQLite back into cache
+    let s1_msgs = memory.get_messages("s1").await;
+    assert_eq!(s1_msgs.len(), 2);
+    assert_eq!(s1_msgs[0].role, Role::System);
+    assert_eq!(s1_msgs[0].content.as_deref(), Some("Prompt 1"));
+    assert_eq!(s1_msgs[1].content.as_deref(), Some("Hello from 1"));
+
+    // Query s3: Should also still be valid
+    let s3_msgs = memory.get_messages("s3").await;
+    assert_eq!(s3_msgs.len(), 2);
+    assert_eq!(s3_msgs[1].content.as_deref(), Some("Hello from 3"));
+}
+
+#[tokio::test]
+async fn test_sqlite_memory_open_in_dir_and_commit_points() {
+    use kanon_llm::PersistentMemory;
+
+    let dir = tempdir().expect("Failed to create temporary directory");
+    let nested_dir = dir.path().join("isolated_plugin_dir");
+
+    // Test PersistentMemory alias and open_in_dir
+    let memory: PersistentMemory = PersistentMemory::open_in_dir(&nested_dir, "plugin_memory.db", 10)
+        .expect("Failed to open SQLite database in dir");
+
+    assert!(nested_dir.exists(), "Directory should have been automatically created");
+    assert!(nested_dir.join("plugin_memory.db").exists(), "DB file should exist");
+
+    memory.set_system_prompt("commit_sess", "Persistent Persona".to_string()).await;
+    memory.push_message("commit_sess", ChatMessage::user("Testing commit")).await;
+
+    // Test commit point and session commit
+    memory.commit_point().await.expect("WAL checkpoint commit failed");
+    memory.flush().await.expect("Flush failed");
+    memory.commit_session("commit_sess").await.expect("Session commit failed");
+
+    let msgs = memory.get_messages("commit_sess").await;
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[1].content.as_deref(), Some("Testing commit"));
+}
+

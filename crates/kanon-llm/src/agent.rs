@@ -22,11 +22,12 @@ use kanon_proto::v1::{
 
 use crate::error::AgentError;
 use crate::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role, ToolCall, ToolDefinition};
-use crate::gateway::LlmProvider;
+use crate::gateway::{ChatChunk, ChatChunkStream, LlmProvider};
 use crate::memory::{Memory, SlidingWindowMemory};
 use crate::tool_router::{
     aggregate_tools, json_to_prost_struct, prost_struct_to_json, ExecutedToolCall, ToolHost,
 };
+use tokio_stream::StreamExt;
 
 /// Configuration parameters for agent reasoning and execution.
 #[derive(Debug, Clone)]
@@ -538,6 +539,244 @@ impl Agent {
             }
         }
     }
+
+    /// Executes the agent reasoning loop in standalone streaming mode, returning incremental chunks
+    /// for the assistant's final response.
+    ///
+    /// If tool execution turns are required, they are executed internally before streaming
+    /// the final text response. Upon stream completion, the full assistant message is
+    /// committed into session memory.
+    pub async fn run_standalone_stream(
+        &self,
+        session_id: &str,
+        user_input: &str,
+    ) -> Result<ChatChunkStream, AgentError> {
+        let empty_hosts: [Arc<NoopHost>; 0] = [];
+        self.run_stream(session_id, user_input, &empty_hosts).await
+    }
+
+    /// Executes the agent reasoning loop with tool resolution, streaming the final assistant response.
+    pub async fn run_stream<H: ToolHost>(
+        &self,
+        session_id: &str,
+        user_input: &str,
+        hosts: &[Arc<H>],
+    ) -> Result<ChatChunkStream, AgentError> {
+        // 1. Ensure system prompt is established
+        if let Some(ref prompt) = self.system_prompt
+            && self.memory.get_system_prompt(session_id).await.is_none()
+        {
+            self.memory.set_system_prompt(session_id, prompt.clone()).await;
+        }
+
+        // 2. Push user message to memory
+        self.memory
+            .push_message(session_id, ChatMessage::user(user_input))
+            .await;
+
+        // 3. Dynamically aggregate tools
+        let mut tools = Vec::with_capacity(self.tools.len());
+        for t in &self.tools {
+            tools.push(t.definition());
+        }
+        tools.extend(aggregate_tools(hosts));
+
+        let mut iterations = 0;
+
+        // If tools are available, execute intermediate tool turns first
+        while !tools.is_empty() && iterations < self.config.max_iterations {
+            let messages = self.memory.get_messages(session_id).await;
+            let mut request = ChatRequest {
+                model: self.config.default_model.clone(),
+                messages,
+                tools: tools.clone(),
+                temperature: self.config.temperature,
+                max_tokens: self.config.max_tokens,
+            };
+
+            for hook in &self.hooks {
+                hook.on_llm_request(session_id, &mut request).await?;
+            }
+
+            let mut response = self.provider.chat(&request).await?;
+
+            for hook in &self.hooks {
+                hook.on_llm_response(session_id, &mut response).await?;
+            }
+
+            // If no tools were called, this is the final response
+            if response.tool_calls.is_empty() {
+                let final_content = response.content.unwrap_or_default();
+                if !final_content.is_empty() {
+                    self.memory
+                        .push_message(session_id, ChatMessage::assistant(&final_content))
+                        .await;
+                }
+                let (tx, rx) = tokio::sync::mpsc::channel(2);
+                let _ = tx.send(Ok(ChatChunk::delta(&final_content))).await;
+                let _ = tx.send(Ok(ChatChunk::done(response.finish_reason))).await;
+                return Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)));
+            }
+
+            // Otherwise, execute tools
+            iterations += 1;
+            self.memory
+                .push_message(
+                    session_id,
+                    ChatMessage {
+                        role: Role::Assistant,
+                        content: response.content.clone(),
+                        tool_calls: Some(response.tool_calls.clone()),
+                        tool_call_id: None,
+                        name: None,
+                    },
+                )
+                .await;
+
+            for call in response.tool_calls {
+                let mut permitted = true;
+                for hook in &self.hooks {
+                    if !hook.on_before_tool_call(session_id, &call).await? {
+                        permitted = false;
+                        break;
+                    }
+                }
+                if !permitted {
+                    let veto_msg = format!("Tool '{}' execution was denied by agent policy", call.name);
+                    self.memory
+                        .push_message(session_id, ChatMessage::tool_response(&call.id, &veto_msg))
+                        .await;
+                    continue;
+                }
+
+                if let Some(native_tool) = self.tools.iter().find(|t| t.definition().name == call.name) {
+                    let (result_str, is_success) = match native_tool.call(session_id, call.arguments.clone()).await {
+                        Ok(res) => (res, true),
+                        Err(err) => (format!("Error: {err}"), false),
+                    };
+                    for hook in &self.hooks {
+                        hook.on_after_tool_call(session_id, &call, &result_str, is_success).await?;
+                    }
+                    self.memory
+                        .push_message(session_id, ChatMessage::tool_response(&call.id, &result_str))
+                        .await;
+                    continue;
+                }
+
+                let target = find_tool_target(&call.name, hosts);
+                let (target_host, plugin_id) = match target {
+                    Some((h, pid)) => (h, pid),
+                    None => {
+                        let err_msg = format!("Tool '{}' not registered", call.name);
+                        self.memory
+                            .push_message(session_id, ChatMessage::tool_response(&call.id, &err_msg))
+                            .await;
+                        continue;
+                    }
+                };
+
+                let structured_args = match &call.arguments {
+                    serde_json::Value::Object(_) => json_to_prost_struct(&call.arguments),
+                    _ => None,
+                };
+                let tool_req = ToolCallRequest {
+                    call_id: call.id.clone(),
+                    tool_name: call.name.clone(),
+                    session_id: session_id.to_string(),
+                    payload: structured_args.map(tool_call_request::Payload::StructuredArgs),
+                };
+
+                tracing::debug!(
+                    agent = %self.name,
+                    tool = %call.name,
+                    host_id = %target_host.host_id(),
+                    plugin_id = %plugin_id,
+                    "Agent stream dispatching tool RPC to host"
+                );
+
+                match target_host.call_tool(tool_req).await {
+                    Ok(resp) => {
+                        let is_success = resp.success;
+                        let result_str = if !is_success {
+                            format!("Error: {}", resp.error_message)
+                        } else {
+                            match resp.payload {
+                                Some(tool_call_response::Payload::StructuredResult(s)) => {
+                                    prost_struct_to_json(s).to_string()
+                                }
+                                Some(tool_call_response::Payload::RawBytes(bytes)) => {
+                                    String::from_utf8_lossy(&bytes).to_string()
+                                }
+                                None => "{}".to_string(),
+                            }
+                        };
+                        for hook in &self.hooks {
+                            hook.on_after_tool_call(session_id, &call, &result_str, is_success).await?;
+                        }
+                        self.memory
+                            .push_message(session_id, ChatMessage::tool_response(&call.id, result_str))
+                            .await;
+                    }
+                    Err(st) => {
+                        let err_msg = format!("Tool RPC failed: {st}");
+                        self.memory
+                            .push_message(session_id, ChatMessage::tool_response(&call.id, &err_msg))
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // Final streaming generation turn (pure assistant reply)
+        let messages = self.memory.get_messages(session_id).await;
+        let mut request = ChatRequest {
+            model: self.config.default_model.clone(),
+            messages,
+            tools: Vec::new(),
+            temperature: self.config.temperature,
+            max_tokens: self.config.max_tokens,
+        };
+
+        for hook in &self.hooks {
+            hook.on_llm_request(session_id, &mut request).await?;
+        }
+
+        let inner_stream = self.provider.chat_stream(&request).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let memory = self.memory.clone();
+        let sid = session_id.to_string();
+
+        tokio::spawn(async move {
+            let mut inner = inner_stream;
+            let mut accumulated = String::new();
+
+            while let Some(chunk_res) = inner.next().await {
+                match chunk_res {
+                    Ok(chunk) => {
+                        accumulated.push_str(&chunk.delta_text);
+                        let is_fin = chunk.is_finished;
+                        let _ = tx.send(Ok(chunk)).await;
+                        if is_fin {
+                            if !accumulated.is_empty() {
+                                memory.push_message(&sid, ChatMessage::assistant(&accumulated)).await;
+                            }
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
+
+            if !accumulated.is_empty() {
+                memory.push_message(&sid, ChatMessage::assistant(&accumulated)).await;
+            }
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
 }
 
 /// Helper locating the owning host and plugin ID for a tool name.
@@ -563,6 +802,7 @@ pub struct AgentBuilder {
     tools: Vec<Arc<dyn AgentTool>>,
     hooks: Vec<Arc<dyn AgentHook>>,
     config: AgentConfig,
+    summary_config: Option<crate::summary::SummaryConfig>,
 }
 
 impl AgentBuilder {
@@ -576,6 +816,7 @@ impl AgentBuilder {
             tools: Vec::new(),
             hooks: Vec::new(),
             config: AgentConfig::default(),
+            summary_config: None,
         }
     }
 
@@ -645,11 +886,28 @@ impl AgentBuilder {
         self
     }
 
+    /// Configures automatic long-context summary compression for this agent.
+    pub fn summary_config(mut self, config: crate::summary::SummaryConfig) -> Self {
+        self.summary_config = Some(config);
+        self
+    }
+
     /// Builds the configured [`Agent`].
-    pub fn build(self) -> Agent {
+    pub fn build(mut self) -> Agent {
         let memory = self
             .memory
             .unwrap_or_else(|| Arc::new(SlidingWindowMemory::default()));
+
+        if let Some(summary_cfg) = self.summary_config
+            && summary_cfg.enabled
+        {
+            let summarizer = Arc::new(crate::summary::ContextSummarizer::new(
+                summary_cfg,
+                self.provider.clone(),
+                memory.clone(),
+            ));
+            self.hooks.push(Arc::new(crate::summary::SummaryHook::new(summarizer)));
+        }
 
         Agent {
             name: self.name,

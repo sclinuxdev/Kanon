@@ -192,12 +192,36 @@ impl BotApiService for CoreApiService {
             }
         };
 
+        let mut messages = Vec::new();
+        let mut temperature = None;
+        let mut max_tokens = None;
+
+        if let Some(ref params) = req.parameters {
+            if let Some(kanon_proto::prost_types::value::Kind::StringValue(s)) =
+                params.fields.get("system_prompt").and_then(|v| v.kind.as_ref())
+            {
+                messages.push(ChatMessage::system(s));
+            }
+            if let Some(kanon_proto::prost_types::value::Kind::NumberValue(n)) =
+                params.fields.get("temperature").and_then(|v| v.kind.as_ref())
+            {
+                temperature = Some(*n as f32);
+            }
+            if let Some(kanon_proto::prost_types::value::Kind::NumberValue(n)) =
+                params.fields.get("max_tokens").and_then(|v| v.kind.as_ref())
+            {
+                max_tokens = Some(*n as u32);
+            }
+        }
+
+        messages.push(ChatMessage::user(req.prompt));
+
         let chat_req = ChatRequest {
             model: req.model,
-            messages: vec![ChatMessage::user(req.prompt)],
+            messages,
             tools: Vec::new(),
-            temperature: None,
-            max_tokens: None,
+            temperature,
+            max_tokens,
         };
 
         let stream = gateway.chat_stream(&chat_req).await.map_err(|e| {

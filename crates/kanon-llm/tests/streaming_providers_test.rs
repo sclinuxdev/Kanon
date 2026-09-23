@@ -169,3 +169,77 @@ async fn test_anthropic_messages_streaming_sse() {
     assert!(finished);
     assert_eq!(accumulated, "Claude streaming");
 }
+
+#[tokio::test]
+async fn test_agent_run_standalone_stream() {
+    use std::sync::Arc;
+    use async_trait::async_trait;
+    use kanon_llm::agent::Agent;
+    use kanon_llm::error::GatewayError;
+    use kanon_llm::gateway::types::{ChatChunk, ChatResponse};
+    use kanon_llm::gateway::ChatChunkStream;
+    use kanon_llm::memory::SlidingWindowMemory;
+
+    struct MockAgentStreamProvider;
+
+    #[async_trait]
+    impl LlmProvider for MockAgentStreamProvider {
+        async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, GatewayError> {
+            Ok(ChatResponse {
+                content: Some("Full content".to_string()),
+                tool_calls: vec![],
+                finish_reason: Some("stop".to_string()),
+                usage: None,
+            })
+        }
+
+        async fn chat_stream(&self, _request: &ChatRequest) -> Result<ChatChunkStream, GatewayError> {
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            tokio::spawn(async move {
+                let _ = tx.send(Ok(ChatChunk::delta("Token 1, "))).await;
+                let _ = tx.send(Ok(ChatChunk::delta("Token 2, "))).await;
+                let _ = tx.send(Ok(ChatChunk::delta("Token 3"))).await;
+                let _ = tx.send(Ok(ChatChunk::done(Some("stop".to_string())))).await;
+            });
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        }
+    }
+
+    let memory: Arc<dyn kanon_llm::memory::Memory> = Arc::new(SlidingWindowMemory::new(10));
+    let provider = Arc::new(MockAgentStreamProvider);
+    let agent = Agent::builder("stream_bot", provider)
+        .system_prompt("You are a streaming bot.")
+        .memory(memory.clone())
+        .build();
+
+    let session_id = "agent_stream_sess";
+    let mut stream = agent
+        .run_standalone_stream(session_id, "Tell me something")
+        .await
+        .expect("Failed to start agent stream");
+
+    let mut accumulated = String::new();
+    let mut finished = false;
+
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.expect("Error in agent chunk stream");
+        accumulated.push_str(&chunk.delta_text);
+        if chunk.is_finished {
+            finished = true;
+            assert_eq!(chunk.finish_reason.as_deref(), Some("stop"));
+        }
+    }
+
+    assert!(finished);
+    assert_eq!(accumulated, "Token 1, Token 2, Token 3");
+
+    // Verify that memory automatically committed the assistant's response upon stream finish
+    let messages = memory.get_messages(session_id).await;
+    assert_eq!(messages.len(), 3); // 1 System + 1 User + 1 Assistant
+    assert_eq!(messages[0].role, kanon_llm::gateway::types::Role::System);
+    assert_eq!(messages[1].role, kanon_llm::gateway::types::Role::User);
+    assert_eq!(messages[1].content.as_deref(), Some("Tell me something"));
+    assert_eq!(messages[2].role, kanon_llm::gateway::types::Role::Assistant);
+    assert_eq!(messages[2].content.as_deref(), Some("Token 1, Token 2, Token 3"));
+}
+

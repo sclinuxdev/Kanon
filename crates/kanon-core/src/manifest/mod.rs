@@ -37,6 +37,8 @@ pub struct PluginSection {
     pub entrypoint: String,
     /// Whether this plugin must run in a dedicated sub-process.
     pub isolated: Option<bool>,
+    /// Execution priority for pipeline scheduling (1..=1000, lower executes first, default 500).
+    pub priority: Option<i32>,
 }
 
 /// Command metadata declared under `[[commands]]` in `plugin.toml`.

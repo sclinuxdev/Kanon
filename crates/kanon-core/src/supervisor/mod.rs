@@ -70,6 +70,29 @@ pub struct ManagedHost {
     pipeline_client: Mutex<MessagePipelineServiceClient<Channel>>,
     /// Cached metadata obtained during initial handshake.
     pub meta: Vec<PluginMeta>,
+    /// Execution priority for pipeline scheduling (lower executes first, default 500).
+    pub priority: i32,
+}
+
+impl ManagedHost {
+    /// Creates a new `ManagedHost` with an established channel, primarily used in testing or direct registration.
+    pub fn new(
+        host_id: String,
+        socket_path: PathBuf,
+        channel: Channel,
+        meta: Vec<PluginMeta>,
+        priority: i32,
+    ) -> Self {
+        Self {
+            host_id,
+            socket_path,
+            child: Mutex::new(None),
+            host_client: Mutex::new(PluginHostServiceClient::new(channel.clone())),
+            pipeline_client: Mutex::new(MessagePipelineServiceClient::new(channel)),
+            meta,
+            priority,
+        }
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -141,12 +164,25 @@ impl Supervisor {
     }
 
     /// Spawns a plugin host sub-process, waits for its IPC socket readiness,
-    /// performs the initial `GetPluginMeta` handshake, and registers it.
+    /// performs the initial `GetPluginMeta` handshake, and registers it with default priority (500).
     pub async fn spawn_plugin(
         &self,
         host_id: &str,
         executable_path: impl AsRef<Path>,
         args: &[&str],
+    ) -> Result<Arc<ManagedHost>, SupervisorError> {
+        self.spawn_plugin_with_priority(host_id, executable_path, args, 500).await
+    }
+
+    /// Spawns a plugin host sub-process with explicit execution priority,
+    /// waits for its IPC socket readiness, performs the initial `GetPluginMeta`
+    /// handshake, and registers it in the supervisor registry.
+    pub async fn spawn_plugin_with_priority(
+        &self,
+        host_id: &str,
+        executable_path: impl AsRef<Path>,
+        args: &[&str],
+        priority: i32,
     ) -> Result<Arc<ManagedHost>, SupervisorError> {
         let socket_path = host_socket_path(host_id, Some(&self.run_dir));
 
@@ -157,6 +193,7 @@ impl Supervisor {
 
         tracing::info!(
             host_id = %host_id,
+            priority = priority,
             executable = %executable_path.as_ref().display(),
             socket = %socket_path.display(),
             "Spawning plugin host process"
@@ -212,6 +249,7 @@ impl Supervisor {
             host_client: Mutex::new(host_client),
             pipeline_client: Mutex::new(pipeline_client),
             meta: plugins,
+            priority,
         });
 
         self.hosts
@@ -240,12 +278,26 @@ impl Supervisor {
             }
         };
 
-        self.spawn_plugin(&host_id, exec_path, &[]).await
+        let priority = manifest.plugin.priority.unwrap_or(500);
+        self.spawn_plugin_with_priority(&host_id, exec_path, &[], priority).await
+    }
+
+    /// Directly registers an externally created or mocked `ManagedHost` (useful for unit tests).
+    pub async fn register_managed_host(&self, host: Arc<ManagedHost>) {
+        self.hosts
+            .write()
+            .await
+            .insert(host.host_id.clone(), host);
     }
 
     /// Retrieves an active managed host by its identifier.
     pub async fn get_host(&self, host_id: &str) -> Option<Arc<ManagedHost>> {
         self.hosts.read().await.get(host_id).cloned()
+    }
+
+    /// Returns a list of all currently active managed plugin hosts.
+    pub async fn get_all_hosts(&self) -> Vec<Arc<ManagedHost>> {
+        self.hosts.read().await.values().cloned().collect()
     }
 
     /// Stops a specific managed host and cleans up its socket.

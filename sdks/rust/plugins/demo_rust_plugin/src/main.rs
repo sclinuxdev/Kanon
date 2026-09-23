@@ -38,6 +38,28 @@ impl Plugin for DemoPlugin {
         Ok(())
     }
 
+    /// Intercepts inbound events before command dispatch.
+    ///
+    /// Demonstrates pre-filter blocking if the message contains `[block]`.
+    async fn on_pre_filter(
+        &self,
+        req: PipelineEventRequest,
+    ) -> PluginResult<Option<PreFilterResult>> {
+        if req.raw_text.contains("[block]") {
+            let block_reply = MessageSegment {
+                segment: Some(Segment::Text(TextSegment {
+                    content: "Message blocked by Demo Rust Plugin pre-filter".to_string(),
+                })),
+            };
+            return Ok(Some(PreFilterResult {
+                action: pre_filter_result::Action::Block as i32,
+                modified_text: String::new(),
+                reply_messages: vec![block_reply],
+            }));
+        }
+        Ok(None)
+    }
+
     /// Handles command execution for the `/rustcalc` command.
     async fn on_execute_command(
         &self,

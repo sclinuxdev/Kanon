@@ -11,4 +11,8 @@ pub mod supervisor;
 
 pub use ipc::{CoreApiService, CoreIpcServer, HostRegistration};
 pub use manifest::PluginManifest;
+pub use pipeline::{
+    CommandRouter, MatchedCommand, PipelineEngine, PipelineResult, PreFilterChain,
+    PreFilterOutcome,
+};
 pub use supervisor::{ManagedHost, Supervisor, SupervisorError};

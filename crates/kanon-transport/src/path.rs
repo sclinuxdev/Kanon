@@ -58,15 +58,15 @@ pub fn host_socket_path(host_id: &str, base_dir: Option<&Path>) -> PathBuf {
 /// if created anew, preventing unauthorized local users from inspecting or tampering
 /// with the Unix domain sockets.
 pub fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let permissions = std::fs::Permissions::from_mode(0o700);
-                let _ = std::fs::set_permissions(parent, permissions);
-            }
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::Permissions::from_mode(0o700);
+            let _ = std::fs::set_permissions(parent, permissions);
         }
     }
     Ok(())

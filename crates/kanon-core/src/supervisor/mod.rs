@@ -17,7 +17,7 @@ use kanon_proto::v1::message_pipeline_service_client::MessagePipelineServiceClie
 use kanon_proto::v1::plugin_host_service_client::PluginHostServiceClient;
 use kanon_proto::v1::{
     CommandExecuteRequest, CommandExecuteResponse, GetPluginMetaRequest,
-    PipelineEventRequest, PluginMeta, PreFilterResult,
+    PipelineEventRequest, PluginMeta, PreFilterResult, ToolCallRequest, ToolCallResponse,
 };
 use kanon_transport::{
     connect_ipc, core_socket_path, default_run_dir, host_socket_path,
@@ -119,6 +119,34 @@ impl ManagedHost {
         let mut client = self.host_client.lock().await;
         let response = client.get_plugin_meta(GetPluginMetaRequest {}).await?;
         Ok(response.into_inner().plugins)
+    }
+
+    /// Dispatches a tool call to this host for execution via gRPC IPC.
+    pub async fn on_call_tool(
+        &self,
+        req: ToolCallRequest,
+    ) -> Result<ToolCallResponse, tonic::Status> {
+        let mut client = self.pipeline_client.lock().await;
+        let response = client.on_call_tool(req).await?;
+        Ok(response.into_inner())
+    }
+}
+
+#[tonic::async_trait]
+impl kanon_llm::tool_router::ToolHost for ManagedHost {
+    fn host_id(&self) -> &str {
+        &self.host_id
+    }
+
+    fn plugin_metas(&self) -> &[PluginMeta] {
+        &self.meta
+    }
+
+    async fn call_tool(
+        &self,
+        req: ToolCallRequest,
+    ) -> Result<ToolCallResponse, tonic::Status> {
+        self.on_call_tool(req).await
     }
 }
 

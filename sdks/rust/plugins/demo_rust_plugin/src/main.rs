@@ -25,7 +25,11 @@ impl Plugin for DemoPlugin {
                 usage: "/rustcalc <expr>".to_string(),
                 priority: 100,
             }],
-            tools: vec![],
+            tools: vec![ToolMeta {
+                name: "fast_calc".to_string(),
+                description: "High-performance mathematical calculation tool".to_string(),
+                parameters: None,
+            }],
         }
     }
 
@@ -82,6 +86,45 @@ impl Plugin for DemoPlugin {
             success: true,
             replies: vec![reply],
             error_message: String::new(),
+        })
+    }
+
+    /// Executes a registered tool call requested by the LLM state machine.
+    async fn on_call_tool(&self, req: ToolCallRequest) -> PluginResult<ToolCallResponse> {
+        if req.tool_name == "fast_calc" {
+            let mut result_fields = std::collections::BTreeMap::new();
+            result_fields.insert(
+                "result".to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::NumberValue(42.0)),
+                },
+            );
+            result_fields.insert(
+                "summary".to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(
+                        "Calculation succeeded via Rust plugin tool".to_string(),
+                    )),
+                },
+            );
+
+            return Ok(ToolCallResponse {
+                call_id: req.call_id,
+                success: true,
+                error_message: String::new(),
+                payload: Some(tool_call_response::Payload::StructuredResult(
+                    prost_types::Struct {
+                        fields: result_fields,
+                    },
+                )),
+            });
+        }
+
+        Ok(ToolCallResponse {
+            call_id: req.call_id,
+            success: false,
+            error_message: format!("Unknown tool: {}", req.tool_name),
+            payload: None,
         })
     }
 }

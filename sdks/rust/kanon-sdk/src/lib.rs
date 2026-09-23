@@ -15,4 +15,5 @@ pub mod prelude {
     pub use super::host::KanonHost;
     pub use async_trait::async_trait;
     pub use kanon_proto::v1::*;
+    pub use prost_types;
 }

@@ -51,3 +51,39 @@ impl From<tonic::Status> for ToolRouterError {
         Self::Rpc(Box::new(status))
     }
 }
+
+/// Errors arising during general agent execution and reasoning loops.
+#[derive(Debug, Error)]
+pub enum AgentError {
+    /// Failure originating from the underlying model gateway.
+    #[error("Agent LLM gateway failure: {0}")]
+    Gateway(#[from] GatewayError),
+
+    /// gRPC RPC status error returned by the plugin host.
+    #[error("Agent tool execution RPC failure: {0}")]
+    Rpc(Box<tonic::Status>),
+
+    /// Requested tool name was not declared by any active plugin.
+    #[error("Tool '{0}' is not registered on any active plugin host")]
+    ToolNotFound(String),
+
+    /// Memory backend failure.
+    #[error("Agent memory failure: {0}")]
+    Memory(String),
+}
+
+impl From<tonic::Status> for AgentError {
+    fn from(status: tonic::Status) -> Self {
+        Self::Rpc(Box::new(status))
+    }
+}
+
+impl From<ToolRouterError> for AgentError {
+    fn from(err: ToolRouterError) -> Self {
+        match err {
+            ToolRouterError::Gateway(g) => Self::Gateway(g),
+            ToolRouterError::Rpc(s) => Self::Rpc(s),
+            ToolRouterError::ToolNotFound(t) => Self::ToolNotFound(t),
+        }
+    }
+}

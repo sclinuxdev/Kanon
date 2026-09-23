@@ -9,14 +9,13 @@
 use std::sync::Arc;
 use async_trait::async_trait;
 
-use kanon_proto::v1::{
-    tool_call_request, tool_call_response, PluginMeta, ToolCallRequest, ToolCallResponse, ToolMeta,
-};
+use kanon_proto::v1::{PluginMeta, ToolCallRequest, ToolCallResponse};
 
-use crate::error::ToolRouterError;
-use crate::gateway::types::{ChatMessage, ChatRequest, Role, ToolDefinition};
+use crate::agent::Agent;
+use crate::error::{AgentError, ToolRouterError};
+use crate::gateway::types::ToolDefinition;
 use crate::gateway::LlmProvider;
-use crate::memory::ConversationManager;
+use crate::memory::Memory;
 
 /// Abstract interface for a plugin host capable of executing tool calls.
 ///
@@ -57,34 +56,6 @@ pub struct ToolRouterOutput {
     pub executed_tools: Vec<ExecutedToolCall>,
 }
 
-/// Resolved target identifying where a tool should be routed.
-struct ResolvedToolTarget<H: ToolHost> {
-    host: Arc<H>,
-    plugin_id: String,
-    #[allow(dead_code)]
-    meta: ToolMeta,
-}
-
-impl<H: ToolHost> ResolvedToolTarget<H> {
-    /// Locates the host and plugin owning the specified tool name among active hosts.
-    fn find(tool_name: &str, hosts: &[Arc<H>]) -> Option<Self> {
-        for host in hosts {
-            for plugin in host.plugin_metas() {
-                for tool in &plugin.tools {
-                    if tool.name == tool_name {
-                        return Some(Self {
-                            host: host.clone(),
-                            plugin_id: plugin.id.clone(),
-                            meta: tool.clone(),
-                        });
-                    }
-                }
-            }
-        }
-        None
-    }
-}
-
 /// Dynamically aggregates tool definitions declared across all active plugin hosts.
 ///
 /// Directly translates Protobuf Struct schemas into `serde_json::Value` in memory.
@@ -113,11 +84,10 @@ pub fn aggregate_tools<H: ToolHost>(hosts: &[Arc<H>]) -> Vec<ToolDefinition> {
 }
 
 /// Central Tool Calling state machine router and execution loop.
+///
+/// Serves as a specialized adapter around the core [`Agent`] engine for pipeline integration.
 pub struct ToolRouter {
-    gateway: Arc<dyn LlmProvider>,
-    memory: Arc<ConversationManager>,
-    default_model: String,
-    max_tool_iterations: usize,
+    agent: Agent,
 }
 
 impl ToolRouter {
@@ -125,211 +95,56 @@ impl ToolRouter {
     pub const DEFAULT_MAX_ITERATIONS: usize = 2;
 
     /// Creates a new `ToolRouter` with default maximum iterations (2 turns).
-    pub fn new(
+    pub fn new<M: Memory + 'static>(
         gateway: Arc<dyn LlmProvider>,
-        memory: Arc<ConversationManager>,
+        memory: Arc<M>,
         default_model: impl Into<String>,
     ) -> Self {
-        Self {
-            gateway,
-            memory,
-            default_model: default_model.into(),
-            max_tool_iterations: Self::DEFAULT_MAX_ITERATIONS,
-        }
+        let agent = Agent::builder("tool_router", gateway)
+            .memory(memory as Arc<dyn Memory>)
+            .model(default_model)
+            .max_iterations(Self::DEFAULT_MAX_ITERATIONS)
+            .build();
+        Self { agent }
     }
 
     /// Overrides the maximum tool execution loop iterations.
     pub fn with_max_iterations(mut self, max: usize) -> Self {
-        self.max_tool_iterations = max;
+        self.agent = Agent::builder(self.agent.name(), self.agent.provider().clone())
+            .memory(self.agent.memory().clone())
+            .model(&self.agent.config().default_model)
+            .max_iterations(max)
+            .build();
         self
     }
 
-    /// Returns a reference to the conversation manager.
-    pub fn memory(&self) -> &Arc<ConversationManager> {
-        &self.memory
+    /// Returns a reference to the active memory backend.
+    pub fn memory(&self) -> &Arc<dyn Memory> {
+        self.agent.memory()
+    }
+
+    /// Access to the underlying [`Agent`] engine.
+    pub fn agent(&self) -> &Agent {
+        &self.agent
     }
 
     /// Executes the tool calling loop for an incoming conversational message.
-    ///
-    /// # State Machine Workflow:
-    /// 1. Appends the inbound user message to conversation memory.
-    /// 2. Discovers all tools dynamically declared by currently active plugin hosts.
-    /// 3. In a loop bounded by `max_tool_iterations`:
-    ///    - Submits the conversational history + tools contract to the LLM backend.
-    ///    - If the model returns text without tool calls: stores response and returns.
-    ///    - If the model requests `tool_calls`:
-    ///      - Verifies recursion guard limit; halts if exceeded.
-    ///      - For each requested tool, resolves the owning host and converts arguments
-    ///        directly to `prost_types::Struct` in-memory.
-    ///      - Dispatches `ToolCallRequest` via gRPC IPC to the plugin host.
-    ///      - Appends the tool execution result into memory as a `Role::Tool` message.
-    ///    - Repeats the cycle so the model can reason over the tool execution output.
     pub async fn execute<H: ToolHost>(
         &self,
         session_id: &str,
         user_input: &str,
         hosts: &[Arc<H>],
     ) -> Result<ToolRouterOutput, ToolRouterError> {
-        // 1. Record user message in conversational memory
-        self.memory.push_message(session_id, ChatMessage::user(user_input));
-
-        // 2. Dynamically aggregate tools from active plugin hosts
-        let tools = aggregate_tools(hosts);
-
-        let mut executed_tools = Vec::new();
-        let mut iterations = 0;
-
-        // 3. State machine reasoning & tool execution loop
-        loop {
-            let messages = self.memory.get_messages(session_id);
-
-            let request = ChatRequest {
-                model: self.default_model.clone(),
-                messages,
-                tools: tools.clone(),
-                temperature: None,
-                max_tokens: None,
-            };
-
-            let response = self.gateway.chat(&request).await?;
-
-            // Terminal state: Model completed inference without requesting further tools
-            if response.tool_calls.is_empty() {
-                let final_content = response.content.unwrap_or_default();
-                if !final_content.is_empty() {
-                    self.memory.push_message(session_id, ChatMessage::assistant(&final_content));
-                }
-                return Ok(ToolRouterOutput {
-                    content: final_content,
-                    executed_tools,
-                });
-            }
-
-            // Guard against runaway loop recursion
-            if iterations >= self.max_tool_iterations {
-                tracing::warn!(
-                    session_id = %session_id,
-                    iterations = iterations,
-                    "Tool calling recursion limit reached; terminating execution loop"
-                );
-                let fallback = response.content.unwrap_or_else(|| {
-                    "Tool calling recursion limit reached; execution halted.".to_string()
-                });
-                self.memory.push_message(session_id, ChatMessage::assistant(&fallback));
-                return Ok(ToolRouterOutput {
-                    content: fallback,
-                    executed_tools,
-                });
-            }
-
-            iterations += 1;
-
-            // Record assistant message with tool calls in history
-            self.memory.push_message(
-                session_id,
-                ChatMessage {
-                    role: Role::Assistant,
-                    content: response.content.clone(),
-                    tool_calls: Some(response.tool_calls.clone()),
-                    tool_call_id: None,
-                    name: None,
-                },
-            );
-
-            // Execute each requested tool call
-            for call in response.tool_calls {
-                let target = match ResolvedToolTarget::find(&call.name, hosts) {
-                    Some(t) => t,
-                    None => {
-                        tracing::warn!(tool = %call.name, "Requested tool not declared by any active host");
-                        let err_msg = format!("Tool '{}' not registered", call.name);
-                        self.memory.push_message(
-                            session_id,
-                            ChatMessage::tool_response(&call.id, &err_msg),
-                        );
-                        executed_tools.push(ExecutedToolCall {
-                            call_id: call.id,
-                            tool_name: call.name,
-                            plugin_id: "unknown".to_string(),
-                            host_id: "unknown".to_string(),
-                            success: false,
-                        });
-                        continue;
-                    }
-                };
-
-                // Zero-copy direct translation from serde_json::Value to prost_types::Struct
-                let structured_args = match &call.arguments {
-                    serde_json::Value::Object(_) => json_to_prost_struct(&call.arguments),
-                    _ => None,
-                };
-
-                let tool_req = ToolCallRequest {
-                    call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    session_id: session_id.to_string(),
-                    payload: structured_args.map(tool_call_request::Payload::StructuredArgs),
-                };
-
-                tracing::debug!(
-                    tool = %call.name,
-                    host_id = %target.host.host_id(),
-                    plugin_id = %target.plugin_id,
-                    "Calling tool on target host via IPC"
-                );
-
-                match target.host.call_tool(tool_req).await {
-                    Ok(resp) => {
-                        executed_tools.push(ExecutedToolCall {
-                            call_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            plugin_id: target.plugin_id.clone(),
-                            host_id: target.host.host_id().to_string(),
-                            success: resp.success,
-                        });
-
-                        // Format tool result payload for model ingestion
-                        let result_str = if !resp.success {
-                            format!("Error: {}", resp.error_message)
-                        } else {
-                            match resp.payload {
-                                Some(tool_call_response::Payload::StructuredResult(s)) => {
-                                    prost_struct_to_json(s).to_string()
-                                }
-                                Some(tool_call_response::Payload::RawBytes(bytes)) => {
-                                    String::from_utf8_lossy(&bytes).to_string()
-                                }
-                                None => "{}".to_string(),
-                            }
-                        };
-
-                        self.memory.push_message(
-                            session_id,
-                            ChatMessage::tool_response(&call.id, result_str),
-                        );
-                    }
-                    Err(status) => {
-                        tracing::error!(
-                            tool = %call.name,
-                            error = %status,
-                            "Tool execution failed with gRPC status"
-                        );
-                        executed_tools.push(ExecutedToolCall {
-                            call_id: call.id.clone(),
-                            tool_name: call.name.clone(),
-                            plugin_id: target.plugin_id.clone(),
-                            host_id: target.host.host_id().to_string(),
-                            success: false,
-                        });
-                        self.memory.push_message(
-                            session_id,
-                            ChatMessage::tool_response(
-                                &call.id,
-                                format!("RPC Error: {}", status.message()),
-                            ),
-                        );
-                    }
-                }
+        match self.agent.run(session_id, user_input, hosts).await {
+            Ok(output) => Ok(ToolRouterOutput {
+                content: output.content,
+                executed_tools: output.executed_tools,
+            }),
+            Err(AgentError::Gateway(e)) => Err(ToolRouterError::Gateway(e)),
+            Err(AgentError::Rpc(s)) => Err(ToolRouterError::Rpc(s)),
+            Err(AgentError::ToolNotFound(name)) => Err(ToolRouterError::ToolNotFound(name)),
+            Err(AgentError::Memory(m)) => {
+                Err(ToolRouterError::Gateway(crate::error::GatewayError::InvalidResponse(m)))
             }
         }
     }

@@ -1,0 +1,332 @@
+//! Anthropic Messages protocol implementation.
+//!
+//! Protocol-level client conforming to the Anthropic `/v1/messages` specification.
+//! Compatible with any engine or proxy implementing the Anthropic Messages wire format
+//! (e.g. Anthropic Claude models, AWS Bedrock Anthropic proxies, Minimax).
+//!
+//! Handles translation between Kanon domain types and Anthropic's structured content blocks
+//! (`text`, `tool_use`, `tool_result`), with top-level system prompt separation.
+
+use std::time::Duration;
+use async_trait::async_trait;
+
+use crate::error::GatewayError;
+use crate::gateway::types::{ChatRequest, ChatResponse, Role, TokenUsage, ToolCall};
+use crate::gateway::LlmProvider;
+
+/// Private wire structures representing the Anthropic Messages API format.
+#[allow(dead_code)]
+mod wire {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Serialize)]
+    pub struct AnthropicMessagesRequest<'a> {
+        pub model: &'a str,
+        pub max_tokens: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub system: Option<String>,
+        pub messages: Vec<AnthropicMessageWire>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tools: Option<Vec<AnthropicToolWire>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub temperature: Option<f32>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct AnthropicMessageWire {
+        pub role: String, // "user" | "assistant"
+        pub content: Vec<AnthropicContentBlock>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type")]
+    pub enum AnthropicContentBlock {
+        #[serde(rename = "text")]
+        Text { text: String },
+
+        #[serde(rename = "tool_use")]
+        ToolUse {
+            id: String,
+            name: String,
+            input: serde_json::Value,
+        },
+
+        #[serde(rename = "tool_result")]
+        ToolResult {
+            tool_use_id: String,
+            content: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_error: Option<bool>,
+        },
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct AnthropicToolWire {
+        pub name: String,
+        pub description: String,
+        pub input_schema: serde_json::Value,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct AnthropicMessagesResponse {
+        #[serde(default)]
+        pub id: Option<String>,
+        #[serde(rename = "type")]
+        pub message_type: Option<String>,
+        pub role: String,
+        pub content: Vec<AnthropicContentBlock>,
+        pub stop_reason: Option<String>,
+        pub usage: Option<AnthropicUsageWire>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct AnthropicUsageWire {
+        pub input_tokens: u32,
+        pub output_tokens: u32,
+    }
+}
+
+/// Generic, protocol-level HTTP client implementing the Anthropic Messages API.
+pub struct AnthropicMessagesProvider {
+    client: reqwest::Client,
+    endpoint: String,
+    api_key: Option<String>,
+    anthropic_version: String,
+    default_model: String,
+    custom_headers: Vec<(String, String)>,
+}
+
+/// Backward-compatible type alias.
+pub type AnthropicProvider = AnthropicMessagesProvider;
+
+impl AnthropicMessagesProvider {
+    /// Standard Anthropic API version header.
+    pub const DEFAULT_VERSION: &'static str = "2023-06-01";
+    /// Default maximum token count if unspecified in requests.
+    pub const DEFAULT_MAX_TOKENS: u32 = 4096;
+
+    /// Creates a new `AnthropicMessagesProvider` pointing to a base URL or endpoint.
+    ///
+    /// # Arguments
+    /// - `base_url`: Base URL or endpoint (e.g. `https://api.anthropic.com/v1`).
+    /// - `api_key`: Secret API key passed via `x-api-key`.
+    /// - `default_model`: Default model identifier (e.g. `claude-3-5-sonnet-20241022`).
+    pub fn new(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+        default_model: impl Into<String>,
+    ) -> Self {
+        let raw_url = base_url.into();
+        let trimmed = raw_url.trim_end_matches('/');
+        let endpoint = if trimmed.ends_with("/messages") {
+            trimmed.to_string()
+        } else if trimmed.ends_with("/v1") {
+            format!("{trimmed}/messages")
+        } else {
+            format!("{trimmed}/v1/messages")
+        };
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .pool_max_idle_per_host(10)
+            .build()
+            .unwrap_or_default();
+
+        Self {
+            client,
+            endpoint,
+            api_key,
+            anthropic_version: Self::DEFAULT_VERSION.to_string(),
+            default_model: default_model.into(),
+            custom_headers: Vec::new(),
+        }
+    }
+
+    /// Sets a custom `anthropic-version` header value.
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.anthropic_version = version.into();
+        self
+    }
+
+    /// Appends a custom HTTP header to all outbound requests.
+    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.custom_headers.push((key.into(), value.into()));
+        self
+    }
+}
+
+#[async_trait]
+impl LlmProvider for AnthropicMessagesProvider {
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, GatewayError> {
+        let model = if !request.model.is_empty() {
+            &request.model
+        } else {
+            &self.default_model
+        };
+
+        let max_tokens = request.max_tokens.unwrap_or(Self::DEFAULT_MAX_TOKENS);
+
+        // Anthropic requires system prompt to be in the top-level `system` field,
+        // rather than inside the `messages` array.
+        let mut system_prompt: Option<String> = None;
+        let mut messages: Vec<wire::AnthropicMessageWire> = Vec::new();
+
+        for msg in &request.messages {
+            match msg.role {
+                Role::System => {
+                    if let Some(ref text) = msg.content {
+                        if let Some(existing) = &mut system_prompt {
+                            existing.push_str("\n\n");
+                            existing.push_str(text);
+                        } else {
+                            system_prompt = Some(text.clone());
+                        }
+                    }
+                }
+                Role::User => {
+                    let mut blocks = Vec::new();
+                    if let Some(ref text) = msg.content {
+                        blocks.push(wire::AnthropicContentBlock::Text { text: text.clone() });
+                    }
+                    if !blocks.is_empty() {
+                        messages.push(wire::AnthropicMessageWire {
+                            role: "user".to_string(),
+                            content: blocks,
+                        });
+                    }
+                }
+                Role::Assistant => {
+                    let mut blocks = Vec::new();
+                    if let Some(ref text) = msg.content
+                        && !text.is_empty()
+                    {
+                        blocks.push(wire::AnthropicContentBlock::Text { text: text.clone() });
+                    }
+                    if let Some(ref tool_calls) = msg.tool_calls {
+                        for tc in tool_calls {
+                            blocks.push(wire::AnthropicContentBlock::ToolUse {
+                                id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                input: tc.arguments.clone(),
+                            });
+                        }
+                    }
+                    if !blocks.is_empty() {
+                        messages.push(wire::AnthropicMessageWire {
+                            role: "assistant".to_string(),
+                            content: blocks,
+                        });
+                    }
+                }
+                Role::Tool => {
+                    // Anthropic specifies tool execution output is returned inside a "user" turn
+                    // with type: "tool_result".
+                    let tool_use_id = msg.tool_call_id.clone().unwrap_or_default();
+                    let content = msg.content.clone().unwrap_or_default();
+                    let block = wire::AnthropicContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error: None,
+                    };
+                    messages.push(wire::AnthropicMessageWire {
+                        role: "user".to_string(),
+                        content: vec![block],
+                    });
+                }
+            }
+        }
+
+        let tools = if request.tools.is_empty() {
+            None
+        } else {
+            Some(
+                request
+                    .tools
+                    .iter()
+                    .map(|t| wire::AnthropicToolWire {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        input_schema: t.parameters.clone(),
+                    })
+                    .collect(),
+            )
+        };
+
+        let wire_req = wire::AnthropicMessagesRequest {
+            model,
+            max_tokens,
+            system: system_prompt,
+            messages,
+            tools,
+            temperature: request.temperature,
+        };
+
+        let mut req_builder = self.client.post(&self.endpoint).json(&wire_req);
+
+        if let Some(ref key) = self.api_key {
+            req_builder = req_builder.header("x-api-key", key);
+        }
+        req_builder = req_builder.header("anthropic-version", &self.anthropic_version);
+
+        for (k, v) in &self.custom_headers {
+            req_builder = req_builder.header(k, v);
+        }
+
+        let resp = req_builder.send().await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ApiStatus {
+                status: status.as_u16(),
+                message: err_body,
+            });
+        }
+
+        let wire_resp: wire::AnthropicMessagesResponse = resp.json().await?;
+
+        let mut text_output = String::new();
+        let mut tool_calls = Vec::new();
+
+        for block in wire_resp.content {
+            match block {
+                wire::AnthropicContentBlock::Text { text } => {
+                    text_output.push_str(&text);
+                }
+                wire::AnthropicContentBlock::ToolUse { id, name, input } => {
+                    tool_calls.push(ToolCall {
+                        id,
+                        name,
+                        arguments: input,
+                    });
+                }
+                wire::AnthropicContentBlock::ToolResult { .. } => {}
+            }
+        }
+
+        let content = if text_output.is_empty() {
+            None
+        } else {
+            Some(text_output)
+        };
+
+        let finish_reason = match wire_resp.stop_reason.as_deref() {
+            Some("tool_use") => Some("tool_calls".to_string()),
+            Some(other) => Some(other.to_string()),
+            None => None,
+        };
+
+        let usage = wire_resp.usage.map(|u| TokenUsage {
+            prompt_tokens: u.input_tokens,
+            completion_tokens: u.output_tokens,
+            total_tokens: u.input_tokens + u.output_tokens,
+        });
+
+        Ok(ChatResponse {
+            content,
+            tool_calls,
+            finish_reason,
+            usage,
+        })
+    }
+}

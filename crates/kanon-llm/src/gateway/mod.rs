@@ -1,7 +1,7 @@
 //! Unified LLM Gateway client and provider abstractions.
 //!
 //! Exposes the [`LlmProvider`] trait for model backends, domain types in [`types`],
-//! and decoupled provider implementations in [`providers`].
+//! and protocol implementations in [`providers`].
 
 pub mod providers;
 pub mod types;
@@ -10,13 +10,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::error::GatewayError;
-pub use providers::{OllamaProvider, OpenAiProvider};
+pub use providers::{
+    AnthropicMessagesProvider, AnthropicProvider, OpenAiChatProvider, OpenAiProvider,
+};
 pub use types::{ChatMessage, ChatRequest, ChatResponse, Role, TokenUsage, ToolCall, ToolDefinition};
 
 /// Asynchronous trait defining interaction with an LLM backend.
 ///
 /// Providers translate the unified [`ChatRequest`] domain format into their
-/// proprietary wire representations, transmit the payload via non-blocking HTTP,
+/// wire representations, transmit the payload via non-blocking HTTP,
 /// and map the response back into [`ChatResponse`].
 #[async_trait]
 pub trait LlmProvider: Send + Sync {

@@ -1,10 +1,11 @@
-//! OpenAI-compatible model provider implementation.
+//! OpenAI Chat Completions protocol implementation.
 //!
-//! Compatible with standard endpoints including DeepSeek (`api.deepseek.com`),
-//! OpenAI (`api.openai.com`), vLLM, and Ollama (`localhost:11434/v1`).
+//! Protocol-level client conforming to the industry-standard OpenAI `/chat/completions`
+//! specification. Compatible with any provider or local engine adhering to this wire format
+//! (e.g. OpenAI, DeepSeek, Ollama, vLLM, Groq, Mistral, Moonshot, Qwen).
 //!
-//! All wire-format JSON structures are strictly private to this module, ensuring
-//! decoupling from the Kanon internal domain model.
+//! This module avoids hardcoding vendor names, domains, or proprietary endpoints.
+//! All configuration is protocol-level: base URL, auth token/headers, model, and parameters.
 
 use std::time::Duration;
 use async_trait::async_trait;
@@ -13,7 +14,7 @@ use crate::error::GatewayError;
 use crate::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role, TokenUsage, ToolCall};
 use crate::gateway::LlmProvider;
 
-/// Private wire structures representing the OpenAI Chat Completions API format.
+/// Private wire structures representing the standard OpenAI Chat Completions JSON schema.
 #[allow(dead_code)]
 mod wire {
     use serde::{Deserialize, Serialize};
@@ -64,7 +65,7 @@ mod wire {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct OpenAiFunctionCallWire {
         pub name: String,
-        /// OpenAI serializes arguments as a JSON-encoded string.
+        /// OpenAI protocol encodes tool arguments as an escaped JSON string.
         pub arguments: String,
     }
 
@@ -99,55 +100,58 @@ mod wire {
     }
 }
 
-/// High-performance HTTP client for OpenAI-compatible model endpoints.
-pub struct OpenAiProvider {
+/// Generic, protocol-level HTTP client implementing the OpenAI Chat Completions API.
+pub struct OpenAiChatProvider {
     client: reqwest::Client,
-    base_url: String,
+    endpoint: String,
     api_key: Option<String>,
     default_model: String,
+    custom_headers: Vec<(String, String)>,
 }
 
-impl OpenAiProvider {
-    /// Creates a new `OpenAiProvider` targeting an arbitrary base URL.
+/// Backward-compatible type alias.
+pub type OpenAiProvider = OpenAiChatProvider;
+
+impl OpenAiChatProvider {
+    /// Creates a new `OpenAiChatProvider` from a protocol base URL or full endpoint.
     ///
     /// # Arguments
-    /// - `base_url`: Base URL of the API (e.g. `https://api.openai.com/v1` or `http://localhost:11434/v1`).
+    /// - `base_url`: Base URL or endpoint (e.g. `https://api.openai.com/v1` or `http://localhost:11434/v1`).
+    ///   If the URL does not end with `/chat/completions`, it is automatically appended.
     /// - `api_key`: Optional Bearer authentication token.
-    /// - `default_model`: Default model identifier to use when not overridden in the request.
+    /// - `default_model`: Default model identifier.
     pub fn new(
         base_url: impl Into<String>,
         api_key: Option<String>,
         default_model: impl Into<String>,
     ) -> Self {
+        let raw_url = base_url.into();
+        let trimmed = raw_url.trim_end_matches('/');
+        let endpoint = if trimmed.ends_with("/chat/completions") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/chat/completions")
+        };
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .pool_max_idle_per_host(10)
             .build()
             .unwrap_or_default();
 
-        let base_url = base_url.into().trim_end_matches('/').to_string();
-
         Self {
             client,
-            base_url,
+            endpoint,
             api_key,
             default_model: default_model.into(),
+            custom_headers: Vec::new(),
         }
     }
 
-    /// Convenience constructor pre-configured for DeepSeek's official API.
-    pub fn deepseek(api_key: impl Into<String>, model: Option<&str>) -> Self {
-        Self::new(
-            "https://api.deepseek.com/v1",
-            Some(api_key.into()),
-            model.unwrap_or("deepseek-chat"),
-        )
-    }
-
-    /// Convenience constructor pre-configured for Ollama running with OpenAI compatibility mode.
-    pub fn ollama_v1(base_url: Option<&str>, model: impl Into<String>) -> Self {
-        let url = base_url.unwrap_or("http://localhost:11434/v1");
-        Self::new(url, None, model)
+    /// Appends a custom HTTP header to all outbound requests (useful for proxies or custom auth).
+    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.custom_headers.push((key.into(), value.into()));
+        self
     }
 
     /// Converts an internal domain `ChatMessage` into the wire format `OpenAiMessageWire`.
@@ -184,10 +188,8 @@ impl OpenAiProvider {
 }
 
 #[async_trait]
-impl LlmProvider for OpenAiProvider {
+impl LlmProvider for OpenAiChatProvider {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, GatewayError> {
-        let url = format!("{}/chat/completions", self.base_url);
-
         let model = if !request.model.is_empty() {
             &request.model
         } else {
@@ -227,10 +229,14 @@ impl LlmProvider for OpenAiProvider {
             max_tokens: request.max_tokens,
         };
 
-        let mut req_builder = self.client.post(&url).json(&wire_req);
+        let mut req_builder = self.client.post(&self.endpoint).json(&wire_req);
 
         if let Some(ref key) = self.api_key {
             req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
+        }
+
+        for (k, v) in &self.custom_headers {
+            req_builder = req_builder.header(k, v);
         }
 
         let resp = req_builder.send().await?;

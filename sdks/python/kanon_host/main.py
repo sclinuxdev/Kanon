@@ -1,9 +1,252 @@
-"""Kanon Python Host Process Entrypoint (Skeleton)"""
+"""Kanon Official Python Host Process.
 
+Spawns a gRPC server hosting one or more Python plugins, serving
+PluginHostService and MessagePipelineService over an IPC socket (Unix Domain Socket
+or Windows Loopback TCP), communicating with the Kanon Core microkernel.
+"""
+
+import argparse
+import asyncio
+import importlib.util
+import inspect
+import os
+import signal
 import sys
+from pathlib import Path
+from typing import Optional, Type
 
-def main():
-    print("Kanon Python Host Skeleton Initialized")
+import grpc
+
+# Ensure sdks/python is on sys.path
+_current_dir = Path(__file__).resolve().parent
+_python_sdk_dir = _current_dir.parent
+if str(_python_sdk_dir) not in sys.path:
+    sys.path.insert(0, str(_python_sdk_dir))
+
+from kanon_sdk.context import PluginContext
+from kanon_sdk.plugin import Plugin
+from kanon_sdk.proto import pb, pb_grpc
+
+
+class HostServiceImpl(pb_grpc.PluginHostServiceServicer):
+    """Implementation of PluginHostService for host lifecycle management."""
+
+    def __init__(self, plugin: Plugin):
+        self.plugin = plugin
+
+    async def Ping(
+        self,
+        request: pb.PingRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.PingResponse:
+        return pb.PingResponse(timestamp=request.timestamp)
+
+    async def ReloadPluginConfig(
+        self,
+        request: pb.ReloadPluginConfigRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.ReloadPluginConfigResponse:
+        return pb.ReloadPluginConfigResponse(
+            success=True,
+            error_message="",
+        )
+
+    async def GetPluginMeta(
+        self,
+        request: pb.GetPluginMetaRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.GetPluginMetaResponse:
+        meta = self.plugin.meta()
+        return pb.GetPluginMetaResponse(plugins=[meta])
+
+
+class PipelineServiceImpl(pb_grpc.MessagePipelineServiceServicer):
+    """Implementation of MessagePipelineService for dispatching pipeline events."""
+
+    def __init__(self, plugin: Plugin):
+        self.plugin = plugin
+
+    async def OnPreFilter(
+        self,
+        request: pb.PipelineEventRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.PreFilterResult:
+        result = await self.plugin.on_pre_filter(request)
+        if result is None:
+            return pb.PreFilterResult(
+                action=pb.PreFilterResult.Action.PASS,
+                modified_text="",
+                reply_messages=[],
+            )
+        return result
+
+    async def OnExecuteCommand(
+        self,
+        request: pb.CommandExecuteRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.CommandExecuteResponse:
+        return await self.plugin.on_execute_command(request)
+
+    async def OnCallTool(
+        self,
+        request: pb.ToolCallRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.ToolCallResponse:
+        return await self.plugin.on_call_tool(request)
+
+    async def OnEvent(
+        self,
+        request: pb.EventNotification,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.EventAck:
+        await self.plugin.on_event(request)
+        return pb.EventAck(received=True)
+
+    async def OnDeliverMessage(
+        self,
+        request: pb.DeliverMessageRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.DeliverMessageResponse:
+        return await self.plugin.on_deliver_message(request)
+
+
+def load_plugin_from_path(target_path: Path) -> Plugin:
+    """Loads a Plugin subclass from a Python script or plugin.toml directory."""
+    script_path = target_path
+    if target_path.is_file() and target_path.name == "plugin.toml":
+        import tomllib
+        with open(target_path, "rb") as f:
+            data = tomllib.load(f)
+        entrypoint = data.get("plugin", {}).get("entrypoint", "main.py")
+        script_path = target_path.parent / entrypoint
+    elif target_path.is_dir():
+        manifest = target_path / "plugin.toml"
+        if manifest.exists():
+            import tomllib
+            with open(manifest, "rb") as f:
+                data = tomllib.load(f)
+            entrypoint = data.get("plugin", {}).get("entrypoint", "main.py")
+            script_path = target_path / entrypoint
+        else:
+            script_path = target_path / "main.py"
+
+    if not script_path.exists():
+        raise FileNotFoundError(f"Plugin entrypoint script not found: {script_path}")
+
+    # Add plugin directory to sys.path so it can import sibling modules
+    plugin_dir = str(script_path.parent)
+    if plugin_dir not in sys.path:
+        sys.path.insert(0, plugin_dir)
+
+    module_name = f"kanon_plugin_{script_path.stem}"
+    spec = importlib.util.spec_from_file_location(module_name, script_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module spec from {script_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+
+    # Search module for Plugin instance or subclass
+    for _, attr in inspect.getmembers(module):
+        if inspect.isclass(attr) and issubclass(attr, Plugin) and attr is not Plugin:
+            return attr()
+        if isinstance(attr, Plugin):
+            return attr
+
+    raise ValueError(f"No Plugin class or instance found in {script_path}")
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="Kanon Python Plugin Host Runner")
+    parser.add_argument("--plugin", type=str, default=None, help="Path to plugin manifest or script")
+    parser.add_argument("--socket", type=str, default=None, help="Path to host IPC socket")
+    args = parser.parse_args()
+
+    socket_path_str = (
+        args.socket
+        or os.environ.get("KANON_HOST_SOCK")
+        or "./run/host_py.sock"
+    )
+    socket_path = Path(socket_path_str).resolve()
+    core_sock_str = os.environ.get("KANON_CORE_SOCK")
+    host_id = os.environ.get("KANON_HOST_ID", "host_py")
+
+    plugin_target = (
+        args.plugin
+        or os.environ.get("KANON_PLUGIN_MANIFEST")
+        or os.environ.get("KANON_PLUGIN_ENTRYPOINT")
+    )
+
+    if not plugin_target:
+        print("Error: No plugin specified via --plugin or KANON_PLUGIN_MANIFEST", file=sys.stderr)
+        sys.exit(1)
+
+    plugin = load_plugin_from_path(Path(plugin_target).resolve())
+    meta = plugin.meta()
+
+    data_dir = Path(f"./data/plugins/{meta.id}").resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    ctx = PluginContext(data_dir=data_dir)
+    await plugin.on_load(ctx)
+
+    # Clean up stale socket file if it exists
+    if socket_path.exists():
+        try:
+            socket_path.unlink()
+        except OSError:
+            pass
+
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+
+    server = grpc.aio.server()
+    pb_grpc.add_PluginHostServiceServicer_to_server(HostServiceImpl(plugin), server)
+    pb_grpc.add_MessagePipelineServiceServicer_to_server(PipelineServiceImpl(plugin), server)
+
+    server.add_insecure_port(f"unix:{socket_path}")
+    await server.start()
+    print(f"Kanon Python Host running on {socket_path}", flush=True)
+
+    # Optionally register with Core IPC server if reachable
+    if core_sock_str:
+        core_sock = Path(core_sock_str).resolve()
+        if core_sock.exists():
+            try:
+                async with grpc.aio.insecure_channel(f"unix:{core_sock}") as channel:
+                    client = pb_grpc.BotApiServiceStub(channel)
+                    reg_req = pb.RegisterHostRequest(
+                        host_id=host_id,
+                        runtime="python",
+                        endpoint=str(socket_path),
+                        loaded_plugin_ids=[meta.id],
+                    )
+                    await client.RegisterHost(reg_req, timeout=1.0)
+            except Exception:
+                pass
+
+    stop_event = asyncio.Event()
+
+    def handle_signal():
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, handle_signal)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    await stop_event.wait()
+
+    # Graceful shutdown
+    await plugin.on_unload()
+    await server.stop(grace=1.0)
+    if socket_path.exists():
+        try:
+            socket_path.unlink()
+        except OSError:
+            pass
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

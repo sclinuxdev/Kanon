@@ -19,6 +19,7 @@
 10. **发现问题先修根因，不要用补丁堆复杂度。**
 11. **代码应当容易理解、验证和删除，而不是容易扩展。**
 12. **当设计已经足够简单且正确时，停止重构。**
+13. **测试与业务逻辑物理分离**：禁止在业务模块（`src/`）中内联混杂 `#[cfg(test)]` 代码；所有测试统一独立置于所属 Crate 根目录下的 `tests/` 目录，保持核心逻辑精简纯粹。
 
 ---
 
@@ -66,6 +67,7 @@ Kanon 是基于 Rust 2024 构建的高性能多平台聊天机器人微内核，
 - **Windows 本地安全**：TCP Loopback 握手必须在首包 HTTP/2 HEADERS 中携带 32-Byte CSPRNG 随机 Token（`x-kanon-auth-token`），核心恒定时间校验。
 - **数据访问防放大**：只读配置 Host 内存缓存；复杂业务持久化直接在专属目录 `./data/plugins/<id>/` 本地读写 SQLite/DuckDB。
 - **Rust 标准**：统一 **Rust 2024 Edition**，异步基于 Tokio/Tonic/Axum。错误用 `thiserror`/`anyhow` 显式追踪。`cargo check --workspace` 必须保持 **0 错误、0 警告**。
+- **测试隔离规范**：所有测试代码必须从业务代码中独立剥离至 `tests/` 目录，禁止在 `src/` 中内联测试，确保逻辑代码零冗余。
 
 ---
 

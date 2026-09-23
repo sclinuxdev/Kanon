@@ -48,6 +48,9 @@ pub enum SupervisorError {
     /// Requested host was not found in the supervisor registry.
     #[error("Host '{0}' not found in supervisor")]
     HostNotFound(String),
+    /// Runtime environment was not found or is unsupported.
+    #[error("Runtime environment '{runtime}' is not available: {reason}")]
+    RuntimeUnavailable { runtime: String, reason: String },
 }
 
 impl From<tonic::Status> for SupervisorError {
@@ -288,26 +291,107 @@ impl Supervisor {
         Ok(managed_host)
     }
 
-    /// Spawns a plugin sub-process based on a `plugin.toml` manifest file.
+    /// Spawns a plugin sub-process based on a `plugin.toml` manifest file,
+    /// dynamically resolving the runtime launcher (Rust native binary, Python venv/interpreter,
+    /// or Node/Bun runtime for TypeScript).
     pub async fn spawn_from_manifest(
         &self,
         manifest_path: impl AsRef<Path>,
         executable_override: Option<&Path>,
     ) -> Result<Arc<ManagedHost>, SupervisorError> {
-        let manifest = PluginManifest::load_from_file(manifest_path.as_ref())
+        let manifest_path_ref = manifest_path.as_ref();
+        let manifest = PluginManifest::load_from_file(manifest_path_ref)
             .map_err(|e| SupervisorError::Manifest(e.to_string()))?;
 
         let host_id = manifest.plugin.id.replace('.', "_");
-        let exec_path = match executable_override {
-            Some(path) => path.to_path_buf(),
-            None => {
-                let parent = manifest_path.as_ref().parent().unwrap_or_else(|| Path::new("."));
-                parent.join(&manifest.plugin.entrypoint)
-            }
-        };
-
         let priority = manifest.plugin.priority.unwrap_or(500);
-        self.spawn_plugin_with_priority(&host_id, exec_path, &[], priority).await
+        let parent = manifest_path_ref.parent().unwrap_or_else(|| Path::new("."));
+
+        if let Some(override_path) = executable_override {
+            return self
+                .spawn_plugin_with_priority(&host_id, override_path, &[], priority)
+                .await;
+        }
+
+        match manifest.plugin.runtime.as_str() {
+            "rust" => {
+                let exec_path = parent.join(&manifest.plugin.entrypoint);
+                self.spawn_plugin_with_priority(&host_id, exec_path, &[], priority)
+                    .await
+            }
+            "python" => {
+                let python_bin = std::env::var("KANON_PYTHON_BIN")
+                    .map(PathBuf::from)
+                    .ok()
+                    .or_else(|| find_file_upwards(parent, "sdks/python/.venv/bin/python"))
+                    .or_else(|| find_binary_in_path("python3"))
+                    .or_else(|| find_binary_in_path("python"))
+                    .ok_or_else(|| SupervisorError::RuntimeUnavailable {
+                        runtime: "python".to_string(),
+                        reason: "Neither python3 nor a virtual environment (.venv) was found in PATH"
+                            .to_string(),
+                    })?;
+
+                let host_script = std::env::var("KANON_PYTHON_HOST_PATH")
+                    .map(PathBuf::from)
+                    .ok()
+                    .or_else(|| find_file_upwards(parent, "sdks/python/kanon_host/main.py"))
+                    .or_else(|| find_file_upwards(parent, "kanon_host/main.py"))
+                    .ok_or_else(|| SupervisorError::RuntimeUnavailable {
+                        runtime: "python".to_string(),
+                        reason: "Could not locate Python host runner script (kanon_host/main.py)"
+                            .to_string(),
+                    })?;
+
+                let host_script_str = host_script.to_string_lossy();
+                let manifest_str = manifest_path_ref.to_string_lossy();
+                let args = [
+                    host_script_str.as_ref(),
+                    "--plugin",
+                    manifest_str.as_ref(),
+                ];
+
+                self.spawn_plugin_with_priority(&host_id, python_bin, &args, priority)
+                    .await
+            }
+            "typescript" | "ts" => {
+                let node_bin = std::env::var("KANON_NODE_BIN")
+                    .map(PathBuf::from)
+                    .ok()
+                    .or_else(|| find_binary_in_path("bun"))
+                    .or_else(|| find_binary_in_path("node"))
+                    .ok_or_else(|| SupervisorError::RuntimeUnavailable {
+                        runtime: "typescript".to_string(),
+                        reason: "Neither bun nor node was found in PATH".to_string(),
+                    })?;
+
+                let host_script = std::env::var("KANON_TS_HOST_PATH")
+                    .map(PathBuf::from)
+                    .ok()
+                    .or_else(|| find_file_upwards(parent, "sdks/typescript/dist/src/host/index.js"))
+                    .or_else(|| find_file_upwards(parent, "dist/src/host/index.js"))
+                    .ok_or_else(|| SupervisorError::RuntimeUnavailable {
+                        runtime: "typescript".to_string(),
+                        reason: "Could not locate TypeScript host runner script (dist/src/host/index.js)"
+                            .to_string(),
+                    })?;
+
+                let host_script_str = host_script.to_string_lossy();
+                let manifest_str = manifest_path_ref.to_string_lossy();
+                let args = [
+                    host_script_str.as_ref(),
+                    "--plugin",
+                    manifest_str.as_ref(),
+                ];
+
+                self.spawn_plugin_with_priority(&host_id, node_bin, &args, priority)
+                    .await
+            }
+            other => Err(SupervisorError::RuntimeUnavailable {
+                runtime: other.to_string(),
+                reason: format!("Unsupported plugin runtime '{other}' declared in manifest"),
+            }),
+        }
     }
 
     /// Directly registers an externally created or mocked `ManagedHost` (useful for unit tests).
@@ -413,3 +497,39 @@ impl Drop for Supervisor {
         }
     }
 }
+
+/// Searches the system PATH environment variable for a given executable name.
+fn find_binary_in_path(bin_name: &str) -> Option<PathBuf> {
+    if let Some(paths) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&paths) {
+            let full = path.join(bin_name);
+            if full.is_file() {
+                return Some(full);
+            }
+            #[cfg(windows)]
+            {
+                let full_exe = path.join(format!("{bin_name}.exe"));
+                if full_exe.is_file() {
+                    return Some(full_exe);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Searches upwards from a starting directory for a relative target file path (up to 6 levels).
+fn find_file_upwards(start: &Path, rel_path: &str) -> Option<PathBuf> {
+    let mut current = start.to_path_buf();
+    for _ in 0..6 {
+        let candidate = current.join(rel_path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+

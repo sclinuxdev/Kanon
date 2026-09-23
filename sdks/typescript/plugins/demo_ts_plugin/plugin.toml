@@ -7,8 +7,15 @@ description = "Demonstration plugin written in TypeScript"
 runtime = "typescript"
 entrypoint = "index.ts"
 isolated = false
+priority = 100
 
 [[commands]]
 name = "tsgreet"
 description = "TypeScript-based greeting command"
 usage = "/tsgreet <name>"
+priority = 100
+
+[[tools]]
+name = "ts_calc"
+description = "TypeScript mathematical calculation tool"
+parameters = { type = "object", properties = { expr = { type = "string", description = "Expression to evaluate" } } }

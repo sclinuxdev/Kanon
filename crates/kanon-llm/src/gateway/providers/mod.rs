@@ -10,8 +10,11 @@
 pub mod anthropic;
 pub mod openai;
 pub mod openai_responses;
+pub mod sse;
 
 pub use anthropic::{AnthropicMessagesProvider, AnthropicProvider};
 pub use openai::{OpenAiChatProvider, OpenAiProvider};
 pub use openai_responses::OpenAiResponsesProvider;
+pub use sse::{SseDecoder, SseEvent};
+
 

@@ -9,10 +9,12 @@
 
 use std::time::Duration;
 use async_trait::async_trait;
+use tokio_stream::StreamExt;
 
 use crate::error::GatewayError;
+use crate::gateway::providers::sse::SseDecoder;
 use crate::gateway::types::{ChatRequest, ChatResponse, Role, TokenUsage, ToolCall};
-use crate::gateway::LlmProvider;
+use crate::gateway::{ChatChunk, ChatChunkStream, LlmProvider};
 
 /// Private wire structures representing the Anthropic Messages API format.
 #[allow(dead_code)]
@@ -30,7 +32,10 @@ mod wire {
         pub tools: Option<Vec<AnthropicToolWire>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub temperature: Option<f32>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        pub stream: bool,
     }
+
 
     #[derive(Debug, Serialize, Deserialize)]
     pub struct AnthropicMessageWire {
@@ -259,6 +264,7 @@ impl LlmProvider for AnthropicMessagesProvider {
             messages,
             tools,
             temperature: request.temperature,
+            stream: false,
         };
 
         let mut req_builder = self.client.post(&self.endpoint).json(&wire_req);
@@ -329,4 +335,180 @@ impl LlmProvider for AnthropicMessagesProvider {
             usage,
         })
     }
+
+    async fn chat_stream(&self, request: &ChatRequest) -> Result<ChatChunkStream, GatewayError> {
+        let model = if !request.model.is_empty() {
+            &request.model
+        } else {
+            &self.default_model
+        };
+
+        let max_tokens = request.max_tokens.unwrap_or(Self::DEFAULT_MAX_TOKENS);
+
+        let mut system_prompt: Option<String> = None;
+        let mut messages: Vec<wire::AnthropicMessageWire> = Vec::new();
+
+        for msg in &request.messages {
+            match msg.role {
+                Role::System => {
+                    if let Some(ref text) = msg.content {
+                        if let Some(existing) = &mut system_prompt {
+                            existing.push_str("\n\n");
+                            existing.push_str(text);
+                        } else {
+                            system_prompt = Some(text.clone());
+                        }
+                    }
+                }
+                Role::User => {
+                    let mut blocks = Vec::new();
+                    if let Some(ref text) = msg.content {
+                        blocks.push(wire::AnthropicContentBlock::Text { text: text.clone() });
+                    }
+                    if !blocks.is_empty() {
+                        messages.push(wire::AnthropicMessageWire {
+                            role: "user".to_string(),
+                            content: blocks,
+                        });
+                    }
+                }
+                Role::Assistant => {
+                    let mut blocks = Vec::new();
+                    if let Some(ref text) = msg.content
+                        && !text.is_empty()
+                    {
+                        blocks.push(wire::AnthropicContentBlock::Text { text: text.clone() });
+                    }
+                    if let Some(ref tool_calls) = msg.tool_calls {
+                        for tc in tool_calls {
+                            blocks.push(wire::AnthropicContentBlock::ToolUse {
+                                id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                input: tc.arguments.clone(),
+                            });
+                        }
+                    }
+                    if !blocks.is_empty() {
+                        messages.push(wire::AnthropicMessageWire {
+                            role: "assistant".to_string(),
+                            content: blocks,
+                        });
+                    }
+                }
+                Role::Tool => {
+                    let tool_use_id = msg.tool_call_id.clone().unwrap_or_default();
+                    let content = msg.content.clone().unwrap_or_default();
+                    let block = wire::AnthropicContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error: None,
+                    };
+                    messages.push(wire::AnthropicMessageWire {
+                        role: "user".to_string(),
+                        content: vec![block],
+                    });
+                }
+            }
+        }
+
+        let tools = if request.tools.is_empty() {
+            None
+        } else {
+            Some(
+                request
+                    .tools
+                    .iter()
+                    .map(|t| wire::AnthropicToolWire {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        input_schema: t.parameters.clone(),
+                    })
+                    .collect(),
+            )
+        };
+
+        let wire_req = wire::AnthropicMessagesRequest {
+            model,
+            max_tokens,
+            system: system_prompt,
+            messages,
+            tools,
+            temperature: request.temperature,
+            stream: true,
+        };
+
+        let mut req_builder = self.client.post(&self.endpoint).json(&wire_req);
+
+        if let Some(ref key) = self.api_key {
+            req_builder = req_builder.header("x-api-key", key);
+        }
+        req_builder = req_builder.header("anthropic-version", &self.anthropic_version);
+
+        for (k, v) in &self.custom_headers {
+            req_builder = req_builder.header(k, v);
+        }
+
+        let resp = req_builder.send().await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ApiStatus {
+                status: status.as_u16(),
+                message: err_body,
+            });
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let mut byte_stream = resp.bytes_stream();
+
+        tokio::spawn(async move {
+            let mut decoder = SseDecoder::new();
+            let mut finish_reason: Option<String> = None;
+
+            while let Some(chunk_res) = byte_stream.next().await {
+                let chunk = match chunk_res {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(Err(GatewayError::Http(e))).await;
+                        return;
+                    }
+                };
+
+                let events = decoder.decode(&chunk);
+                for ev in events {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&ev.data) {
+                        let event_type = ev.event.as_deref().or_else(|| val["type"].as_str());
+
+                        if let Some("content_block_delta") = event_type {
+                            if let Some("text_delta") = val["delta"]["type"].as_str()
+                                && let Some(text) = val["delta"]["text"].as_str()
+                                && tx.send(Ok(ChatChunk::delta(text))).await.is_err()
+                            {
+                                return;
+                            }
+                        } else if let Some("message_delta") = event_type {
+
+
+                            if let Some(stop_reason) = val["delta"]["stop_reason"].as_str() {
+                                finish_reason = Some(match stop_reason {
+                                    "tool_use" => "tool_calls".to_string(),
+                                    other => other.to_string(),
+                                });
+                            }
+                        } else if let Some("message_stop") = event_type {
+                            let _ = tx.send(Ok(ChatChunk::done(finish_reason.clone()))).await;
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let _ = tx.send(Ok(ChatChunk::done(finish_reason))).await;
+        });
+
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
 }
+

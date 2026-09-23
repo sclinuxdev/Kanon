@@ -18,6 +18,9 @@ use kanon_proto::v1::{
 };
 use kanon_transport::{core_socket_path, IpcListener};
 
+use kanon_llm::{ChatMessage, ChatRequest, LlmGateway};
+use tokio_stream::StreamExt;
+
 /// Default capacity for the inbound asynchronous event ingest queue.
 ///
 /// Under high throughput, this queue serves as a backpressure boundary separating
@@ -44,6 +47,8 @@ pub struct CoreApiService {
     event_sender: mpsc::Sender<IngestEventRequest>,
     /// Thread-safe registry of connected and registered plugin hosts.
     hosts: Arc<RwLock<HashMap<String, HostRegistration>>>,
+    /// Optional shared LLM gateway instance for delegating model completions.
+    gateway: Option<Arc<LlmGateway>>,
 }
 
 impl CoreApiService {
@@ -52,7 +57,14 @@ impl CoreApiService {
         Self {
             event_sender,
             hosts: Arc::new(RwLock::new(HashMap::new())),
+            gateway: None,
         }
+    }
+
+    /// Configures the active LLM gateway instance.
+    pub fn with_gateway(mut self, gateway: Arc<LlmGateway>) -> Self {
+        self.gateway = Some(gateway);
+        self
     }
 
     /// Returns a snapshot of currently registered hosts.
@@ -60,6 +72,7 @@ impl CoreApiService {
         self.hosts.read().await.values().cloned().collect()
     }
 }
+
 
 #[tonic::async_trait]
 impl BotApiService for CoreApiService {
@@ -161,18 +174,63 @@ impl BotApiService for CoreApiService {
     /// Invokes the LLM gateway for streaming text completions.
     async fn request_llm(
         &self,
-        _request: Request<LlmRequest>,
+        request: Request<LlmRequest>,
     ) -> Result<Response<Self::RequestLLMStream>, Status> {
-        // Stub streaming response for Phase 1.
-        let (tx, rx) = mpsc::channel(1);
-        let _ = tx
-            .send(Ok(LlmChunk {
-                delta_text: "Kanon LLM stub chunk".to_string(),
-                is_finished: true,
-            }))
-            .await;
+        let req = request.into_inner();
+        let gateway = match &self.gateway {
+            Some(g) => g.clone(),
+            None => {
+                // When no gateway is bound, return a single completed fallback chunk
+                let (tx, rx) = mpsc::channel(1);
+                let _ = tx
+                    .send(Ok(LlmChunk {
+                        delta_text: format!("Echo: {}", req.prompt),
+                        is_finished: true,
+                    }))
+                    .await;
+                return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)));
+            }
+        };
+
+        let chat_req = ChatRequest {
+            model: req.model,
+            messages: vec![ChatMessage::user(req.prompt)],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+        };
+
+        let stream = gateway.chat_stream(&chat_req).await.map_err(|e| {
+            Status::internal(format!("LLM Gateway error: {e}"))
+        })?;
+
+        let (tx, rx) = mpsc::channel(32);
+        tokio::spawn(async move {
+            let mut stream = stream;
+            while let Some(chunk_res) = stream.next().await {
+                match chunk_res {
+                    Ok(chunk) => {
+                        let proto_chunk = LlmChunk {
+                            delta_text: chunk.delta_text,
+                            is_finished: chunk.is_finished,
+                        };
+                        if tx.send(Ok(proto_chunk)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(Err(Status::internal(format!("Stream chunk error: {e}"))))
+                            .await;
+                        break;
+                    }
+                }
+            }
+        });
+
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
+
 
     /// Sets an embedded KV key-value pair.
     async fn set_storage(

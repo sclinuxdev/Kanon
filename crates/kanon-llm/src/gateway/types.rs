@@ -162,3 +162,39 @@ pub struct ChatResponse {
     /// Token usage metrics for this inference step.
     pub usage: Option<TokenUsage>,
 }
+
+/// A streaming chunk emitted during model generation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChatChunk {
+    /// Incremental textual delta generated in this chunk.
+    pub delta_text: String,
+    /// Whether this chunk marks the completion of the generation stream.
+    pub is_finished: bool,
+    /// Termination reason, present on final chunk (e.g. `stop`, `tool_calls`, `length`).
+    pub finish_reason: Option<String>,
+    /// Incremental or assembled tool calls, if any.
+    pub tool_calls: Vec<ToolCall>,
+}
+
+impl ChatChunk {
+    /// Creates a content text delta chunk.
+    pub fn delta(text: impl Into<String>) -> Self {
+        Self {
+            delta_text: text.into(),
+            is_finished: false,
+            finish_reason: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// Creates a completion chunk signaling stream termination.
+    pub fn done(finish_reason: Option<String>) -> Self {
+        Self {
+            delta_text: String::new(),
+            is_finished: true,
+            finish_reason,
+            tool_calls: Vec::new(),
+        }
+    }
+}
+

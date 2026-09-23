@@ -14,6 +14,9 @@ pub mod agent;
 pub mod error;
 pub mod gateway;
 pub mod memory;
+pub mod sqlite_memory;
+pub mod summary;
+pub mod token;
 pub mod tool_router;
 
 pub use agent::{
@@ -23,8 +26,18 @@ pub use agent::{
 pub use error::{AgentError, GatewayError, ToolRouterError};
 pub use gateway::providers::{
     AnthropicMessagesProvider, AnthropicProvider, OpenAiChatProvider, OpenAiProvider,
-    OpenAiResponsesProvider,
+    OpenAiResponsesProvider, SseDecoder, SseEvent,
 };
-pub use gateway::{LlmGateway, LlmProvider};
+pub use gateway::{
+    ChatChunk, ChatChunkStream, ChatMessage, ChatRequest, ChatResponse, LlmGateway, LlmProvider,
+    Role, TokenUsage, ToolCall, ToolDefinition,
+};
 pub use memory::{ConversationManager, Memory, SessionMemory, SlidingWindowMemory};
+pub use sqlite_memory::SqliteMemory;
+pub use summary::{ContextSummarizer, SummaryConfig, SummaryHook};
+pub use token::{
+    estimate_conversation_tokens, estimate_message_tokens, estimate_text_tokens, estimate_tokens,
+};
 pub use tool_router::{aggregate_tools, ToolHost, ToolRouter, ToolRouterOutput};
+
+

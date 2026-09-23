@@ -54,16 +54,40 @@ pub struct SessionMemory {
     messages: VecDeque<ChatMessage>,
     /// Maximum count of messages retained before sliding window pruning kicks in.
     max_messages: usize,
+    /// Optional maximum cumulative token budget before pruning older messages.
+    max_tokens_budget: Option<usize>,
 }
 
 impl SessionMemory {
     /// Creates a new `SessionMemory` with the specified sliding window capacity.
     pub fn new(max_messages: usize) -> Self {
+        Self::with_budget(max_messages, None)
+    }
+
+    /// Creates a new `SessionMemory` with message limit and token budget.
+    pub fn with_budget(max_messages: usize, max_tokens_budget: Option<usize>) -> Self {
         Self {
             system_prompt: None,
             messages: VecDeque::with_capacity(max_messages.min(64)),
             max_messages,
+            max_tokens_budget,
         }
+    }
+
+    /// Sets or updates the token budget for this session.
+    pub fn set_token_budget(&mut self, budget: Option<usize>) {
+        self.max_tokens_budget = budget;
+        self.prune();
+    }
+
+    /// Returns the active token budget if set.
+    pub fn token_budget(&self) -> Option<usize> {
+        self.max_tokens_budget
+    }
+
+    /// Computes the current estimated token utilization of this session.
+    pub fn estimated_tokens(&self) -> usize {
+        crate::token::estimate_conversation_tokens(&self.get_messages())
     }
 
     /// Sets or updates the system persona prompt for this session.
@@ -117,16 +141,26 @@ impl SessionMemory {
         self.messages.clear();
     }
 
-    /// Prunes messages from the front to maintain the sliding window limit.
+    /// Prunes messages from the front to maintain the sliding window limit and token budget.
     ///
     /// Design rationale: In multi-turn tool calling, pruning must not leave an orphaned
     /// `Role::Tool` message at the beginning of the context, as standard LLM APIs
     /// require every Tool message to follow an Assistant message with matching `tool_calls`.
-    /// When popping beyond `max_messages`, we continue popping until the conversation starts
-    /// cleanly on a User message boundary.
+    /// When popping beyond `max_messages` or `max_tokens_budget`, we continue popping until
+    /// the conversation starts cleanly on a User message boundary.
     fn prune(&mut self) {
         while self.messages.len() > self.max_messages {
             self.messages.pop_front();
+        }
+
+        if let Some(budget) = self.max_tokens_budget {
+            while !self.messages.is_empty() {
+                let current_tokens = crate::token::estimate_conversation_tokens(&self.get_messages());
+                if current_tokens <= budget {
+                    break;
+                }
+                self.messages.pop_front();
+            }
         }
 
         // Drop any orphaned tool responses that lost their preceding assistant call.
@@ -150,6 +184,8 @@ pub struct SlidingWindowMemory {
     sessions: DashMap<String, SessionMemory>,
     /// Default maximum message window size configured per session.
     default_max_messages: usize,
+    /// Default maximum token budget per session.
+    default_max_tokens: Option<usize>,
 }
 
 /// Backward-compatible alias for [`SlidingWindowMemory`].
@@ -170,7 +206,22 @@ impl SlidingWindowMemory {
         Self {
             sessions: DashMap::new(),
             default_max_messages,
+            default_max_tokens: None,
         }
+    }
+
+    /// Sets default token budget for sessions managed by this memory store.
+    pub fn with_token_budget(mut self, budget: usize) -> Self {
+        self.default_max_tokens = Some(budget);
+        self
+    }
+
+    /// Returns estimated token count for a given session.
+    pub fn estimated_tokens(&self, session_key: &str) -> usize {
+        self.sessions
+            .get(session_key)
+            .map(|s| s.estimated_tokens())
+            .unwrap_or(0)
     }
 
     /// Formats a standard Kanon composite session key from channel and sender IDs.
@@ -182,7 +233,7 @@ impl SlidingWindowMemory {
     pub fn push_message_sync(&self, session_key: &str, message: ChatMessage) {
         self.sessions
             .entry(session_key.to_string())
-            .or_insert_with(|| SessionMemory::new(self.default_max_messages))
+            .or_insert_with(|| SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens))
             .push_message(message);
     }
 
@@ -198,7 +249,7 @@ impl SlidingWindowMemory {
     pub fn set_system_prompt_sync(&self, session_key: &str, prompt: impl Into<String>) {
         self.sessions
             .entry(session_key.to_string())
-            .or_insert_with(|| SessionMemory::new(self.default_max_messages))
+            .or_insert_with(|| SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens))
             .set_system_prompt(prompt);
     }
 

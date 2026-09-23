@@ -9,10 +9,12 @@
 
 use std::time::Duration;
 use async_trait::async_trait;
+use tokio_stream::StreamExt;
 
 use crate::error::GatewayError;
+use crate::gateway::providers::sse::SseDecoder;
 use crate::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role, TokenUsage, ToolCall};
-use crate::gateway::LlmProvider;
+use crate::gateway::{ChatChunk, ChatChunkStream, LlmProvider};
 
 /// Private wire structures representing the standard OpenAI Chat Completions JSON schema.
 #[allow(dead_code)]
@@ -29,7 +31,10 @@ mod wire {
         pub temperature: Option<f32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub max_tokens: Option<u32>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        pub stream: bool,
     }
+
 
     #[derive(Debug, Serialize, Deserialize)]
     pub struct OpenAiMessageWire {
@@ -98,7 +103,48 @@ mod wire {
         pub completion_tokens: u32,
         pub total_tokens: u32,
     }
+
+    #[derive(Debug, Deserialize)]
+    pub struct OpenAiStreamResponse {
+        pub choices: Vec<OpenAiStreamChoice>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct OpenAiStreamChoice {
+        pub index: usize,
+        pub delta: OpenAiStreamDelta,
+        pub finish_reason: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct OpenAiStreamDelta {
+        #[serde(default)]
+        pub role: Option<String>,
+        #[serde(default)]
+        pub content: Option<String>,
+        #[serde(default)]
+        pub tool_calls: Option<Vec<OpenAiToolCallChunkWire>>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct OpenAiToolCallChunkWire {
+        #[serde(default)]
+        pub index: Option<usize>,
+        #[serde(default)]
+        pub id: Option<String>,
+        #[serde(default)]
+        pub function: Option<OpenAiFunctionChunkWire>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct OpenAiFunctionChunkWire {
+        #[serde(default)]
+        pub name: Option<String>,
+        #[serde(default)]
+        pub arguments: Option<String>,
+    }
 }
+
 
 /// Generic, protocol-level HTTP client implementing the OpenAI Chat Completions API.
 pub struct OpenAiChatProvider {
@@ -227,6 +273,7 @@ impl LlmProvider for OpenAiChatProvider {
             tools,
             temperature: request.temperature,
             max_tokens: request.max_tokens,
+            stream: false,
         };
 
         let mut req_builder = self.client.post(&self.endpoint).json(&wire_req);
@@ -288,4 +335,146 @@ impl LlmProvider for OpenAiChatProvider {
             usage,
         })
     }
+
+    async fn chat_stream(&self, request: &ChatRequest) -> Result<ChatChunkStream, GatewayError> {
+        let model = if !request.model.is_empty() {
+            &request.model
+        } else {
+            &self.default_model
+        };
+
+        let messages: Vec<wire::OpenAiMessageWire> = request
+            .messages
+            .iter()
+            .map(Self::map_message_to_wire)
+            .collect();
+
+        let tools = if request.tools.is_empty() {
+            None
+        } else {
+            Some(
+                request
+                    .tools
+                    .iter()
+                    .map(|t| wire::OpenAiToolWire {
+                        r#type: "function".to_string(),
+                        function: wire::OpenAiFunctionWire {
+                            name: t.name.clone(),
+                            description: t.description.clone(),
+                            parameters: t.parameters.clone(),
+                        },
+                    })
+                    .collect(),
+            )
+        };
+
+        let wire_req = wire::OpenAiChatRequest {
+            model,
+            messages,
+            tools,
+            temperature: request.temperature,
+            max_tokens: request.max_tokens,
+            stream: true,
+        };
+
+        let mut req_builder = self.client.post(&self.endpoint).json(&wire_req);
+
+        if let Some(ref key) = self.api_key {
+            req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
+        }
+
+        for (k, v) in &self.custom_headers {
+            req_builder = req_builder.header(k, v);
+        }
+
+        let resp = req_builder.send().await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ApiStatus {
+                status: status.as_u16(),
+                message: err_body,
+            });
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let mut byte_stream = resp.bytes_stream();
+
+        tokio::spawn(async move {
+            let mut decoder = SseDecoder::new();
+            let mut has_finished = false;
+
+            while let Some(chunk_res) = byte_stream.next().await {
+                let chunk = match chunk_res {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(Err(GatewayError::Http(e))).await;
+                        return;
+                    }
+                };
+
+                let events = decoder.decode(&chunk);
+                for ev in events {
+                    if ev.data.trim() == "[DONE]" {
+                        if !has_finished {
+                            let _ = tx.send(Ok(ChatChunk::done(Some("stop".to_string())))).await;
+                        }
+                        return;
+                    }
+
+
+                    if let Ok(stream_resp) = serde_json::from_str::<wire::OpenAiStreamResponse>(&ev.data) {
+                        for choice in stream_resp.choices {
+                            let finish_reason = choice.finish_reason;
+                            let is_done = finish_reason.is_some();
+                            if is_done {
+                                has_finished = true;
+                            }
+
+                            let delta_text = choice.delta.content.unwrap_or_default();
+                            let tool_calls = choice
+                                .delta
+                                .tool_calls
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|tc| ToolCall {
+                                    id: tc.id.unwrap_or_default(),
+                                    name: tc
+                                        .function
+                                        .as_ref()
+                                        .and_then(|f| f.name.clone())
+                                        .unwrap_or_default(),
+                                    arguments: tc
+                                        .function
+                                        .as_ref()
+                                        .and_then(|f| f.arguments.as_ref())
+                                        .and_then(|args| serde_json::from_str(args).ok())
+                                        .unwrap_or(serde_json::json!({})),
+                                })
+                                .collect();
+
+                            let out_chunk = ChatChunk {
+                                delta_text,
+                                is_finished: is_done,
+                                finish_reason,
+                                tool_calls,
+                            };
+
+                            if tx.send(Ok(out_chunk)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !has_finished {
+                let _ = tx.send(Ok(ChatChunk::done(None))).await;
+            }
+        });
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
 }
+

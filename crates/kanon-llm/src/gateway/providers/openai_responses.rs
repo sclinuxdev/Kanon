@@ -8,10 +8,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use async_trait::async_trait;
+use tokio_stream::StreamExt;
 
 use crate::error::GatewayError;
+use crate::gateway::providers::sse::SseDecoder;
 use crate::gateway::types::{ChatRequest, ChatResponse, Role, TokenUsage, ToolCall};
-use crate::gateway::LlmProvider;
+use crate::gateway::{ChatChunk, ChatChunkStream, LlmProvider};
 
 static CALL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -32,7 +34,10 @@ mod wire {
         pub temperature: Option<f32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub max_output_tokens: Option<u32>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        pub stream: bool,
     }
+
 
     #[derive(Debug, Serialize)]
     #[serde(tag = "type")]
@@ -281,6 +286,7 @@ impl LlmProvider for OpenAiResponsesProvider {
             tools,
             temperature: req.temperature,
             max_output_tokens: req.max_tokens,
+            stream: false,
         };
 
         // 3. Dispatch HTTP request with bearer authorization & custom headers
@@ -390,4 +396,160 @@ impl LlmProvider for OpenAiResponsesProvider {
             finish_reason,
         })
     }
+
+    async fn chat_stream(&self, req: &ChatRequest) -> Result<ChatChunkStream, GatewayError> {
+        let mut instructions = Vec::new();
+        let mut input = Vec::new();
+
+        for msg in &req.messages {
+            match msg.role {
+                Role::System => {
+                    if let Some(ref text) = msg.content {
+                        instructions.push(text.clone());
+                    }
+                }
+                Role::User => {
+                    let text = msg.content.clone().unwrap_or_default();
+                    input.push(wire::ResponsesInputItem::Message {
+                        role: "user".to_string(),
+                        content: vec![wire::ResponsesContentPart::InputText { text }],
+                    });
+                }
+                Role::Assistant => {
+                    if let Some(ref text) = msg.content
+                        && !text.is_empty()
+                    {
+                        input.push(wire::ResponsesInputItem::Message {
+                            role: "assistant".to_string(),
+                            content: vec![wire::ResponsesContentPart::OutputText { text: text.clone() }],
+                        });
+                    }
+                    if let Some(ref calls) = msg.tool_calls {
+                        for call in calls {
+                            input.push(wire::ResponsesInputItem::FunctionCall {
+                                call_id: call.id.clone(),
+                                name: call.name.clone(),
+                                arguments: call.arguments.to_string(),
+                            });
+                        }
+                    }
+                }
+                Role::Tool => {
+                    input.push(wire::ResponsesInputItem::FunctionCallOutput {
+                        call_id: msg.tool_call_id.clone().unwrap_or_default(),
+                        output: msg.content.clone().unwrap_or_default(),
+                    });
+                }
+            }
+        }
+
+        let instructions = if instructions.is_empty() {
+            None
+        } else {
+            Some(instructions.join("\n\n"))
+        };
+
+        let tools = if req.tools.is_empty() {
+            None
+        } else {
+            Some(
+                req.tools
+                    .iter()
+                    .map(|t| wire::ResponsesToolWire {
+                        tool_type: "function",
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: t.parameters.clone(),
+                    })
+                    .collect(),
+            )
+        };
+
+        let body = wire::ResponsesRequest {
+            model: &req.model,
+            instructions,
+            input,
+            tools,
+            temperature: req.temperature,
+            max_output_tokens: req.max_tokens,
+            stream: true,
+        };
+
+        let mut req_builder = self
+            .client
+            .post(&self.endpoint)
+            .header("Content-Type", "application/json")
+            .json(&body);
+
+        if !self.api_key.is_empty() {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+
+        for (k, v) in &self.custom_headers {
+            req_builder = req_builder.header(k, v);
+        }
+
+        let resp = req_builder.send().await.map_err(GatewayError::Http)?;
+        let status = resp.status();
+
+        if !status.is_success() {
+            let error_text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ApiStatus {
+                status: status.as_u16(),
+                message: error_text,
+            });
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let mut byte_stream = resp.bytes_stream();
+
+        tokio::spawn(async move {
+            let mut decoder = SseDecoder::new();
+
+            while let Some(chunk_res) = byte_stream.next().await {
+                let chunk = match chunk_res {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(Err(GatewayError::Http(e))).await;
+                        return;
+                    }
+                };
+
+                let events = decoder.decode(&chunk);
+                for ev in events {
+                    if ev.data.trim() == "[DONE]" {
+                        let _ = tx.send(Ok(ChatChunk::done(Some("completed".to_string())))).await;
+                        return;
+                    }
+
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&ev.data) {
+                        let event_type = ev.event.as_deref().or_else(|| val["type"].as_str());
+
+                        if let Some("response.output_text.delta") = event_type {
+                            if let Some(delta) = val["delta"].as_str()
+                                && tx.send(Ok(ChatChunk::delta(delta))).await.is_err()
+                            {
+                                return;
+                            }
+                        } else if let Some("response.completed" | "response.done") = event_type {
+                            let _ = tx.send(Ok(ChatChunk::done(Some("completed".to_string())))).await;
+                            return;
+                        } else if let Some(delta) = val.get("delta").and_then(|d| d.as_str())
+                            && tx.send(Ok(ChatChunk::delta(delta))).await.is_err()
+                        {
+                            return;
+                        }
+
+
+                    }
+                }
+            }
+
+            let _ = tx.send(Ok(ChatChunk::done(None))).await;
+        });
+
+
+        Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+    }
 }
+

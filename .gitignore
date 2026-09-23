@@ -1,0 +1,18 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+
+# Node
+node_modules/
+dist/
+*.log
+
+# Data
+data/
+*.sock

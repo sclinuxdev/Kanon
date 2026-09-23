@@ -1,0 +1,1 @@
+//! IPC Listener trait skeleton

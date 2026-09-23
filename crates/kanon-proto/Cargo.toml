@@ -1,0 +1,13 @@
+[package]
+name = "kanon-proto"
+version = "0.1.0"
+edition = "2024"
+description = "Protobuf and gRPC definitions for Kanon"
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+[build-dependencies]
+tonic-build = "0.12"

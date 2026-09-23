@@ -1,0 +1,14 @@
+[plugin]
+id = "org.kanon.plugin.demo_rust"
+name = "Demo Rust Plugin"
+version = "0.1.0"
+author = "Kanon Dev"
+description = "Demonstration plugin written in Rust"
+runtime = "rust"
+entrypoint = "target/debug/demo-rust-plugin"
+isolated = false
+
+[[commands]]
+name = "rustcalc"
+description = "High-performance calculation command"
+usage = "/rustcalc <expr>"

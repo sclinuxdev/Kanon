@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kanon-proto",
+    "crates/kanon-transport",
+    "crates/kanon-storage",
+    "crates/kanon-llm",
+    "crates/kanon-core",
+    "crates/kanon-api",
+    "crates/kanon-dev",
+    "sdks/rust/kanon-sdk",
+    "sdks/rust/plugins/demo_rust_plugin",
+]

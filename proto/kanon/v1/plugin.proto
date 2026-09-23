@@ -1,0 +1,250 @@
+syntax = "proto3";
+
+package kanon.plugin.v1;
+
+import "google/protobuf/struct.proto";
+
+// 1. 插件宿主生命周期服务 (运行在 Host 端)
+service PluginHostService {
+  rpc Ping (PingRequest) returns (PingResponse);
+  rpc ReloadPluginConfig (ReloadPluginConfigRequest) returns (ReloadPluginConfigResponse);
+}
+
+// 2. 消息与事件管道服务 (运行在 Host 端，Core 主动连接各 Host 端点发起调用)
+service MessagePipelineService {
+  rpc OnPreFilter (PipelineEventRequest) returns (PreFilterResult);
+  rpc OnExecuteCommand (CommandExecuteRequest) returns (CommandExecuteResponse);
+  rpc OnCallTool (ToolCallRequest) returns (ToolCallResponse);
+  rpc OnEvent (EventNotification) returns (EventAck);
+  rpc OnDeliverMessage (DeliverMessageRequest) returns (DeliverMessageResponse);
+}
+
+// 3. 核心 API 服务 (运行在 Core 端，监听 core.sock / loopback，Host 主动连接调用)
+service BotApiService {
+  rpc RegisterHost (RegisterHostRequest) returns (RegisterHostResponse);
+  rpc IngestEvent (IngestEventRequest) returns (IngestEventResponse);
+  rpc SendMessage (SendMessageRequest) returns (SendMessageResponse);
+  rpc RequestLLM (LLMRequest) returns (stream LLMChunk);
+  rpc SetStorage (SetStorageRequest) returns (SetStorageResponse);
+  rpc GetStorage (GetStorageRequest) returns (GetStorageResponse);
+}
+
+// --- 握手与注册 ---
+
+message RegisterHostRequest {
+  string host_id = 1;
+  string runtime = 2; // "rust", "python", "typescript"
+  string endpoint = 3; // Host 监听的专属 socket 路径或 loopback 地址
+  repeated string loaded_plugin_ids = 4;
+}
+
+message RegisterHostResponse {
+  bool success = 1;
+  string message = 2;
+  google.protobuf.Struct core_metadata = 3;
+}
+
+message PingRequest {
+  int64 timestamp = 1;
+}
+
+message PingResponse {
+  int64 timestamp = 1;
+}
+
+message ReloadPluginConfigRequest {
+  string plugin_id = 1;
+  google.protobuf.Struct config = 2;
+}
+
+message ReloadPluginConfigResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+// --- 强类型消息段定义 (彻底废弃 map<string, string> 反模式) ---
+
+message PipelineEventRequest {
+  string event_id = 1;
+  string platform = 2;
+  string channel_id = 3;
+  string sender_id = 4;
+  string raw_text = 5;
+  repeated MessageSegment segments = 6;
+  google.protobuf.Struct metadata = 7;
+}
+
+message MessageSegment {
+  oneof segment {
+    TextSegment text = 1;
+    ImageSegment image = 2;
+    AudioSegment audio = 3;
+    MentionSegment mention = 4;
+    ReplySegment reply = 5;
+    RawCustomSegment custom = 6;
+  }
+}
+
+message TextSegment {
+  string content = 1;
+}
+
+message ImageSegment {
+  oneof source {
+    string url = 1;
+    string file_path = 2;
+    bytes raw_bytes = 3;
+  }
+  optional string mime_type = 4;
+  optional string filename = 5;
+}
+
+message AudioSegment {
+  oneof source {
+    string url = 1;
+    string file_path = 2;
+    bytes raw_bytes = 3;
+  }
+  optional int32 duration_seconds = 4;
+}
+
+message MentionSegment {
+  string target_user_id = 1;
+  string display_name = 2;
+  bool is_all = 3;
+}
+
+message ReplySegment {
+  string target_message_id = 1;
+  string snippet = 2;
+}
+
+message RawCustomSegment {
+  string type_name = 1;
+  google.protobuf.Struct payload = 2;
+}
+
+// --- 流水线与指令定义 ---
+
+message PreFilterResult {
+  enum Action {
+    PASS = 0;
+    BLOCK = 1;
+    MODIFY = 2;
+  }
+  Action action = 1;
+  string modified_text = 2;
+  repeated MessageSegment reply_messages = 3;
+}
+
+message CommandExecuteRequest {
+  string plugin_id = 1;
+  string command = 2;
+  repeated string args = 3;
+  PipelineEventRequest context = 4;
+}
+
+message CommandExecuteResponse {
+  bool success = 1;
+  repeated MessageSegment replies = 2;
+  string error_message = 3;
+}
+
+// --- Tool Calling 双模载荷定义 (彻底消灭 JSON 字符串二次序列化) ---
+
+message ToolCallRequest {
+  string call_id = 1;
+  string tool_name = 2;
+  string session_id = 3;
+  oneof payload {
+    google.protobuf.Struct structured_args = 4;
+    bytes raw_bytes = 5;
+  }
+}
+
+message ToolCallResponse {
+  string call_id = 1;
+  bool success = 2;
+  string error_message = 3;
+  oneof payload {
+    google.protobuf.Struct structured_result = 4;
+    bytes raw_bytes = 5;
+  }
+}
+
+message EventNotification {
+  string event_type = 1;
+  google.protobuf.Struct payload = 2;
+}
+
+message EventAck {
+  bool received = 1;
+}
+
+message DeliverMessageRequest {
+  string platform = 1;
+  string channel_id = 2;
+  string recipient_id = 3;
+  repeated MessageSegment segments = 4;
+}
+
+message DeliverMessageResponse {
+  bool success = 1;
+  string message_id = 2;
+  string error_message = 3;
+}
+
+message IngestEventRequest {
+  string platform = 1;
+  PipelineEventRequest event = 2;
+}
+
+message IngestEventResponse {
+  bool accepted = 1;
+  string event_id = 2;
+}
+
+message SendMessageRequest {
+  string platform = 1;
+  string channel_id = 2;
+  string recipient_id = 3;
+  repeated MessageSegment segments = 4;
+}
+
+message SendMessageResponse {
+  bool success = 1;
+  string message_id = 2;
+  string error_message = 3;
+}
+
+message LLMRequest {
+  string prompt = 1;
+  string model = 2;
+  google.protobuf.Struct parameters = 3;
+}
+
+message LLMChunk {
+  string delta_text = 1;
+  bool is_finished = 2;
+}
+
+message SetStorageRequest {
+  string plugin_id = 1;
+  string key = 2;
+  bytes value = 3;
+  int64 ttl_seconds = 4;
+}
+
+message SetStorageResponse {
+  bool success = 1;
+}
+
+message GetStorageRequest {
+  string plugin_id = 1;
+  string key = 2;
+}
+
+message GetStorageResponse {
+  bool found = 1;
+  bytes value = 2;
+}

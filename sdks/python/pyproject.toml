@@ -1,0 +1,15 @@
+[project]
+name = "kanon-python-host"
+version = "0.1.0"
+description = "Official Python Host and SDK skeleton for Kanon"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "grpcio>=1.60.0",
+    "protobuf>=4.25.0",
+    "pydantic>=2.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

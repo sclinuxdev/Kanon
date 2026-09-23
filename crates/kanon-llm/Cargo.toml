@@ -1,0 +1,12 @@
+[package]
+name = "kanon-llm"
+version = "0.1.0"
+edition = "2024"
+description = "LLM gateway, context memory manager, and tool calling router for Kanon"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+kanon-proto = { path = "../kanon-proto" }

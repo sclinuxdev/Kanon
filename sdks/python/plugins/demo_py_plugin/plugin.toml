@@ -1,0 +1,14 @@
+[plugin]
+id = "org.kanon.plugin.demo_py"
+name = "Demo Python Plugin"
+version = "0.1.0"
+author = "Kanon Dev"
+description = "Demonstration plugin written in Python"
+runtime = "python"
+entrypoint = "main.py"
+isolated = false
+
+[[commands]]
+name = "pycalc"
+description = "Python-based calculation command"
+usage = "/pycalc <expr>"

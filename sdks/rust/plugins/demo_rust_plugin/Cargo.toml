@@ -1,0 +1,9 @@
+[package]
+name = "demo-rust-plugin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kanon-sdk = { path = "../../kanon-sdk" }
+tokio = { version = "1.40", features = ["full"] }
+serde_json = "1.0"

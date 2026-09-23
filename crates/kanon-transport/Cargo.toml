@@ -1,0 +1,12 @@
+[package]
+name = "kanon-transport"
+version = "0.1.0"
+edition = "2024"
+description = "Cross-platform IPC transport abstraction (UDS and authenticated loopback) for Kanon"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+tonic = "0.12"
+constant_time_eq = "0.3"
+thiserror = "1.0"
+tracing = "0.1"

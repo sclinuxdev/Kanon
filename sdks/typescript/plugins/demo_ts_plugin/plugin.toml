@@ -1,0 +1,14 @@
+[plugin]
+id = "org.kanon.plugin.demo_ts"
+name = "Demo TypeScript Plugin"
+version = "0.1.0"
+author = "Kanon Dev"
+description = "Demonstration plugin written in TypeScript"
+runtime = "typescript"
+entrypoint = "index.ts"
+isolated = false
+
+[[commands]]
+name = "tsgreet"
+description = "TypeScript-based greeting command"
+usage = "/tsgreet <name>"

@@ -1,17 +1,19 @@
 //! Comprehensive unit tests for Kanon Agent engine, pluggable Memory, and Protocol Providers.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::RwLock;
 
-use kanon_llm::agent::{Agent, AgentConfig};
-use kanon_llm::gateway::providers::{AnthropicMessagesProvider, OpenAiChatProvider};
-use kanon_llm::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role, ToolCall};
+use kanon_llm::agent::{Agent, AgentConfig, AgentHook, NativeTool};
+use kanon_llm::gateway::providers::{
+    AnthropicMessagesProvider, OpenAiChatProvider, OpenAiResponsesProvider,
+};
+use kanon_llm::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role, ToolCall, ToolDefinition};
 use kanon_llm::gateway::LlmProvider;
 use kanon_llm::memory::Memory;
 use kanon_llm::tool_router::{json_to_prost_struct, prost_struct_to_json, ToolHost};
-use kanon_llm::GatewayError;
+use kanon_llm::{AgentError, GatewayError};
 use kanon_proto::v1::{
     tool_call_request, tool_call_response, PluginMeta, ToolCallRequest, ToolCallResponse, ToolMeta,
 };
@@ -149,7 +151,52 @@ impl Memory for CustomPluginMemory {
 }
 
 // =========================================================================
-// 3. Tests
+// 3. Custom Lifecycle Hook Implementation
+// =========================================================================
+
+struct TracingHook {
+    request_intercepted: Arc<AtomicBool>,
+    response_intercepted: Arc<AtomicBool>,
+    tool_authorized: Arc<AtomicBool>,
+    tool_finished: Arc<AtomicBool>,
+    should_veto: bool,
+}
+
+#[async_trait]
+impl AgentHook for TracingHook {
+    async fn on_llm_request(&self, _session_id: &str, _request: &mut ChatRequest) -> Result<(), AgentError> {
+        self.request_intercepted.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn on_llm_response(&self, _session_id: &str, _response: &mut ChatResponse) -> Result<(), AgentError> {
+        self.response_intercepted.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn on_before_tool_call(&self, _session_id: &str, _call: &ToolCall) -> Result<bool, AgentError> {
+        self.tool_authorized.store(true, Ordering::SeqCst);
+        if self.should_veto {
+            Ok(false)
+        } else {
+            Ok(true)
+        }
+    }
+
+    async fn on_after_tool_call(
+        &self,
+        _session_id: &str,
+        _call: &ToolCall,
+        _result: &str,
+        _success: bool,
+    ) -> Result<(), AgentError> {
+        self.tool_finished.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+// =========================================================================
+// 4. Tests
 // =========================================================================
 
 #[tokio::test]
@@ -231,12 +278,148 @@ async fn test_agent_builder_and_execution_with_custom_memory() {
     assert_eq!(history[4].role, Role::Assistant);
 }
 
+#[tokio::test]
+async fn test_agent_native_in_process_tool_and_standalone_run() {
+    let turn1 = ChatResponse {
+        content: None,
+        tool_calls: vec![ToolCall {
+            id: "call_calc_1".to_string(),
+            name: "multiply".to_string(),
+            arguments: serde_json::json!({ "x": 6.0, "y": 7.0 }),
+        }],
+        finish_reason: Some("tool_calls".to_string()),
+        usage: None,
+    };
+
+    let turn2 = ChatResponse {
+        content: Some("Result is 42.".to_string()),
+        tool_calls: vec![],
+        finish_reason: Some("stop".to_string()),
+        usage: None,
+    };
+
+    let provider = Arc::new(ScriptedLlmProvider::new(vec![turn1, turn2]));
+
+    let multiply_tool = NativeTool::new(
+        ToolDefinition {
+            name: "multiply".to_string(),
+            description: "Multiplies two numbers".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "x": { "type": "number" },
+                    "y": { "type": "number" }
+                }
+            }),
+        },
+        |_session_id, args| async move {
+            let x = args.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = args.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            Ok(format!("{}", x * y))
+        },
+    );
+
+    let agent = Agent::builder("math_agent", provider)
+        .tool(multiply_tool)
+        .build();
+
+    // Standalone execution does not require any external gRPC plugin processes!
+    let output = agent
+        .run_standalone("session_standalone", "What is 6 * 7?")
+        .await
+        .expect("Standalone run with native tool should succeed");
+
+    assert_eq!(output.content, "Result is 42.");
+    assert_eq!(output.executed_tools.len(), 1);
+    assert_eq!(output.executed_tools[0].tool_name, "multiply");
+    assert_eq!(output.executed_tools[0].plugin_id, "native");
+    assert_eq!(output.executed_tools[0].host_id, "in_process");
+    assert!(output.executed_tools[0].success);
+}
+
+#[tokio::test]
+async fn test_agent_lifecycle_hooks_and_veto() {
+    let req_flag = Arc::new(AtomicBool::new(false));
+    let resp_flag = Arc::new(AtomicBool::new(false));
+    let auth_flag = Arc::new(AtomicBool::new(false));
+    let fin_flag = Arc::new(AtomicBool::new(false));
+
+    let hook = TracingHook {
+        request_intercepted: req_flag.clone(),
+        response_intercepted: resp_flag.clone(),
+        tool_authorized: auth_flag.clone(),
+        tool_finished: fin_flag.clone(),
+        should_veto: true, // Veto the tool execution!
+    };
+
+    let turn1 = ChatResponse {
+        content: None,
+        tool_calls: vec![ToolCall {
+            id: "call_dangerous".to_string(),
+            name: "delete_database".to_string(),
+            arguments: serde_json::json!({}),
+        }],
+        finish_reason: Some("tool_calls".to_string()),
+        usage: None,
+    };
+
+    let turn2 = ChatResponse {
+        content: Some("I was unable to perform the deletion because permission was denied.".to_string()),
+        tool_calls: vec![],
+        finish_reason: Some("stop".to_string()),
+        usage: None,
+    };
+
+    let provider = Arc::new(ScriptedLlmProvider::new(vec![turn1, turn2]));
+
+    let agent = Agent::builder("safety_agent", provider)
+        .hook(hook)
+        .build();
+
+    let output = agent
+        .run_standalone("sess_guardrail", "Delete all database tables")
+        .await
+        .expect("Agent execution should succeed with vetoed tool");
+
+    assert!(req_flag.load(Ordering::SeqCst));
+    assert!(resp_flag.load(Ordering::SeqCst));
+    assert!(auth_flag.load(Ordering::SeqCst));
+    // Since it was vetoed, tool execution never finished:
+    assert!(!fin_flag.load(Ordering::SeqCst));
+
+    assert_eq!(output.executed_tools.len(), 1);
+    assert!(!output.executed_tools[0].success);
+    assert_eq!(output.executed_tools[0].plugin_id, "policy");
+}
+
+#[test]
+fn test_openai_responses_provider_endpoints_and_headers() {
+    let p1 = OpenAiResponsesProvider::new("sk-test");
+    assert_eq!(p1.endpoint(), "https://api.openai.com/v1/responses");
+
+    let p2 = OpenAiResponsesProvider::new("sk-test")
+        .with_base_url("https://api.openai.com");
+    assert_eq!(p2.endpoint(), "https://api.openai.com/v1/responses");
+
+    let p3 = OpenAiResponsesProvider::new("sk-test")
+        .with_base_url("https://custom.ai/v1");
+    assert_eq!(p3.endpoint(), "https://custom.ai/v1/responses");
+
+    let p4 = OpenAiResponsesProvider::new("sk-test")
+        .with_base_url("https://custom.ai/responses/");
+    assert_eq!(p4.endpoint(), "https://custom.ai/responses");
+
+    let p5 = OpenAiResponsesProvider::new("sk-test")
+        .with_header("x-trace-id", "trace-abc");
+    assert_eq!(p5.custom_headers().len(), 1);
+    assert_eq!(p5.custom_headers()[0], ("x-trace-id".to_string(), "trace-abc".to_string()));
+}
+
 #[test]
 fn test_openai_chat_provider_endpoint_and_headers() {
     let provider = OpenAiChatProvider::new("http://localhost:8000/v1", Some("sk-test".to_string()), "gpt-4o")
         .with_header("x-org-id", "org_123");
 
-    // Validates clean construction without panicking or hardcoding
     let _ = provider;
 }
 

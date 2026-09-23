@@ -1,0 +1,393 @@
+//! OpenAI Responses protocol implementation.
+//!
+//! Protocol-level client conforming to the modern OpenAI `/v1/responses` specification.
+//! Designed for stateful agentic workflows, complex reasoning chains, and typed output streams.
+//!
+//! Compatible with OpenAI `/v1/responses` and compatible gateways (e.g. SambaNova, OpenResponses).
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use async_trait::async_trait;
+
+use crate::error::GatewayError;
+use crate::gateway::types::{ChatRequest, ChatResponse, Role, TokenUsage, ToolCall};
+use crate::gateway::LlmProvider;
+
+static CALL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Private wire structures representing the OpenAI Responses API format.
+#[allow(dead_code)]
+mod wire {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Serialize)]
+    pub struct ResponsesRequest<'a> {
+        pub model: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub instructions: Option<String>,
+        pub input: Vec<ResponsesInputItem>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub tools: Option<Vec<ResponsesToolWire>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub temperature: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub max_output_tokens: Option<u32>,
+    }
+
+    #[derive(Debug, Serialize)]
+    #[serde(tag = "type")]
+    pub enum ResponsesInputItem {
+        #[serde(rename = "message")]
+        Message {
+            role: String,
+            content: Vec<ResponsesContentPart>,
+        },
+        #[serde(rename = "function_call")]
+        FunctionCall {
+            call_id: String,
+            name: String,
+            arguments: String,
+        },
+        #[serde(rename = "function_call_output")]
+        FunctionCallOutput {
+            call_id: String,
+            output: String,
+        },
+    }
+
+    #[derive(Debug, Serialize)]
+    #[serde(tag = "type")]
+    pub enum ResponsesContentPart {
+        #[serde(rename = "input_text")]
+        InputText { text: String },
+        #[serde(rename = "output_text")]
+        OutputText { text: String },
+    }
+
+    #[derive(Debug, Serialize)]
+    pub struct ResponsesToolWire {
+        #[serde(rename = "type")]
+        pub tool_type: &'static str,
+        pub name: String,
+        pub description: String,
+        pub parameters: serde_json::Value,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct ResponsesResponseWire {
+        #[serde(default)]
+        pub id: Option<String>,
+        #[serde(default)]
+        pub status: Option<String>,
+        #[serde(default)]
+        pub output: Vec<ResponsesOutputWire>,
+        #[serde(default)]
+        pub usage: Option<ResponsesUsageWire>,
+        #[serde(default)]
+        pub error: Option<ResponsesErrorWire>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct ResponsesErrorWire {
+        pub message: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type")]
+    pub enum ResponsesOutputWire {
+        #[serde(rename = "message")]
+        Message {
+            #[serde(default)]
+            role: Option<String>,
+            #[serde(default)]
+            content: Vec<ResponsesOutputContentPart>,
+        },
+        #[serde(rename = "function_call")]
+        FunctionCall {
+            #[serde(default)]
+            call_id: Option<String>,
+            #[serde(default)]
+            id: Option<String>,
+            name: String,
+            arguments: serde_json::Value,
+        },
+        #[serde(other)]
+        Other,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "type")]
+    pub enum ResponsesOutputContentPart {
+        #[serde(rename = "output_text")]
+        OutputText { text: String },
+        #[serde(other)]
+        Other,
+    }
+
+    #[derive(Debug, Deserialize)]
+    pub struct ResponsesUsageWire {
+        pub input_tokens: Option<u32>,
+        pub output_tokens: Option<u32>,
+        pub total_tokens: Option<u32>,
+    }
+}
+
+/// Client for the OpenAI Responses API (`/v1/responses`).
+///
+/// Converts between Kanon internal agent types and the typed items protocol used
+/// by modern OpenAI Responses endpoints.
+pub struct OpenAiResponsesProvider {
+    api_key: String,
+    endpoint: String,
+    client: reqwest::Client,
+    custom_headers: Vec<(String, String)>,
+}
+
+impl OpenAiResponsesProvider {
+    /// Constructs a new [`OpenAiResponsesProvider`] with default endpoint `https://api.openai.com/v1/responses`.
+    pub fn new(api_key: impl Into<String>) -> Self {
+        Self {
+            api_key: api_key.into(),
+            endpoint: "https://api.openai.com/v1/responses".to_string(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(60))
+                .build()
+                .unwrap_or_default(),
+            custom_headers: Vec::new(),
+        }
+    }
+
+    /// Sets the base URL, automatically normalizing and appending the `/responses` endpoint path.
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        let base = base_url.into().trim_end_matches('/').to_string();
+        if base.ends_with("/responses") {
+            self.endpoint = base;
+        } else if base.ends_with("/v1") {
+            self.endpoint = format!("{base}/responses");
+        } else {
+            self.endpoint = format!("{base}/v1/responses");
+        }
+        self
+    }
+
+    /// Overrides the exact target HTTP endpoint URL.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
+    /// Appends a custom HTTP header to all outbound requests (e.g. for proxy routing or tracing).
+    pub fn with_header(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
+        self.custom_headers.push((key.into(), val.into()));
+        self
+    }
+
+    /// Configures the HTTP client connection/request timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap_or_default();
+        self
+    }
+
+    /// Returns the currently configured endpoint URL.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Returns custom headers configured on this client.
+    pub fn custom_headers(&self) -> &[(String, String)] {
+        &self.custom_headers
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiResponsesProvider {
+    async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, GatewayError> {
+        let mut instructions = Vec::new();
+        let mut input = Vec::new();
+
+        // 1. Map messages into Responses API input items and extract system instructions
+        for msg in &req.messages {
+            match msg.role {
+                Role::System => {
+                    if let Some(ref text) = msg.content {
+                        instructions.push(text.clone());
+                    }
+                }
+                Role::User => {
+                    let text = msg.content.clone().unwrap_or_default();
+                    input.push(wire::ResponsesInputItem::Message {
+                        role: "user".to_string(),
+                        content: vec![wire::ResponsesContentPart::InputText { text }],
+                    });
+                }
+                Role::Assistant => {
+                    if let Some(ref text) = msg.content
+                        && !text.is_empty()
+                    {
+                        input.push(wire::ResponsesInputItem::Message {
+                            role: "assistant".to_string(),
+                            content: vec![wire::ResponsesContentPart::OutputText { text: text.clone() }],
+                        });
+                    }
+                    if let Some(ref calls) = msg.tool_calls {
+                        for call in calls {
+                            input.push(wire::ResponsesInputItem::FunctionCall {
+                                call_id: call.id.clone(),
+                                name: call.name.clone(),
+                                arguments: call.arguments.to_string(),
+                            });
+                        }
+                    }
+                }
+                Role::Tool => {
+                    input.push(wire::ResponsesInputItem::FunctionCallOutput {
+                        call_id: msg.tool_call_id.clone().unwrap_or_default(),
+                        output: msg.content.clone().unwrap_or_default(),
+                    });
+                }
+            }
+        }
+
+        let instructions = if instructions.is_empty() {
+            None
+        } else {
+            Some(instructions.join("\n\n"))
+        };
+
+        // 2. Map tool definitions into Responses API flat tool schemas
+        let tools = if req.tools.is_empty() {
+            None
+        } else {
+            Some(
+                req.tools
+                    .iter()
+                    .map(|t| wire::ResponsesToolWire {
+                        tool_type: "function",
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: t.parameters.clone(),
+                    })
+                    .collect(),
+            )
+        };
+
+        let body = wire::ResponsesRequest {
+            model: &req.model,
+            instructions,
+            input,
+            tools,
+            temperature: req.temperature,
+            max_output_tokens: req.max_tokens,
+        };
+
+        // 3. Dispatch HTTP request with bearer authorization & custom headers
+        let mut req_builder = self
+            .client
+            .post(&self.endpoint)
+            .header("Content-Type", "application/json")
+            .json(&body);
+
+        if !self.api_key.is_empty() {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", self.api_key));
+        }
+
+        for (k, v) in &self.custom_headers {
+            req_builder = req_builder.header(k, v);
+        }
+
+        let resp = req_builder.send().await.map_err(GatewayError::Http)?;
+        let status = resp.status();
+
+        if !status.is_success() {
+            let error_text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ApiStatus {
+                status: status.as_u16(),
+                message: error_text,
+            });
+        }
+
+        let raw_bytes = resp.bytes().await.map_err(GatewayError::Http)?;
+        let wire_resp: wire::ResponsesResponseWire =
+            serde_json::from_slice(&raw_bytes).map_err(|e| GatewayError::InvalidResponse(e.to_string()))?;
+
+        if let Some(err) = wire_resp.error {
+            return Err(GatewayError::ApiStatus {
+                status: 200,
+                message: err.message,
+            });
+        }
+
+        // 4. Translate output items (messages & function calls)
+        let mut final_content = String::new();
+        let mut tool_calls = Vec::new();
+
+        for item in wire_resp.output {
+            match item {
+                wire::ResponsesOutputWire::Message { content, .. } => {
+                    for part in content {
+                        match part {
+                            wire::ResponsesOutputContentPart::OutputText { text } => {
+                                final_content.push_str(&text);
+                            }
+                            wire::ResponsesOutputContentPart::Other => {}
+                        }
+                    }
+                }
+                wire::ResponsesOutputWire::FunctionCall {
+                    call_id,
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    let call_id = call_id.or(id).unwrap_or_else(|| {
+                        let cnt = CALL_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                        format!("call_{cnt}")
+                    });
+
+                    let parsed_args = match arguments {
+                        serde_json::Value::String(s) => {
+                            serde_json::from_str(&s).unwrap_or(serde_json::json!({}))
+                        }
+                        val @ serde_json::Value::Object(_) => val,
+                        _ => serde_json::json!({}),
+                    };
+
+                    tool_calls.push(ToolCall {
+                        id: call_id,
+                        name,
+                        arguments: parsed_args,
+                    });
+                }
+                wire::ResponsesOutputWire::Other => {}
+            }
+        }
+
+        let finish_reason = if !tool_calls.is_empty() {
+            Some("tool_calls".to_string())
+        } else {
+            wire_resp.status
+        };
+
+        let usage = wire_resp.usage.map(|u| TokenUsage {
+            prompt_tokens: u.input_tokens.unwrap_or(0),
+            completion_tokens: u.output_tokens.unwrap_or(0),
+            total_tokens: u.total_tokens.unwrap_or_else(|| {
+                u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0)
+            }),
+        });
+
+        Ok(ChatResponse {
+            content: if final_content.is_empty() {
+                None
+            } else {
+                Some(final_content)
+            },
+            tool_calls,
+            usage,
+            finish_reason,
+        })
+    }
+}

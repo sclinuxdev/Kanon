@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use crate::error::GatewayError;
 pub use providers::{
     AnthropicMessagesProvider, AnthropicProvider, OpenAiChatProvider, OpenAiProvider,
+    OpenAiResponsesProvider,
 };
 pub use types::{ChatMessage, ChatRequest, ChatResponse, Role, TokenUsage, ToolCall, ToolDefinition};
 

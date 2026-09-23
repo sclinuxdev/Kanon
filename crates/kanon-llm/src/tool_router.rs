@@ -217,24 +217,3 @@ pub fn json_to_prost_value(val: &serde_json::Value) -> prost_types::Value {
     prost_types::Value { kind }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_prost_json_roundtrip() {
-        let json_input = serde_json::json!({
-            "name": "calc",
-            "count": 42.0,
-            "active": true,
-            "nested": {
-                "tags": ["rust", "plugin"]
-            }
-        });
-
-        let prost_struct = json_to_prost_struct(&json_input).expect("Valid JSON object");
-        let json_output = prost_struct_to_json(prost_struct);
-
-        assert_eq!(json_input, json_output);
-    }
-}

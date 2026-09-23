@@ -6,17 +6,22 @@
 //! Fully modularized:
 //! - Pluggable model providers implementing [`LlmProvider`];
 //! - Pluggable conversational memory implementing [`Memory`];
+//! - Native in-process tools implementing [`AgentTool`] (zero IPC overhead);
 //! - Dynamic cross-process tool calling via [`ToolHost`];
-//! - Configurable recursion limits, sampling parameters, and execution policies.
+//! - Extensible lifecycle hooks via [`AgentHook`] for RAG, guardrails, and tracing;
+//! - Standalone execution mode via [`Agent::run_standalone`].
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use async_trait::async_trait;
 
 use kanon_proto::v1::{
     tool_call_request, tool_call_response, ToolCallRequest,
 };
 
 use crate::error::AgentError;
-use crate::gateway::types::{ChatMessage, ChatRequest, Role};
+use crate::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role, ToolCall, ToolDefinition};
 use crate::gateway::LlmProvider;
 use crate::memory::{Memory, SlidingWindowMemory};
 use crate::tool_router::{
@@ -63,9 +68,122 @@ pub struct AgentOutput {
     pub finish_reason: Option<String>,
 }
 
+/// Pluggable tool abstraction for in-process or native agent tools.
+///
+/// Allows developers, internal modules, or dynamic scripts to expose functions
+/// directly to the agent without requiring external gRPC IPC processes.
+#[async_trait]
+pub trait AgentTool: Send + Sync {
+    /// Name, description, and JSON schema describing parameter expectations.
+    fn definition(&self) -> ToolDefinition;
+
+    /// Invokes the tool implementation in-process.
+    async fn call(&self, session_id: &str, arguments: serde_json::Value) -> Result<String, String>;
+}
+
+/// Helper type for asynchronous native tool closures.
+pub type NativeToolFn = Arc<
+    dyn Fn(
+        &str,
+        serde_json::Value,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// In-process tool constructed directly from a definition and an async closure.
+pub struct NativeTool {
+    definition: ToolDefinition,
+    handler: NativeToolFn,
+}
+
+impl NativeTool {
+    /// Creates a new native in-process tool from a definition and an async handler.
+    pub fn new<F, Fut>(definition: ToolDefinition, f: F) -> Self
+    where
+        F: Fn(&str, serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String, String>> + Send + 'static,
+    {
+        Self {
+            definition,
+            handler: Arc::new(move |sid, args| Box::pin(f(sid, args))),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentTool for NativeTool {
+    fn definition(&self) -> ToolDefinition {
+        self.definition.clone()
+    }
+
+    async fn call(&self, session_id: &str, arguments: serde_json::Value) -> Result<String, String> {
+        (self.handler)(session_id, arguments).await
+    }
+}
+
+/// Lifecycle interception hooks for agent reasoning and execution.
+///
+/// Enables plugins and middleware to implement:
+/// - RAG / semantic context retrieval injection before calling the LLM;
+/// - Guardrails, safety verification, and permission confirmation before tool execution;
+/// - Observability, tracing, token budget tracking, and latency auditing.
+#[async_trait]
+pub trait AgentHook: Send + Sync {
+    /// Invoked immediately before transmitting the request payload to the model provider.
+    async fn on_llm_request(&self, _session_id: &str, _request: &mut ChatRequest) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    /// Invoked immediately upon receiving a completion response from the model.
+    async fn on_llm_response(&self, _session_id: &str, _response: &mut ChatResponse) -> Result<(), AgentError> {
+        Ok(())
+    }
+
+    /// Invoked before dispatching a tool execution.
+    ///
+    /// Return `Ok(true)` to permit execution, or `Ok(false)` to veto / reject execution.
+    async fn on_before_tool_call(&self, _session_id: &str, _call: &ToolCall) -> Result<bool, AgentError> {
+        Ok(true)
+    }
+
+    /// Invoked immediately following completion of a tool execution.
+    async fn on_after_tool_call(
+        &self,
+        _session_id: &str,
+        _call: &ToolCall,
+        _result: &str,
+        _success: bool,
+    ) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
+/// Fallback host used for standalone agent executions without external gRPC plugin processes.
+#[derive(Debug, Clone, Default)]
+pub struct NoopHost;
+
+#[async_trait]
+impl ToolHost for NoopHost {
+    fn host_id(&self) -> &str {
+        "noop"
+    }
+
+    fn plugin_metas(&self) -> &[kanon_proto::v1::PluginMeta] {
+        &[]
+    }
+
+    async fn call_tool(
+        &self,
+        _req: ToolCallRequest,
+    ) -> Result<kanon_proto::v1::ToolCallResponse, tonic::Status> {
+        Err(tonic::Status::not_found("No external plugin host available"))
+    }
+}
+
 /// General-purpose Kanon Agent.
 ///
-/// Encapsulates model backend, memory store, persona instructions, and reasoning policies.
+/// Encapsulates model backend, memory store, native tools, lifecycle hooks, and reasoning policies.
 pub struct Agent {
     /// Identifier or role name of this agent.
     name: String,
@@ -75,6 +193,10 @@ pub struct Agent {
     provider: Arc<dyn LlmProvider>,
     /// Pluggable memory backend for conversational history.
     memory: Arc<dyn Memory>,
+    /// Native in-process tools directly callable without IPC overhead.
+    tools: Vec<Arc<dyn AgentTool>>,
+    /// Lifecycle interception hooks.
+    hooks: Vec<Arc<dyn AgentHook>>,
     /// Operational configuration.
     config: AgentConfig,
 }
@@ -105,15 +227,37 @@ impl Agent {
         &self.config
     }
 
+    /// Registered native tools.
+    pub fn tools(&self) -> &[Arc<dyn AgentTool>] {
+        &self.tools
+    }
+
+    /// Registered lifecycle hooks.
+    pub fn hooks(&self) -> &[Arc<dyn AgentHook>] {
+        &self.hooks
+    }
+
+    /// Executes the agent reasoning loop for an inbound message in standalone mode,
+    /// using only native registered tools (or pure conversation) without requiring gRPC hosts.
+    pub async fn run_standalone(
+        &self,
+        session_id: &str,
+        user_input: &str,
+    ) -> Result<AgentOutput, AgentError> {
+        let empty_hosts: [Arc<NoopHost>; 0] = [];
+        self.run(session_id, user_input, &empty_hosts).await
+    }
+
     /// Executes the agent reasoning loop for an inbound message.
     ///
     /// # Flow:
     /// 1. Initializes session system prompt if not yet set in memory;
     /// 2. Records inbound user message in memory;
-    /// 3. Dynamically queries active tools from provided plugin hosts;
+    /// 3. Dynamically queries active tools from native registered tools and plugin hosts;
     /// 4. Executes reasoning loop until model emits final text or iteration ceiling is hit;
-    /// 5. Dispatches tool calls via gRPC IPC, translates parameters zero-copy, feeds results back;
-    /// 6. Stores assistant reply in memory and returns [`AgentOutput`].
+    /// 5. Invokes lifecycle hooks around LLM requests, tool authorizations, and completions;
+    /// 6. Dispatches tool calls (in-process for native tools, gRPC IPC for plugin tools);
+    /// 7. Stores assistant reply in memory and returns [`AgentOutput`].
     pub async fn run<H: ToolHost>(
         &self,
         session_id: &str,
@@ -132,8 +276,12 @@ impl Agent {
             .push_message(session_id, ChatMessage::user(user_input))
             .await;
 
-        // 3. Dynamically aggregate tools from active plugin hosts
-        let tools = aggregate_tools(hosts);
+        // 3. Dynamically aggregate tools from both native tools and active plugin hosts
+        let mut tools = Vec::with_capacity(self.tools.len());
+        for t in &self.tools {
+            tools.push(t.definition());
+        }
+        tools.extend(aggregate_tools(hosts));
 
         let mut executed_tools = Vec::new();
         let mut iterations = 0;
@@ -142,7 +290,7 @@ impl Agent {
         loop {
             let messages = self.memory.get_messages(session_id).await;
 
-            let request = ChatRequest {
+            let mut request = ChatRequest {
                 model: self.config.default_model.clone(),
                 messages,
                 tools: tools.clone(),
@@ -150,7 +298,17 @@ impl Agent {
                 max_tokens: self.config.max_tokens,
             };
 
-            let response = self.provider.chat(&request).await?;
+            // Lifecycle Hook: before LLM request (e.g. for RAG / context enrichment)
+            for hook in &self.hooks {
+                hook.on_llm_request(session_id, &mut request).await?;
+            }
+
+            let mut response = self.provider.chat(&request).await?;
+
+            // Lifecycle Hook: after LLM response (e.g. for auditing / token counting)
+            for hook in &self.hooks {
+                hook.on_llm_response(session_id, &mut response).await?;
+            }
 
             // Terminal state: Model completed generation without requesting tools
             if response.tool_calls.is_empty() {
@@ -208,12 +366,67 @@ impl Agent {
 
             // Execute each requested tool call
             for call in response.tool_calls {
+                // Hook: tool call permission / safety check
+                let mut permitted = true;
+                for hook in &self.hooks {
+                    if !hook.on_before_tool_call(session_id, &call).await? {
+                        permitted = false;
+                        break;
+                    }
+                }
+                if !permitted {
+                    tracing::info!(agent = %self.name, tool = %call.name, "Tool call was vetoed by agent hook");
+                    let veto_msg = format!("Tool '{}' execution was denied by agent policy", call.name);
+                    self.memory
+                        .push_message(session_id, ChatMessage::tool_response(&call.id, &veto_msg))
+                        .await;
+                    executed_tools.push(ExecutedToolCall {
+                        call_id: call.id,
+                        tool_name: call.name.clone(),
+                        plugin_id: "policy".to_string(),
+                        host_id: "agent_hook".to_string(),
+                        success: false,
+                    });
+                    continue;
+                }
+
+                // Branch A: Check registered native in-process tools
+                if let Some(native_tool) = self.tools.iter().find(|t| t.definition().name == call.name) {
+                    tracing::debug!(agent = %self.name, tool = %call.name, "Executing native tool in-process");
+                    let (result_str, is_success) = match native_tool.call(session_id, call.arguments.clone()).await {
+                        Ok(res) => (res, true),
+                        Err(err) => (format!("Error: {err}"), false),
+                    };
+
+                    executed_tools.push(ExecutedToolCall {
+                        call_id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        plugin_id: "native".to_string(),
+                        host_id: "in_process".to_string(),
+                        success: is_success,
+                    });
+
+                    for hook in &self.hooks {
+                        hook.on_after_tool_call(session_id, &call, &result_str, is_success).await?;
+                    }
+
+                    self.memory
+                        .push_message(session_id, ChatMessage::tool_response(&call.id, &result_str))
+                        .await;
+
+                    if !is_success && self.config.stop_on_tool_failure {
+                        return Err(AgentError::Memory(format!("Native tool '{}' failed: {result_str}", call.name)));
+                    }
+                    continue;
+                }
+
+                // Branch B: Resolve tool on external gRPC plugin hosts
                 let target = find_tool_target(&call.name, hosts);
 
                 let (target_host, plugin_id) = match target {
                     Some((h, pid)) => (h, pid),
                     None => {
-                        tracing::warn!(tool = %call.name, "Requested tool not declared by any active host");
+                        tracing::warn!(tool = %call.name, "Requested tool not declared by any native tool or active host");
                         let err_msg = format!("Tool '{}' not registered", call.name);
                         self.memory
                             .push_message(
@@ -281,6 +494,10 @@ impl Agent {
                             }
                         };
 
+                        for hook in &self.hooks {
+                            hook.on_after_tool_call(session_id, &call, &result_str, is_success).await?;
+                        }
+
                         self.memory
                             .push_message(
                                 session_id,
@@ -343,6 +560,8 @@ pub struct AgentBuilder {
     system_prompt: Option<String>,
     provider: Arc<dyn LlmProvider>,
     memory: Option<Arc<dyn Memory>>,
+    tools: Vec<Arc<dyn AgentTool>>,
+    hooks: Vec<Arc<dyn AgentHook>>,
     config: AgentConfig,
 }
 
@@ -354,6 +573,8 @@ impl AgentBuilder {
             system_prompt: None,
             provider,
             memory: None,
+            tools: Vec::new(),
+            hooks: Vec::new(),
             config: AgentConfig::default(),
         }
     }
@@ -367,6 +588,30 @@ impl AgentBuilder {
     /// Injects a custom memory backend (e.g. SQLite, Redis, or custom plugin memory).
     pub fn memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Registers a native in-process tool on this agent.
+    pub fn tool(mut self, tool: impl AgentTool + 'static) -> Self {
+        self.tools.push(Arc::new(tool));
+        self
+    }
+
+    /// Registers a native in-process tool wrapped in an [`Arc`].
+    pub fn tool_arc(mut self, tool: Arc<dyn AgentTool>) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    /// Registers a lifecycle interception hook on this agent.
+    pub fn hook(mut self, hook: impl AgentHook + 'static) -> Self {
+        self.hooks.push(Arc::new(hook));
+        self
+    }
+
+    /// Registers a lifecycle hook wrapped in an [`Arc`].
+    pub fn hook_arc(mut self, hook: Arc<dyn AgentHook>) -> Self {
+        self.hooks.push(hook);
         self
     }
 
@@ -394,6 +639,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Configures whether to stop immediately if a tool fails.
+    pub fn stop_on_tool_failure(mut self, stop: bool) -> Self {
+        self.config.stop_on_tool_failure = stop;
+        self
+    }
+
     /// Builds the configured [`Agent`].
     pub fn build(self) -> Agent {
         let memory = self
@@ -405,6 +656,8 @@ impl AgentBuilder {
             system_prompt: self.system_prompt,
             provider: self.provider,
             memory,
+            tools: self.tools,
+            hooks: self.hooks,
             config: self.config,
         }
     }

@@ -8,6 +8,7 @@ import "google/protobuf/struct.proto";
 service PluginHostService {
   rpc Ping (PingRequest) returns (PingResponse);
   rpc ReloadPluginConfig (ReloadPluginConfigRequest) returns (ReloadPluginConfigResponse);
+  rpc GetPluginMeta (GetPluginMetaRequest) returns (GetPluginMetaResponse);
 }
 
 // 2. 消息与事件管道服务 (运行在 Host 端，Core 主动连接各 Host 端点发起调用)
@@ -60,6 +61,35 @@ message ReloadPluginConfigRequest {
 message ReloadPluginConfigResponse {
   bool success = 1;
   string error_message = 2;
+}
+
+message GetPluginMetaRequest {}
+
+message CommandMeta {
+  string name = 1;
+  string description = 2;
+  string usage = 3;
+  int32 priority = 4;
+}
+
+message ToolMeta {
+  string name = 1;
+  string description = 2;
+  google.protobuf.Struct parameters = 3;
+}
+
+message PluginMeta {
+  string id = 1;
+  string name = 2;
+  string version = 3;
+  string author = 4;
+  string description = 5;
+  repeated CommandMeta commands = 6;
+  repeated ToolMeta tools = 7;
+}
+
+message GetPluginMetaResponse {
+  repeated PluginMeta plugins = 1;
 }
 
 // --- 强类型消息段定义 (彻底废弃 map<string, string> 反模式) ---

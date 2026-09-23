@@ -10,6 +10,7 @@ kanon-transport = { path = "../kanon-transport" }
 kanon-storage = { path = "../kanon-storage" }
 kanon-llm = { path = "../kanon-llm" }
 tokio = { version = "1.40", features = ["full"] }
+tokio-stream = "0.1"
 tonic = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -17,3 +18,6 @@ toml = "0.8"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tempfile = "3.12"

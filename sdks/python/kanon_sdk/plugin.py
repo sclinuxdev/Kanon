@@ -223,8 +223,29 @@ class Plugin:
         self,
         req: pb.DeliverMessageRequest,
     ) -> pb.DeliverMessageResponse:
-        """Delivers an outbound message to a target platform."""
+        """Delivers an outbound message to a target platform (adapter hook).
+
+        Platform adapter plugins MUST override this hook; the base implementation
+        is an explicit, loud failure rather than a fake success. Core routes every
+        pipeline reply for a platform to the host that registered that platform,
+        so answering ``success=True`` without actually sending the message would
+        silently swallow user-visible replies and hide a missing adapter.
+
+        The returned ``error_message`` names the offending platform so Core logs
+        and operator diagnostics point straight at the unconfigured adapter.
+
+        Args:
+            req: Outbound message with platform, channel, recipient and segments.
+
+        Returns:
+            ``pb.DeliverMessageResponse`` with ``success=False`` and an empty
+            ``message_id``; never reports a delivery that did not happen.
+        """
         return pb.DeliverMessageResponse(
-            success=True,
-            message_id="delivered_py_1",
+            success=False,
+            message_id="",
+            error_message=(
+                "plugin does not implement on_deliver_message for platform "
+                f"'{req.platform}'"
+            ),
         )

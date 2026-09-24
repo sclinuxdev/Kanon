@@ -23,7 +23,7 @@ _python_sdk_dir = _current_dir.parent
 if str(_python_sdk_dir) not in sys.path:
     sys.path.insert(0, str(_python_sdk_dir))
 
-from kanon_sdk.context import PluginContext
+from kanon_sdk.context import CoreHandle, PluginContext
 from kanon_sdk.plugin import Plugin
 from kanon_sdk.proto import pb, pb_grpc
 
@@ -187,8 +187,6 @@ async def main() -> None:
 
     data_dir = Path(f"./data/plugins/{meta.id}").resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
-    ctx = PluginContext(data_dir=data_dir)
-    await plugin.on_load(ctx)
 
     # Clean up stale socket file if it exists
     if socket_path.exists():
@@ -199,6 +197,82 @@ async def main() -> None:
 
     socket_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # --- Reach Core before building the PluginContext -------------------------
+    #
+    # Why this block runs before `plugin.on_load(ctx)`: on_load is the only
+    # lifecycle hook in which an adapter plugin can capture `ctx.core`, and that
+    # handle must wrap the *same* BotApiService channel that `RegisterHost` just
+    # proved reachable. Dialing once here - rather than letting every plugin dial
+    # lazily per ingest call - keeps a single long-lived HTTP/2 channel per host
+    # process, which is the sharing model CoreHandle documents.
+    #
+    # Standalone mode is explicit and is never faked: when KANON_CORE_SOCK is
+    # unset, when its socket file is missing, or when RegisterHost fails, the
+    # handle stays None. Plugins can then distinguish "no Core" from "Core
+    # accepted/rejected my event" instead of talking to a dead stub.
+    core_channel: Optional[grpc.aio.Channel] = None
+    core_handle: Optional[CoreHandle] = None
+
+    if core_sock_str:
+        core_sock = Path(core_sock_str).resolve()
+        if core_sock.exists():
+            try:
+                # One channel and one stub for the whole process lifetime; adapter
+                # tasks share them through CoreHandle's internal lock.
+                core_channel = grpc.aio.insecure_channel(f"unix:{core_sock}")
+                core_stub = pb_grpc.BotApiServiceStub(core_channel)
+
+                # Registration doubles as the reachability probe: only a Core that
+                # answered this RPC earns a handle.
+                reg_req = pb.RegisterHostRequest(
+                    host_id=host_id,
+                    runtime="python",
+                    endpoint=str(socket_path),
+                    loaded_plugin_ids=[meta.id],
+                )
+                await core_stub.RegisterHost(reg_req, timeout=1.0)
+                core_handle = CoreHandle(core_stub)
+            except Exception as exc:
+                # No Core peer: drop the half-open channel so no descriptor or
+                # connectivity task leaks, and continue in standalone mode.
+                if core_channel is not None:
+                    try:
+                        await core_channel.close()
+                    except Exception:
+                        pass
+                core_channel = None
+                print(
+                    f"[kanon-host] Core at {core_sock} unreachable ({exc}); "
+                    "running in standalone mode with ctx.core = None",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        else:
+            print(
+                f"[kanon-host] KANON_CORE_SOCK points to missing socket {core_sock}; "
+                "running in standalone mode with ctx.core = None",
+                file=sys.stderr,
+                flush=True,
+            )
+    else:
+        print(
+            "[kanon-host] KANON_CORE_SOCK is not set; "
+            "running in standalone mode with ctx.core = None",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    # The context is constructed last, carrying the outcome of the Core handshake.
+    # Adapters read `ctx.core` inside on_load, so it must exist before the hook runs.
+    #
+    # The listener is bound only after on_load returns, so the endpoint advertised
+    # above is reachable a moment later. That is deliberate: the original ordering
+    # (plugin fully initialized before the first served RPC) is preserved, the
+    # registration call is synchronous and 1s-bounded, and Core stores the endpoint
+    # for on-demand dialing instead of connecting at registration time.
+    ctx = PluginContext(data_dir=data_dir, core=core_handle)
+    await plugin.on_load(ctx)
+
     server = grpc.aio.server()
     pb_grpc.add_PluginHostServiceServicer_to_server(HostServiceImpl(plugin), server)
     pb_grpc.add_MessagePipelineServiceServicer_to_server(PipelineServiceImpl(plugin), server)
@@ -206,23 +280,6 @@ async def main() -> None:
     server.add_insecure_port(f"unix:{socket_path}")
     await server.start()
     print(f"Kanon Python Host running on {socket_path}", flush=True)
-
-    # Optionally register with Core IPC server if reachable
-    if core_sock_str:
-        core_sock = Path(core_sock_str).resolve()
-        if core_sock.exists():
-            try:
-                async with grpc.aio.insecure_channel(f"unix:{core_sock}") as channel:
-                    client = pb_grpc.BotApiServiceStub(channel)
-                    reg_req = pb.RegisterHostRequest(
-                        host_id=host_id,
-                        runtime="python",
-                        endpoint=str(socket_path),
-                        loaded_plugin_ids=[meta.id],
-                    )
-                    await client.RegisterHost(reg_req, timeout=1.0)
-            except Exception:
-                pass
 
     stop_event = asyncio.Event()
 
@@ -241,6 +298,10 @@ async def main() -> None:
     # Graceful shutdown
     await plugin.on_unload()
     await server.stop(grace=1.0)
+    if core_channel is not None:
+        # Closed last, after on_unload() has had the chance to stop adapter tasks
+        # that may still hold the shared handle for an in-flight ingest call.
+        await core_channel.close()
     if socket_path.exists():
         try:
             socket_path.unlink()

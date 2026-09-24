@@ -14,7 +14,9 @@ pub mod path;
 pub mod stream;
 
 pub use listener::{IpcIncoming, IpcListener};
-pub use path::{core_socket_path, default_run_dir, ensure_parent_dir, host_socket_path};
+pub use path::{
+    core_socket_path, default_run_dir, ensure_parent_dir, ensure_run_dir, host_socket_path,
+};
 pub use stream::connect_ipc;
 #[cfg(unix)]
 pub use stream::connect_unix;

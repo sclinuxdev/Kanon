@@ -46,9 +46,18 @@ class HostServiceImpl(pb_grpc.PluginHostServiceServicer):
         request: pb.ReloadPluginConfigRequest,
         context: grpc.aio.ServicerContext,
     ) -> pb.ReloadPluginConfigResponse:
+        current_version = getattr(self, "_config_version", 0)
+        if request.version > 0 and request.version <= current_version:
+            return pb.ReloadPluginConfigResponse(
+                success=False,
+                error_message=f"Stale config version {request.version}: current is {current_version}",
+                applied_version=current_version,
+            )
+        self._config_version = request.version
         return pb.ReloadPluginConfigResponse(
             success=True,
             error_message="",
+            applied_version=request.version,
         )
 
     async def GetPluginMeta(

@@ -292,6 +292,7 @@ async fn webhook_adapter_posts_payload_to_callback() {
                     })),
                 },
             ],
+            event_id: "evt-api-adapter-1".to_string(),
         })
         .await
         .expect("delivery succeeds");
@@ -368,6 +369,7 @@ fn test_request() -> DeliverMessageRequest {
                 content: "hello".to_string(),
             })),
         }],
+        event_id: "evt-test-request".to_string(),
     }
 }
 

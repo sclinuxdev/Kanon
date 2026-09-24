@@ -56,11 +56,13 @@ message PingResponse {
 message ReloadPluginConfigRequest {
   string plugin_id = 1;
   google.protobuf.Struct config = 2;
+  uint64 version = 3;
 }
 
 message ReloadPluginConfigResponse {
   bool success = 1;
   string error_message = 2;
+  uint64 applied_version = 3;
 }
 
 message GetPluginMetaRequest {}
@@ -216,6 +218,7 @@ message DeliverMessageRequest {
   string channel_id = 2;
   string recipient_id = 3;
   repeated MessageSegment segments = 4;
+  string event_id = 5;
 }
 
 message DeliverMessageResponse {

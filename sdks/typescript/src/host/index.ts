@@ -219,7 +219,18 @@ async function main(): Promise<void> {
       callback(null, { timestamp: call.request.timestamp });
     },
     ReloadPluginConfig: (call: any, callback: any) => {
-      callback(null, { success: true, error_message: "" });
+      const version = Number(call.request.version || 0);
+      const currentVersion = Number((plugin as any)._configVersion || 0);
+      if (version > 0 && version <= currentVersion) {
+        callback(null, {
+          success: false,
+          error_message: `Stale config version ${version}: current is ${currentVersion}`,
+          applied_version: currentVersion,
+        });
+        return;
+      }
+      (plugin as any)._configVersion = version;
+      callback(null, { success: true, error_message: "", applied_version: version });
     },
     GetPluginMeta: (call: any, callback: any) => {
       callback(null, { plugins: [plugin.meta()] });

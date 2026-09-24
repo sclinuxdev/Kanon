@@ -72,6 +72,13 @@ pub enum SupervisorError {
         plugin_id: String,
         reason: String,
     },
+    /// Stale or out-of-order configuration update rejected by optimistic concurrency control.
+    #[error("Stale configuration version for plugin '{plugin_id}': current is {current_version}, requested {requested_version}")]
+    StaleConfigVersion {
+        plugin_id: String,
+        current_version: u64,
+        requested_version: u64,
+    },
     /// Runtime environment was not found or is unsupported.
     #[error("Runtime environment '{runtime}' is not available: {reason}")]
     RuntimeUnavailable { runtime: String, reason: String },
@@ -332,12 +339,14 @@ impl ManagedHost {
         &self,
         plugin_id: &str,
         config: kanon_proto::prost_types::Struct,
+        version: u64,
     ) -> Result<ReloadPluginConfigResponse, tonic::Status> {
         let mut client = self.host_client.lock().await;
         let response = client
             .reload_plugin_config(ReloadPluginConfigRequest {
                 plugin_id: plugin_id.to_string(),
                 config: Some(config),
+                version,
             })
             .await?;
         Ok(response.into_inner())
@@ -423,6 +432,10 @@ pub struct Supervisor {
     hosts: Arc<RwLock<HashMap<String, Arc<ManagedHost>>>>,
     /// Registry of in-process platform adapters.
     adapters: Arc<AdapterRegistry>,
+    /// Monotonically increasing configuration version tracking per plugin for CAS updates.
+    config_versions: Arc<RwLock<HashMap<String, u64>>>,
+    /// Adaptive circuit breakers maintaining health status per platform outbound queue.
+    platform_circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
 }
 
 impl Supervisor {
@@ -434,16 +447,39 @@ impl Supervisor {
         let run_dir = run_dir.unwrap_or_else(default_run_dir);
         let core_sock_path = core_sock_path.unwrap_or_else(|| core_socket_path(Some(&run_dir)));
 
-        // Ensure the run directory exists for socket allocation.
-        if !run_dir.exists() {
-            let _ = std::fs::create_dir_all(&run_dir);
-        }
+        // Ensure the run directory exists with strict permissions and symlink validation.
+        let _ = kanon_transport::ensure_run_dir(&run_dir);
 
         Self {
             run_dir,
             core_sock_path,
             hosts: Arc::new(RwLock::new(HashMap::new())),
             adapters: Arc::new(AdapterRegistry::new()),
+            config_versions: Arc::new(RwLock::new(HashMap::new())),
+            platform_circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Returns the currently applied configuration version for a plugin (0 if never configured).
+    pub async fn config_version(&self, plugin_id: &str) -> u64 {
+        self.config_versions.read().await.get(plugin_id).copied().unwrap_or(0)
+    }
+
+    /// Retrieves or instantiates the adaptive circuit breaker for a platform's outbound queue.
+    pub async fn platform_circuit_breaker(&self, platform: &str) -> Arc<CircuitBreaker> {
+        let mut breakers = self.platform_circuit_breakers.write().await;
+        breakers
+            .entry(platform.to_string())
+            .or_insert_with(|| Arc::new(CircuitBreaker::with_defaults()))
+            .clone()
+    }
+
+    /// Evaluates the current operational state of a platform's circuit breaker.
+    pub async fn platform_circuit_state(&self, platform: &str) -> CircuitState {
+        let breakers = self.platform_circuit_breakers.read().await;
+        match breakers.get(platform) {
+            Some(cb) => cb.state(),
+            None => CircuitState::Closed,
         }
     }
 
@@ -483,20 +519,19 @@ impl Supervisor {
 
     /// Builds the console-facing adapter catalog: built-ins first, then plugin adapters.
     pub async fn adapter_catalog(&self) -> Vec<AdapterDescriptor> {
-        let mut catalog: Vec<AdapterDescriptor> = self
-            .adapters
-            .list()
-            .await
-            .iter()
-            .map(|adapter| AdapterDescriptor {
+        let mut catalog: Vec<AdapterDescriptor> = Vec::new();
+        for adapter in self.adapters.list().await {
+            let circuit_state = self.platform_circuit_state(adapter.platform()).await;
+            catalog.push(AdapterDescriptor {
                 platform: adapter.platform().to_string(),
                 display_name: adapter.display_name().to_string(),
                 kind: AdapterKind::Builtin,
                 connected: adapter.is_connected(),
+                circuit_state,
                 plugin_id: None,
                 host_id: None,
-            })
-            .collect();
+            });
+        }
 
         for host in self.hosts.read().await.values() {
             let platforms = host.adapter_platforms();
@@ -510,6 +545,7 @@ impl Supervisor {
             let plugin_id = host.adapter_plugin_id();
 
             for platform in platforms {
+                let circuit_state = self.platform_circuit_state(&platform).await;
                 catalog.push(AdapterDescriptor {
                     platform,
                     display_name: display_name.clone(),
@@ -517,6 +553,7 @@ impl Supervisor {
                     // A host present in the registry is a live process; a crashed host is removed
                     // by the supervisor, so presence is the connection signal.
                     connected: true,
+                    circuit_state,
                     plugin_id: plugin_id.clone(),
                     host_id: Some(host.host_id.clone()),
                 });
@@ -834,22 +871,49 @@ impl Supervisor {
 
     /// Pushes an updated configuration object to the host owning `plugin_id` and triggers hot reload.
     ///
-    /// This is a cross-process round trip: the plugin host refreshes its in-memory configuration
-    /// cache synchronously and reports failure explicitly instead of silently keeping stale values.
+    /// Monotonically increments the plugin's configuration version token. Returns the applied version.
     pub async fn reload_plugin_config(
         &self,
         plugin_id: &str,
         config: &serde_json::Value,
-    ) -> Result<(), SupervisorError> {
+    ) -> Result<u64, SupervisorError> {
+        self.reload_plugin_config_cas(plugin_id, config, None).await
+    }
+
+    /// Pushes an updated configuration with optimistic concurrency control (CAS).
+    ///
+    /// If `expected_version` is `Some(v)`, the reload only proceeds if the currently applied
+    /// version matches `v`. On conflict, returns [`SupervisorError::StaleConfigVersion`].
+    pub async fn reload_plugin_config_cas(
+        &self,
+        plugin_id: &str,
+        config: &serde_json::Value,
+        expected_version: Option<u64>,
+    ) -> Result<u64, SupervisorError> {
         let host = self
             .find_host_for_plugin(plugin_id)
             .await
             .ok_or_else(|| SupervisorError::PluginNotFound(plugin_id.to_string()))?;
 
+        let mut versions = self.config_versions.write().await;
+        let current_ver = *versions.get(plugin_id).unwrap_or(&0);
+
+        if let Some(expected) = expected_version
+            && expected != current_ver
+        {
+            return Err(SupervisorError::StaleConfigVersion {
+                plugin_id: plugin_id.to_string(),
+                current_version: current_ver,
+                requested_version: expected,
+            });
+        }
+
+        let next_ver = current_ver + 1;
+
         let structured = kanon_llm::tool_router::json_to_prost_struct(config)
             .ok_or(SupervisorError::InvalidConfigPayload)?;
 
-        let response = host.reload_config(plugin_id, structured).await?;
+        let response = host.reload_config(plugin_id, structured, next_ver).await?;
         if !response.success {
             return Err(SupervisorError::ConfigReloadRejected {
                 host_id: host.host_id.clone(),
@@ -858,13 +922,22 @@ impl Supervisor {
             });
         }
 
+        let applied = if response.applied_version > 0 {
+            response.applied_version
+        } else {
+            next_ver
+        };
+
+        versions.insert(plugin_id.to_string(), applied);
+
         tracing::info!(
             plugin_id = %plugin_id,
             host_id = %host.host_id,
-            "Plugin configuration reloaded"
+            version = applied,
+            "Plugin configuration reloaded with version token"
         );
 
-        Ok(())
+        Ok(applied)
     }
 
     /// Directly registers an externally created or mocked `ManagedHost` (useful for unit tests).

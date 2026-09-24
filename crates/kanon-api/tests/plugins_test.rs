@@ -270,3 +270,143 @@ async fn plugin_config_rejects_path_traversal_identifier() {
         "expected explicit rejection, got {status}: {body}"
     );
 }
+
+/// Config update endpoint PUT /api/v1/plugins/{id}/config enforces CAS version token.
+#[tokio::test]
+async fn plugin_config_cas_version_enforcement() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use kanon_core::ManagedHost;
+    use kanon_proto::v1::plugin_host_service_server::{PluginHostService, PluginHostServiceServer};
+    use kanon_proto::v1::{
+        GetPluginMetaRequest, GetPluginMetaResponse, PingRequest, PingResponse,
+        ReloadPluginConfigRequest, ReloadPluginConfigResponse,
+    };
+    use tonic::{Request, Response, Status};
+
+    struct CasMockHost {
+        ver: AtomicU64,
+    }
+
+    #[tonic::async_trait]
+    impl PluginHostService for CasMockHost {
+        async fn ping(&self, req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
+            Ok(Response::new(PingResponse {
+                timestamp: req.into_inner().timestamp,
+            }))
+        }
+        async fn reload_plugin_config(
+            &self,
+            req: Request<ReloadPluginConfigRequest>,
+        ) -> Result<Response<ReloadPluginConfigResponse>, Status> {
+            let r = req.into_inner();
+            let cur = self.ver.load(Ordering::SeqCst);
+            if r.version > 0 && r.version <= cur {
+                return Ok(Response::new(ReloadPluginConfigResponse {
+                    success: false,
+                    error_message: format!("Stale: cur={cur}, req={}", r.version),
+                    applied_version: cur,
+                }));
+            }
+            self.ver.store(r.version, Ordering::SeqCst);
+            Ok(Response::new(ReloadPluginConfigResponse {
+                success: true,
+                error_message: String::new(),
+                applied_version: r.version,
+            }))
+        }
+        async fn get_plugin_meta(
+            &self,
+            _: Request<GetPluginMetaRequest>,
+        ) -> Result<Response<GetPluginMetaResponse>, Status> {
+            Ok(Response::new(GetPluginMetaResponse { plugins: vec![] }))
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(PluginHostServiceServer::new(CasMockHost {
+                ver: AtomicU64::new(0),
+            }))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_dir = PathBuf::from(dir.path());
+    let supervisor = Arc::new(kanon_core::Supervisor::new(Some(config_dir.join("run")), None));
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let host = Arc::new(
+        ManagedHost::new(
+            "cas_host".to_string(),
+            config_dir.join("cas_host.sock"),
+            channel,
+            vec![common::fixture_meta()],
+            100,
+        )
+        .with_manifest(common::fixture_manifest()),
+    );
+    supervisor.register_managed_host(host).await;
+
+    let state = kanon_api::ApiState::builder(supervisor)
+        .with_config_dir(config_dir.clone())
+        .build();
+    let app: Router = app(state);
+
+    let uri = format!("/api/v1/plugins/{FIXTURE_PLUGIN_ID}/config");
+
+    // 1. Initial GET reports version 0
+    let (status, body) = send_json(&app, Method::GET, &uri, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["version"], 0);
+
+    // 2. PUT with mismatched expected version (e.g. 5) returns 409 Conflict
+    let (status, body) = send_json(
+        &app,
+        Method::PUT,
+        &uri,
+        Some(json!({ "values": { "api_key": "k1" }, "version": 5 })),
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert_eq!(error_code(&body), "conflict");
+
+    // 3. PUT with matching expected version 0 succeeds and returns version 1
+    let (status, body) = send_json(
+        &app,
+        Method::PUT,
+        &uri,
+        Some(json!({ "values": { "api_key": "k1" }, "version": 0 })),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(body["reloaded"], true);
+    assert_eq!(body["version"], 1);
+
+    // 4. Stale PUT with version 0 now fails with 409 Conflict
+    let (status, body) = send_json(
+        &app,
+        Method::PUT,
+        &uri,
+        Some(json!({ "values": { "api_key": "k2" }, "version": 0 })),
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert_eq!(error_code(&body), "conflict");
+
+    // 5. Subsequent GET reports version 1
+    let (status, body) = send_json(&app, Method::GET, &uri, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["version"], 1);
+}

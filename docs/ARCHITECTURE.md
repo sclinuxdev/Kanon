@@ -155,7 +155,25 @@ kanon/
 1. **32-Byte 随机 Token 注入**：
    - Supervisor 在拉起任何 Host 子进程前，通过密码学安全随机数生成器 (CSPRNG) 生成 32 字节高熵随机 Token（64 字符十六进制编码）。
    - Token 仅通过子进程私有环境变量 `KANON_IPC_TOKEN`（或私有安全 stdin 握手管道）单向注入该子进程，对外不可见。
-### 2.7 kanon-transport 架构落地形态与 Tower 鉴权中间件
+2. **首包 HTTP/2 HEADERS 恒定时间校验**：
+   - Host 连接 Core 或 Core 连接 Host 时，首帧必须携带 `x-kanon-auth-token`。
+   - 接收端通过 `subtle::constant_time_eq` 恒定时间比对，校验失败立即切断连接。
+
+### 2.7 Linux/macOS Unix Domain Socket 目录隔离与权限加固规范 (POSIX Socket Security)
+
+在 Unix/Linux 环境下采用 UDS（Unix Domain Socket）通信时，为彻底杜绝本地非特权多租户环境下的符号链接劫持、套接字投毒与非法窃听，制定强制安全约束：
+
+1. **运行目录发现与 UID 安全隔离**：
+   - 优先遵循 XDG Base Directory 规范使用 `$XDG_RUNTIME_DIR/kanon/run`；
+   - 若环境变量 `$XDG_RUNTIME_DIR` 未设置（例如无桌面环境、部分 Docker 容器或基础 SSH 会话），强制安全回退至 `/tmp/kanon-run-$UID/`（通过 POSIX `libc::getuid()` 获取调用方真实 Effective UID），彻底消灭多用户同机共享未隔离路径的安全隐患。
+2. **符号链接攻击防御 (Symlink Rejection)**：
+   - 在创建或绑定套接字前，核心与 Host 必须使用 `std::fs::symlink_metadata` 深度检查目录元数据；
+   - 若目标运行目录属于符号链接（Symlink），直接拒绝并抛出 `std::io::ErrorKind::PermissionDenied`，防止本地非特权攻击者预先埋设软链接诱骗核心向敏感系统路径写入套接字。
+3. **强制 0700 权限收敛 (Mandatory 0700 Permissions Enforcement)**：
+   - 运行目录的所有者 UID 必须与当前进程所有者完全一致；
+   - 无论是全新建立目录还是已存在的既有目录，统一调用 `Permissions::from_mode(0o700)`（`rwx------`）强制将目录权限收敛为仅当前用户可读写执行，剥夺同组及全局用户的读取与遍历权限。
+
+### 2.8 kanon-transport 架构落地形态与 Tower 鉴权中间件
 
 为消除 Tonic/Hyper 与操作系统底层的适配胶水代码，`kanon-transport` 提供统一抽象：
 
@@ -329,6 +347,37 @@ message ToolCallResponse {
     google.protobuf.Struct structured_result = 4;
     bytes raw_bytes = 5;
   }
+}
+
+// --- 插件生命周期与 CAS 配置更新消息 ---
+
+message ReloadPluginConfigRequest {
+  string plugin_id = 1;
+  google.protobuf.Struct config = 2;
+  uint64 version = 3; // CAS 乐观锁版本向量，防止并发覆盖
+}
+
+message ReloadPluginConfigResponse {
+  bool success = 1;
+  string error_message = 2;
+  uint64 applied_version = 3; // 宿主实际生效的配置版本
+}
+
+// --- 平台消息投递消息 ---
+
+message DeliverMessageRequest {
+  string platform = 1;
+  string channel_id = 2;
+  string recipient_id = 3;
+  repeated MessageSegment segments = 4;
+  string event_id = 5; // 全链路追踪与死信队列归档关联 ID
+}
+
+message DeliverMessageResponse {
+  bool success = 1;
+  string message_id = 2;
+  string error_message = 3;
+}
 ```
 
 ### 4.1 OnPreFilter 拦截链执行顺序与性能预算 (Pipeline Deadline & Priority)
@@ -531,8 +580,8 @@ sequenceDiagram
 | :--- | :--- | :--- |
 | `GET` | `/api/v1/health` | 核心健康状态与基础运行指标 (Memory, Uptime, 插件与会话计数) |
 | `GET` | `/api/v1/plugins` | 查询所有已发现插件清单、运行状态与静态元数据 |
-| `GET` | `/api/v1/plugins/{id}/config` | 获取指定插件的配置项当前值与 JSON Schema（含 Schema 默认值合并） |
-| `PUT` | `/api/v1/plugins/{id}/config` | 校验配置 → 触发跨进程热重载 → 原子持久化（宿主拒绝则不落盘） |
+| `GET` | `/api/v1/plugins/{id}/config` | 获取指定插件的配置项当前值、JSON Schema 及当前单调递增版本号 `version` |
+| `PUT` | `/api/v1/plugins/{id}/config` | 校验配置 → 检查 CAS 乐观锁版本向量 → 触发跨进程热重载 → 原子持久化（版本冲突返回 409，宿主拒绝则不落盘） |
 | `POST` | `/api/v1/plugins/{id}/restart` | 重启指定插件所在的宿主进程（依赖 Supervisor 记录的启动配方） |
 | `GET` | `/api/v1/sessions` | 分页查询会话元数据（Turn 计数、Token 消耗、活跃时间、Persona、作用域） |
 | `POST` | `/api/v1/sessions/{id}/reset` | 安全重置会话历史，保留配置变量与人设 |
@@ -540,7 +589,7 @@ sequenceDiagram
 | `GET` | `/api/v1/personas` | 查询系统预设及动态注册人设列表 |
 | `GET` | `/api/v1/metrics` | 导出 Prometheus 格式的系统与消息吞吐指标 |
 | `POST` | `/api/v1/chat/completions` | 在线沙盒对话调试，支持标准 JSON 与 `text/event-stream` 流式输出 |
-| `GET` | `/api/v1/adapters` | 查询已注册的平台适配器（内置 + 插件声明）及其连接存活状态 |
+| `GET` | `/api/v1/adapters` | 查询已注册的平台适配器（内置 + 插件声明）及其连接存活状态与断路器状态 (`circuit_state`) |
 | `POST` | `/api/v1/adapters/{platform}/ingest` | 平台入站数据面：Fast-ACK 接收外部消息并推入核心流水线 |
 
 ### 9.3 实时数据流 (WebSocket)
@@ -573,6 +622,14 @@ sequenceDiagram
 插件配置持久化位置遵循数据隔离规范：`./data/plugins/<plugin_id>/config.json`，采用「临时文件 + `rename`」原子提交，
 写入顺序为 **校验 → 宿主热重载确认 → 落盘**，宿主拒绝时不会留下半更新配置。
 
+**CAS 乐观并发控制与单调版本向量 (CAS Optimistic Concurrency Control)**：
+- 为彻底消灭并发修改或多控制台重叠提交引发的「配置时序倒退」与「静默脏写」隐患，管理控制面引入严格的 CAS 版本向量机制；
+- `GET /api/v1/plugins/{id}/config` 返回当前配置值、JSON Schema 及单调递增版本号 `version`；
+- `PUT /api/v1/plugins/{id}/config` 载荷支持携带可选的 `expected_version`。Supervisor 内存中维护各插件当前的最新单调递增版本向量：
+  - 若调用方传入的 `expected_version` 与服务端当前维护的版本号不一致（或并发重载产生竞态），核心立即终止操作并返回 HTTP `409 Conflict` (`stale_config_version`)，杜绝旧配置覆盖新配置；
+  - 校验通过后，Supervisor 递增版本号并将新版本携带在 `ReloadPluginConfigRequest.version` 中下发至宿主；
+  - 跨语言插件宿主（Rust、Python、TypeScript）校验版本单调递增性，应用成功后在 `ReloadPluginConfigResponse.applied_version` 回传已应用的配置版本，实现跨进程配置时序强一致性。
+
 ### 9.5 平台适配器契约 (Platform Adapter Contract)
 
 微内核自身不实现任何 IM 协议：**平台适配器**独占一个平台标识（与 `PipelineEventRequest.platform` 同值），负责两个方向：
@@ -590,7 +647,20 @@ sequenceDiagram
 **出站调度与背压**：流水线工作循环绝不等待平台 I/O。回复统一进入全局有界出站队列后，由 Dispatcher 按 `platform` 分区路由至独立的单平台 Worker 队列（默认容量 64）：
 - **平台并发隔离**：不同平台间并发执行，单一卡顿或故障平台绝不阻塞其他平台的出站吞吐量（避免跨平台队头阻塞）；
 - **平台内时序保障**：同一平台内部由独立 Worker 串行消费，严格保证 FIFO 消息递送顺序；
-- **背压与死信追踪**：单平台队列饱和时，溢出消息立即丢弃并上报 `outbound_failed` 阶段，不静默膨胀内存。
+- **背压与死信追踪**：单平台队列饱和时，溢出消息立即丢弃并自动持久化归档至死信日志，同时上报 `outbound_failed` 阶段，不静默膨胀内存。
+
+**出站单平台独立短路熔断器 (Per-Platform Circuit Breaker)**：
+- 为杜绝目标平台长期宕机或网络中断导致单平台队列持续满载丢包及产生不必要的网络重试开销，Supervisor 为每个注册平台分配专属的独立断路器（`CircuitBreaker`）；
+- **熔断阈值与状态转移**：单平台出站投递若连续遭遇 **5 次失败**（网络异常、超时或平台拒绝），断路器自动熔断切换至 `Open`（熔断开启）状态；
+- **极速短路 (Fast-Skip)**：当断路器处于 `Open` 状态时，后续路由到该平台的出站请求直接短路失败，不再发起无意义的网络 I/O，并立即将未投递消息写入死信队列；
+- **半开探测 (Half-Open Probe)**：熔断窗口期（默认 30 秒）到期后，断路器自动进入 `Half-Open` 试探状态，放行单条出站请求试探远端服务可用性；若试探成功则自动复位至 `Closed` 状态并重置失败计数，若依然失败则重新转入 `Open` 状态；
+- **控制面状态透出**：`GET /api/v1/adapters` 实时输出各个适配器的熔断器健康状态（`circuit_state: "closed" | "open" | "half_open"`），使运维能够实时监控各平台连接质量与故障熔断状态。
+
+**出站死信队列与持久化归档 (Outbound Dead-Letter Queue & Cold Persistence)**：
+- 因平台出站队列饱和背压丢弃、网络重试耗尽失败，或因断路器 `Open` 极速短路拦截的所有出站消息，均受核心死信引擎（`DeadLetterWriter`）全程护航，绝不静默丢失；
+- 死信日志按平台标识与 UTC 自然日期进行目录隔离与文件分片持久化，归档路径为：
+  `./data/dead_letter/<platform>_<YYYY-MM-DD>.jsonl`；
+- 每条死信记录包含 `event_id`（全链路追踪关联 ID）、`platform`、`target_id`、`channel_id`、`reason`（失败原因/熔断说明）、`timestamp_millis`（毫秒时间戳）以及结构化的 `segments` 消息段载荷，为不可逆投递失败提供完整的审计追溯与运维离线补发对账能力。
 
 **Webhook 鉴权与出站退避重试**：
 - **HMAC-SHA256 签名校验**：配置 `secret` 时，入站 `/api/v1/adapters/{platform}/ingest` 严格校验 `X-Hub-Signature-256` / `X-Kanon-Signature`（恒定时间比对防时序攻击），验签失败直接返回 HTTP 401 `unauthorized`；出站自动为 Payload 计算签名并注入请求头。
@@ -643,6 +713,11 @@ sequenceDiagram
 | **运行时依赖定位** | 容易被误解为 Python/Node 为强依赖 | **明确核心自包含与零硬依赖原则**，纯 Rust 运行时 < 20MB，Python/Node 仅按需惰性探测 | 保持 Rust 极简纯净单二进制分发的绝对优势。 |
 | **入站与心跳锁步** | 适配器同步阻塞等待核心处理，大模型慢推理导致 IM 网关反向断连 | **Fast-ACK 异步队列机制**（入站 Tokio MPSC 快速返回，出站独立 OnDeliverMessage） | 彻底斩断反压链，保证适配器 WebSocket 心跳与长轮询毫秒级平稳保活。 |
 | **Windows 本地安全性** | 开放 127.0.0.1 端口暴露于同机非特权进程，存在指令嗅探注入风险 | **CSPRNG 32-Byte 随机 Token 握手鉴权**（私有环境变量注入 + gRPC 首帧恒定时间比对） | 彻底隔绝本机未授权恶意进程伪造请求或探测。 |
+| **Linux IPC 路径与权限安全** | 默认目录权限宽松或依赖不可靠的共享 `/tmp/`，面临符号链接劫持与多租户权限越界 | **基于 UID 隔离的 `/tmp/kanon-run-$UID/` 降级路径 + 强制 `0700` 权限收敛与符号链接深度拦截** | 消除本地多用户非特权攻击者对 UDS 套接字的窃听、替换与权限越界风险。 |
+| **插件配置并发更新竞争** | 多并发热更新时缺乏时序锁，后发请求可能被先发慢请求覆盖产生时序倒退 | **CAS (Compare-And-Swap) 乐观并发控制与单调版本向量**（冲突返回 HTTP 409 Conflict，三语言 SDK 验证版本号） | 保证跨进程与控制面配置更新的严格线性一致性与时序安全性。 |
+| **出站平台级联雪崩与抖动** | 外部平台接口严重劣化或停机时，出站重试导致单平台队列严重堵塞甚至反压 | **单平台独立短路熔断器 (Circuit Breaker)**（连续 5 次失败转为 Open，极速短路，30s 半开自愈探测） | 杜绝死循环重试开销，快速释放系统计算资源，保护底层连接池。 |
+| **出站饱和丢包与死信丢失** | 队列背压打满或永久失败后丢弃消息仅有日志，无法离线对账与重放补发 | **按平台与日期分片的死信冷存储归档 (DLQ JSONL)**（落地 `./data/dead_letter/<platform>_<date>.jsonl`） | 实现不可逆出站失败的 100% 审计追踪与离线补发恢复能力。 |
+
 
 
 

@@ -30,6 +30,8 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{RwLock, mpsc};
 
+use crate::supervisor::circuit_breaker::CircuitState;
+
 /// Errors raised by a platform adapter or by adapter routing.
 #[derive(Debug, Error)]
 pub enum AdapterError {
@@ -149,6 +151,8 @@ pub struct AdapterDescriptor {
     pub kind: AdapterKind,
     /// Whether the adapter can currently deliver messages.
     pub connected: bool,
+    /// Adaptive circuit breaker state for this platform's outbound delivery queue.
+    pub circuit_state: CircuitState,
     /// Owning plugin identifier (plugin adapters only).
     pub plugin_id: Option<String>,
     /// Owning host process identifier (plugin adapters only).

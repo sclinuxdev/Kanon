@@ -354,6 +354,7 @@ async fn host_dispatches_outbound_delivery_to_plugin() {
                     content: "outbound text".to_string(),
                 })),
             }],
+            event_id: "evt-sdk-1".to_string(),
         })
         .await
         .expect("delivery RPC succeeds")
@@ -398,6 +399,7 @@ async fn non_adapter_plugin_refuses_delivery() {
             channel_id: "chan-7".to_string(),
             recipient_id: "alice".to_string(),
             segments: vec![],
+            event_id: "evt-sdk-refuse".to_string(),
         })
         .await
         .expect("RPC completes with a failure payload")

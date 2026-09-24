@@ -23,8 +23,10 @@ use kanon_proto::v1::{
 
 use crate::adapter::{AdapterError, AdapterKind};
 use crate::pipeline::command::CommandRouter;
+use crate::pipeline::dead_letter::DeadLetterWriter;
 use crate::pipeline::observer::{PipelineObserver, PipelineStage};
 use crate::pipeline::pre_filter::{PreFilterChain, PreFilterOutcome};
+use crate::supervisor::circuit_breaker::CircuitBreaker;
 use crate::supervisor::{AdapterRoute, Supervisor};
 
 /// Default depth of the outbound delivery queue.
@@ -97,6 +99,8 @@ pub struct PipelineEngine {
     tool_router: Option<Arc<ToolRouter>>,
     /// Optional lifecycle observer used by the management control plane for tracing.
     observer: Option<Arc<dyn PipelineObserver>>,
+    /// Persistent dead-letter queue writer for failed or dropped outbound messages.
+    dead_letter: Arc<DeadLetterWriter>,
     /// Producer side of the bounded outbound delivery queue.
     outbound_sender: mpsc::Sender<DeliverMessageRequest>,
     /// Consumer side, taken exactly once by [`PipelineEngine::start_outbound_dispatcher`].
@@ -114,9 +118,21 @@ impl PipelineEngine {
             supervisor,
             tool_router: None,
             observer: None,
+            dead_letter: Arc::new(DeadLetterWriter::default()),
             outbound_sender,
             outbound_receiver: Mutex::new(Some(outbound_receiver)),
         }
+    }
+
+    /// Overrides the default dead letter writer.
+    pub fn with_dead_letter(mut self, dead_letter: Arc<DeadLetterWriter>) -> Self {
+        self.dead_letter = dead_letter;
+        self
+    }
+
+    /// Returns a reference to the active dead letter writer.
+    pub fn dead_letter(&self) -> &Arc<DeadLetterWriter> {
+        &self.dead_letter
     }
 
     /// Attaches an LLM [`ToolRouter`] to enable multi-turn reasoning and tool calling.
@@ -200,14 +216,56 @@ impl PipelineEngine {
         }
     }
 
-    /// Delivers a single outbound message and publishes the resulting observation stage.
+    /// Delivers a single outbound message and publishes the resulting observation stage,
+    /// protected by the platform's adaptive circuit breaker and cold-storage dead-letter queue.
     pub async fn dispatch_outbound_request(&self, request: DeliverMessageRequest) {
+        let breaker = self.supervisor.platform_circuit_breaker(&request.platform).await;
+        self.dispatch_outbound_request_with_breaker(request, &breaker).await;
+    }
+
+    /// Delivers a single outbound message using the given platform circuit breaker.
+    ///
+    /// # Fault Tolerance & Dead-Letter Persistence
+    /// - If the breaker is `Open`, fast-skips the call, publishes [`PipelineStage::OutboundFailed`],
+    ///   and appends the dropped message to `data/dead_letter/<platform>_<date>.jsonl`.
+    /// - If delivery succeeds, records latency in the breaker and publishes [`PipelineStage::OutboundDelivered`].
+    /// - If delivery fails, increments consecutive failures in the breaker (tripping if threshold reached),
+    ///   persists the message to the dead-letter log, and publishes [`PipelineStage::OutboundFailed`].
+    pub async fn dispatch_outbound_request_with_breaker(
+        &self,
+        request: DeliverMessageRequest,
+        breaker: &CircuitBreaker,
+    ) {
         let platform = request.platform.clone();
         let channel_id = request.channel_id.clone();
         let segment_count = request.segments.len();
 
-        match self.deliver_outbound(request).await {
+        if !breaker.allow_request() {
+            let reason = "platform circuit breaker open".to_string();
+            tracing::warn!(
+                platform = %platform,
+                channel_id = %channel_id,
+                "Platform circuit breaker tripped (OPEN); short-circuiting delivery and persisting to dead letter"
+            );
+            if let Err(err) = self.dead_letter.write_record(&request, &reason).await {
+                tracing::error!(
+                    platform = %platform,
+                    error = %err,
+                    "Failed to record dead-letter entry for short-circuited message"
+                );
+            }
+            self.observe(PipelineStage::OutboundFailed {
+                platform,
+                channel_id,
+                reason: "circuit breaker open, persisted to dead letter".to_string(),
+            });
+            return;
+        }
+
+        let start = std::time::Instant::now();
+        match self.deliver_outbound(request.clone()).await {
             Ok(outcome) => {
+                breaker.record_success(start.elapsed());
                 tracing::debug!(
                     platform = %outcome.platform,
                     channel_id = %channel_id,
@@ -223,16 +281,25 @@ impl PipelineEngine {
                 });
             }
             Err(err) => {
+                let reason = err.to_string();
+                breaker.record_failure(&reason);
                 tracing::warn!(
                     platform = %platform,
                     channel_id = %channel_id,
                     error = %err,
-                    "Outbound delivery failed"
+                    "Outbound delivery failed; persisting to dead letter"
                 );
+                if let Err(write_err) = self.dead_letter.write_record(&request, &reason).await {
+                    tracing::error!(
+                        platform = %platform,
+                        error = %write_err,
+                        "Failed to persist dead letter record"
+                    );
+                }
                 self.observe(PipelineStage::OutboundFailed {
                     platform,
                     channel_id,
-                    reason: err.to_string(),
+                    reason,
                 });
             }
         }
@@ -247,11 +314,12 @@ impl PipelineEngine {
         let engine = Arc::clone(self);
         tokio::spawn(async move {
             tracing::debug!(platform = %platform, "Platform outbound worker spawned");
+            let breaker = engine.supervisor.platform_circuit_breaker(&platform).await;
             loop {
                 // Workers retire after 30 seconds of inactivity to reclaim resources.
                 match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
                     Ok(Some(req)) => {
-                        engine.dispatch_outbound_request(req).await;
+                        engine.dispatch_outbound_request_with_breaker(req, &breaker).await;
                     }
                     Ok(None) => {
                         // All channel senders dropped (shutting down).
@@ -267,16 +335,25 @@ impl PipelineEngine {
         });
     }
 
-    /// Reports an outbound drop when a specific platform's worker queue is saturated.
+    /// Reports an outbound drop when a specific platform's worker queue is saturated,
+    /// and asynchronously flushes the dropped message to the dead-letter queue log.
     fn report_outbound_queue_full(&self, dropped: DeliverMessageRequest) {
+        let platform = dropped.platform.clone();
+        let channel_id = dropped.channel_id.clone();
         tracing::warn!(
-            platform = %dropped.platform,
-            channel_id = %dropped.channel_id,
-            "Platform outbound queue saturated; dropping message to prevent cross-platform backpressure"
+            platform = %platform,
+            channel_id = %channel_id,
+            "Platform outbound queue saturated; dropping message to dead letter to prevent cross-platform backpressure"
         );
+        let dead_letter = Arc::clone(&self.dead_letter);
+        tokio::spawn(async move {
+            let _ = dead_letter
+                .write_record(&dropped, "platform outbound queue saturated")
+                .await;
+        });
         self.observe(PipelineStage::OutboundFailed {
-            platform: dropped.platform,
-            channel_id: dropped.channel_id,
+            platform,
+            channel_id,
             reason: "platform outbound queue full".to_string(),
         });
     }
@@ -582,6 +659,7 @@ impl PipelineEngine {
                     channel_id,
                     recipient_id,
                     segments: replies.to_vec(),
+                    event_id: event_id.clone(),
                 };
 
                 let platform = deliver_req.platform.clone();
@@ -598,12 +676,16 @@ impl PipelineEngine {
                             segment_count,
                         });
                     }
-                    Err(mpsc::error::TrySendError::Full(_)) => {
+                    Err(mpsc::error::TrySendError::Full(dropped)) => {
                         tracing::warn!(
                             platform = %platform,
                             channel_id = %channel_id,
-                            "Outbound queue is full; dropping reply to protect pipeline latency"
+                            "Outbound queue is full; dropping reply to dead letter to protect pipeline latency"
                         );
+                        let dead_letter = Arc::clone(&self.dead_letter);
+                        tokio::spawn(async move {
+                            let _ = dead_letter.write_record(&dropped, "outbound queue is full").await;
+                        });
                         self.observe(PipelineStage::OutboundFailed {
                             platform,
                             channel_id,

@@ -128,6 +128,8 @@ pub struct PluginConfigView {
     pub schema: Value,
     /// Whether the values came from a persisted file rather than schema defaults alone.
     pub persisted: bool,
+    /// Currently applied configuration version token.
+    pub version: u64,
 }
 
 /// Request body for `PUT /api/v1/plugins/:id/config`.
@@ -135,6 +137,10 @@ pub struct PluginConfigView {
 pub struct UpdateConfigRequest {
     /// Complete replacement configuration object.
     pub values: Value,
+    /// Optional expected version for optimistic concurrency control (CAS).
+    /// If provided and mismatched against in-memory state, yields HTTP 409 Conflict.
+    #[serde(default)]
+    pub version: Option<u64>,
 }
 
 /// Confirmation payload returned after a successful configuration update.
@@ -148,6 +154,8 @@ pub struct UpdateConfigResponse {
     pub values: Value,
     /// Always `true`: the field exists so console clients can assert on the outcome explicitly.
     pub reloaded: bool,
+    /// Monotonically incremented configuration version token.
+    pub version: u64,
 }
 
 /// Confirmation payload returned after a host restart.
@@ -205,12 +213,14 @@ async fn get_config(
     let stored = store.load(&plugin_id)?;
     let persisted = stored.as_object().is_some_and(|map| !map.is_empty());
     let values = PluginConfigStore::apply_defaults(schema.as_ref(), &stored);
+    let version = state.supervisor().config_version(&plugin_id).await;
 
     Ok(Json(PluginConfigView {
         plugin_id,
         values,
         schema: schema.unwrap_or(Value::Null),
         persisted,
+        version,
     }))
 }
 
@@ -244,9 +254,10 @@ async fn put_config(
         .map_err(|reason| ApiError::BadRequest(format!("Invalid configuration: {reason}")))?;
 
     // Step 1: let the plugin host accept or reject the payload before anything becomes durable.
-    state
+    // Optimistic concurrency control (CAS) verifies the version vector and rejects stale reloads.
+    let applied_version = state
         .supervisor()
-        .reload_plugin_config(&plugin_id, &body.values)
+        .reload_plugin_config_cas(&plugin_id, &body.values, body.version)
         .await?;
 
     // Step 2: persist only an accepted configuration. `spawn_blocking` keeps small filesystem
@@ -269,6 +280,7 @@ async fn put_config(
     tracing::info!(
         plugin_id = %plugin_id,
         host_id = %host.host_id,
+        version = applied_version,
         "Plugin configuration updated and hot reloaded"
     );
 
@@ -277,6 +289,7 @@ async fn put_config(
         host_id: host.host_id.clone(),
         values: body.values,
         reloaded: true,
+        version: applied_version,
     }))
 }
 

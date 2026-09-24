@@ -7,11 +7,13 @@
 //! - [`PipelineObserver`]: Fire-and-forget lifecycle observation hook for control-plane tracing.
 
 pub mod command;
+pub mod dead_letter;
 pub mod engine;
 pub mod observer;
 pub mod pre_filter;
 
 pub use command::{CommandRouter, MatchedCommand};
+pub use dead_letter::{DeadLetterRecord, DeadLetterWriter, DEFAULT_DEAD_LETTER_DIR};
 pub use engine::{DeliveryOutcome, PipelineEngine, PipelineResult, DEFAULT_OUTBOUND_QUEUE_CAPACITY};
 pub use observer::{PipelineObserver, PipelineStage};
 pub use pre_filter::{

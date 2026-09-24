@@ -195,6 +195,7 @@ fn outbound_request(platform: &str) -> DeliverMessageRequest {
                 content: "hello".to_string(),
             })),
         }],
+        event_id: "evt-fixture-1".to_string(),
     }
 }
 
@@ -496,6 +497,7 @@ async fn test_partitioned_outbound_dispatch_cross_platform_isolation_and_fifo_or
         channel_id: chan.to_string(),
         recipient_id: "user1".to_string(),
         segments: vec![],
+        event_id: format!("evt-{plat}-{chan}"),
     };
 
     // Send 1 to slow, then 2 and 3 to fast
@@ -592,6 +594,7 @@ async fn test_partitioned_outbound_dispatch_queue_saturation_drop() {
                 channel_id: format!("c-{i}"),
                 recipient_id: "u1".to_string(),
                 segments: vec![],
+                event_id: format!("evt-drop-{i}"),
             })
             .await
             .expect("send to global outbound queue");
@@ -610,4 +613,182 @@ async fn test_partitioned_outbound_dispatch_queue_saturation_drop() {
         "failure stage reason must indicate platform queue saturation: {}",
         drops[0]
     );
+}
+
+/// A platform adapter whose delivery fails repeatedly.
+struct FailingPlatformAdapter {
+    platform: String,
+    delivery_count: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl kanon_core::PlatformAdapter for FailingPlatformAdapter {
+    fn platform(&self) -> &str {
+        &self.platform
+    }
+
+    async fn deliver(
+        &self,
+        _request: DeliverMessageRequest,
+    ) -> Result<DeliverMessageResponse, AdapterError> {
+        self.delivery_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(AdapterError::Delivery {
+            platform: self.platform.clone(),
+            reason: "connection refused: platform API endpoint offline".to_string(),
+        })
+    }
+}
+
+/// A platform whose deliveries fail trips its circuit breaker to Open and flushes undeliverable
+/// messages into partitioned cold storage dead-letter JSONL files.
+#[tokio::test]
+async fn platform_circuit_breaker_trips_and_persists_to_dead_letter() {
+    use kanon_core::CircuitState;
+    use kanon_core::pipeline::dead_letter::DeadLetterWriter;
+
+    let tmp = tempdir().expect("temp dir");
+    let dlq_dir = tmp.path().join("dead_letter");
+
+    let supervisor = Arc::new(Supervisor::new(Some(tmp.path().to_path_buf()), None));
+    let failing_adapter = Arc::new(FailingPlatformAdapter {
+        platform: "unstable_im".to_string(),
+        delivery_count: std::sync::atomic::AtomicUsize::new(0),
+    });
+    supervisor
+        .adapters()
+        .register(failing_adapter.clone())
+        .await
+        .expect("register adapter");
+
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let observer = FailureObserver {
+        failures: failures.clone(),
+    };
+
+    let dead_letter_writer = Arc::new(DeadLetterWriter::new(dlq_dir.clone()));
+    let engine = Arc::new(
+        PipelineEngine::new(supervisor.clone())
+            .with_observer(Arc::new(observer))
+            .with_dead_letter(dead_letter_writer),
+    );
+
+    let _dispatcher = engine.clone().start_outbound_dispatcher();
+    let sender = engine.outbound_sender();
+
+    // 1. Initial circuit state must be Closed
+    assert_eq!(
+        supervisor.platform_circuit_state("unstable_im").await,
+        CircuitState::Closed
+    );
+
+    // 2. Send 5 messages: all 5 fail in the adapter, reaching the failure_threshold (5)
+    for i in 1..=5 {
+        sender
+            .send(DeliverMessageRequest {
+                platform: "unstable_im".to_string(),
+                channel_id: format!("chan-{i}"),
+                recipient_id: "user1".to_string(),
+                segments: vec![MessageSegment {
+                    segment: Some(Segment::Text(TextSegment {
+                        content: format!("msg {i}"),
+                    })),
+                }],
+                event_id: format!("evt-fail-{i}"),
+            })
+            .await
+            .expect("enqueue message");
+    }
+
+    // Wait until the sequential worker processes all 5 deliveries
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        if failing_adapter
+            .delivery_count
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 5
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        failing_adapter
+            .delivery_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        5
+    );
+
+    // 3. Circuit breaker must now be tripped to Open
+    assert_eq!(
+        supervisor.platform_circuit_state("unstable_im").await,
+        CircuitState::Open
+    );
+
+    // Verify adapter catalog exposes the Open circuit state to the control plane
+    let catalog = supervisor.adapter_catalog().await;
+    let desc = catalog
+        .iter()
+        .find(|d| d.platform == "unstable_im")
+        .expect("adapter in catalog");
+    assert_eq!(desc.circuit_state, CircuitState::Open);
+
+    // 4. Send a 6th message while circuit is Open: must be fast-skipped WITHOUT calling deliver()
+    sender
+        .send(DeliverMessageRequest {
+            platform: "unstable_im".to_string(),
+            channel_id: "chan-short-circuit".to_string(),
+            recipient_id: "user1".to_string(),
+            segments: vec![MessageSegment {
+                segment: Some(Segment::Text(TextSegment {
+                    content: "short circuited".to_string(),
+                })),
+            }],
+            event_id: "evt-short-circuit-6".to_string(),
+        })
+        .await
+        .expect("enqueue message");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The adapter's deliver() was NOT called a 6th time
+    assert_eq!(
+        failing_adapter
+            .delivery_count
+            .load(std::sync::atomic::Ordering::SeqCst),
+        5
+    );
+
+    // 5. Inspect the dead-letter cold storage files
+    assert!(dlq_dir.exists(), "DLQ directory must be created");
+    let mut files = std::fs::read_dir(&dlq_dir).expect("read dlq dir");
+    let entry = files.next().expect("at least one dlq file").expect("file entry");
+    let file_name = entry.file_name().to_string_lossy().to_string();
+    assert!(
+        file_name.starts_with("unstable_im_"),
+        "Filename must be partitioned by platform: {file_name}"
+    );
+    assert!(
+        file_name.ends_with(".jsonl"),
+        "Filename must end in .jsonl: {file_name}"
+    );
+
+    let content = std::fs::read_to_string(entry.path()).expect("read dlq file");
+    let lines: Vec<&str> = content.trim().split('\n').filter(|s| !s.is_empty()).collect();
+    // 5 failed deliveries + 1 short-circuited delivery = 6 dead-letter records
+    assert_eq!(lines.len(), 6);
+
+    // Validate structured JSON of the first record (failed delivery)
+    let record1: serde_json::Value = serde_json::from_str(lines[0]).expect("parse JSON");
+    assert_eq!(record1["platform"], "unstable_im");
+    assert_eq!(record1["channel_id"], "chan-1");
+    assert_eq!(record1["event_id"], "evt-fail-1");
+    assert!(record1["reason"].as_str().unwrap().contains("connection refused"));
+    assert!(record1["timestamp_ms"].as_u64().unwrap() > 0);
+    assert!(record1["iso_time"].as_str().unwrap().contains("T"));
+    assert_eq!(record1["segments"][0]["content"], "msg 1");
+
+    // Validate structured JSON of the last record (circuit breaker open)
+    let record6: serde_json::Value = serde_json::from_str(lines[5]).expect("parse JSON");
+    assert_eq!(record6["event_id"], "evt-short-circuit-6");
+    assert_eq!(record6["reason"], "platform circuit breaker open");
 }

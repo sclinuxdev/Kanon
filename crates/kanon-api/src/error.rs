@@ -115,6 +115,13 @@ impl From<kanon_core::SupervisorError> for ApiError {
             } => ApiError::Upstream(format!(
                 "Host '{host_id}' rejected config reload for plugin '{plugin_id}': {reason}"
             )),
+            SupervisorError::StaleConfigVersion {
+                plugin_id,
+                current_version,
+                requested_version,
+            } => ApiError::Conflict(format!(
+                "Stale configuration version for plugin '{plugin_id}': current version is {current_version}, but requested {requested_version}"
+            )),
             SupervisorError::Rpc(status) => {
                 if status.code() == tonic::Code::NotFound {
                     ApiError::NotFound(status.message().to_string())

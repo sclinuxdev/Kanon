@@ -296,3 +296,136 @@ async fn pipeline_worker_emits_ingest_and_outbound_stages() {
         vec!["ingested", "pre_filter_started", "pre_filter_passed"]
     );
 }
+
+/// Configuration reloads strictly enforce monotonically increasing CAS version vectors.
+#[tokio::test]
+async fn config_hot_reload_enforces_cas_version_vectors() {
+    use kanon_proto::v1::plugin_host_service_server::{PluginHostService, PluginHostServiceServer};
+    use kanon_proto::v1::{
+        GetPluginMetaRequest, GetPluginMetaResponse, PingRequest, PingResponse,
+        ReloadPluginConfigRequest, ReloadPluginConfigResponse,
+    };
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tonic::{Request, Response, Status};
+
+    struct TestHostService {
+        version: AtomicU64,
+    }
+
+    #[tonic::async_trait]
+    impl PluginHostService for TestHostService {
+        async fn ping(&self, req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
+            Ok(Response::new(PingResponse {
+                timestamp: req.into_inner().timestamp,
+            }))
+        }
+        async fn reload_plugin_config(
+            &self,
+            req: Request<ReloadPluginConfigRequest>,
+        ) -> Result<Response<ReloadPluginConfigResponse>, Status> {
+            let r = req.into_inner();
+            let cur = self.version.load(Ordering::SeqCst);
+            if r.version > 0 && r.version <= cur {
+                return Ok(Response::new(ReloadPluginConfigResponse {
+                    success: false,
+                    error_message: format!("Stale version: cur={cur}, req={}", r.version),
+                    applied_version: cur,
+                }));
+            }
+            self.version.store(r.version, Ordering::SeqCst);
+            Ok(Response::new(ReloadPluginConfigResponse {
+                success: true,
+                error_message: String::new(),
+                applied_version: r.version,
+            }))
+        }
+        async fn get_plugin_meta(
+            &self,
+            _: Request<GetPluginMetaRequest>,
+        ) -> Result<Response<GetPluginMetaResponse>, Status> {
+            Ok(Response::new(GetPluginMetaResponse { plugins: vec![] }))
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    let service = TestHostService {
+        version: AtomicU64::new(0),
+    };
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(PluginHostServiceServer::new(service))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    let run_dir = tempdir().expect("temp dir");
+    let supervisor = Supervisor::new(Some(run_dir.path().to_path_buf()), None);
+
+    let plugin_id = "org.kanon.plugin.cas_test";
+    let plugin = PluginMeta {
+        id: plugin_id.to_string(),
+        name: "CAS Test".to_string(),
+        version: "1.0.0".to_string(),
+        ..PluginMeta::default()
+    };
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let host = Arc::new(ManagedHost::new(
+        "host_cas".to_string(),
+        run_dir.path().join("host_cas.sock"),
+        channel,
+        vec![plugin],
+        500,
+    ));
+    supervisor.register_managed_host(host).await;
+
+    // Initial version is 0
+    assert_eq!(supervisor.config_version(plugin_id).await, 0);
+
+    // 1. CAS check: Attempting update with expected_version = 5 must fail with StaleConfigVersion
+    let err = supervisor
+        .reload_plugin_config_cas(plugin_id, &serde_json::json!({"k": 1}), Some(5))
+        .await
+        .expect_err("mismatched version must be rejected");
+    assert!(
+        matches!(err, SupervisorError::StaleConfigVersion { current_version: 0, requested_version: 5, .. })
+    );
+
+    // 2. Successful reload with expected_version = 0 increments version to 1
+    let v1 = supervisor
+        .reload_plugin_config_cas(plugin_id, &serde_json::json!({"k": 1}), Some(0))
+        .await
+        .expect("CAS reload with expected version 0 succeeds");
+    assert_eq!(v1, 1);
+    assert_eq!(supervisor.config_version(plugin_id).await, 1);
+
+    // 3. Next update with expected_version = 1 increments version to 2
+    let v2 = supervisor
+        .reload_plugin_config_cas(plugin_id, &serde_json::json!({"k": 2}), Some(1))
+        .await
+        .expect("CAS reload with expected version 1 succeeds");
+    assert_eq!(v2, 2);
+    assert_eq!(supervisor.config_version(plugin_id).await, 2);
+
+    // 4. Stale update with expected_version = 1 fails (since current is 2)
+    let err2 = supervisor
+        .reload_plugin_config_cas(plugin_id, &serde_json::json!({"k": 3}), Some(1))
+        .await
+        .expect_err("stale CAS version 1 must be rejected when current is 2");
+    assert!(
+        matches!(err2, SupervisorError::StaleConfigVersion { current_version: 2, requested_version: 1, .. })
+    );
+
+    // Version remains 2
+    assert_eq!(supervisor.config_version(plugin_id).await, 2);
+}
+

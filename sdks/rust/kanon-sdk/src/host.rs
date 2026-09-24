@@ -110,6 +110,7 @@ impl<P: Plugin> KanonHost<P> {
         // 4. Start gRPC services
         let host_svc = HostServiceImpl {
             plugin: self.plugin.clone(),
+            config_versions: Arc::new(RwLock::new(std::collections::HashMap::new())),
         };
         let pipeline_svc = PipelineServiceImpl {
             plugin: self.plugin.clone(),
@@ -173,6 +174,7 @@ impl<P: Plugin> KanonHost<P> {
 /// Implementation of [`PluginHostService`] for managing host lifecycle and inspection.
 struct HostServiceImpl<P: Plugin> {
     plugin: Arc<RwLock<P>>,
+    config_versions: Arc<RwLock<std::collections::HashMap<String, u64>>>,
 }
 
 #[tonic::async_trait]
@@ -192,10 +194,41 @@ impl<P: Plugin> PluginHostService for HostServiceImpl<P> {
         request: Request<ReloadPluginConfigRequest>,
     ) -> Result<Response<ReloadPluginConfigResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!(plugin_id = %req.plugin_id, "Reloading plugin configuration");
+        let mut versions = self.config_versions.write().await;
+        let current_ver = *versions.get(&req.plugin_id).unwrap_or(&0);
+
+        if req.version > 0 && req.version <= current_ver {
+            tracing::warn!(
+                plugin_id = %req.plugin_id,
+                current_version = current_ver,
+                requested_version = req.version,
+                "Rejecting stale or out-of-order configuration reload"
+            );
+            return Ok(Response::new(ReloadPluginConfigResponse {
+                success: false,
+                error_message: format!(
+                    "Stale config version {}: current is {}",
+                    req.version, current_ver
+                ),
+                applied_version: current_ver,
+            }));
+        }
+
+        let applied = if req.version > 0 {
+            req.version
+        } else {
+            current_ver + 1
+        };
+        versions.insert(req.plugin_id.clone(), applied);
+        tracing::info!(
+            plugin_id = %req.plugin_id,
+            version = applied,
+            "Reloading plugin configuration"
+        );
         Ok(Response::new(ReloadPluginConfigResponse {
             success: true,
             error_message: String::new(),
+            applied_version: applied,
         }))
     }
 

@@ -38,9 +38,9 @@
 
 ### 2.1 独立端点通信拓扑 (Dedicated Endpoint per Host Model)
 
-针对标准 UDS 下多客户端与服务端反向 RPC 路由的寻址悖论，Kanon 彻底抛弃单一 Socket 混杂监听模式，采用 **基于运行时目录的独立端点隔离模型 (Runtime Endpoint Directory)**：
-
-- **运行时目录**：系统遵循 XDG 规范，使用跨平台隔离目录（如 Linux/macOS 下 `$XDG_RUNTIME_DIR/kanon/run/`；Windows 下使用安全随机端口 TCP Loopback）。
+- **运行时目录与 POSIX 权限防御**：系统遵循 XDG 规范，使用跨平台隔离目录（如 Linux/macOS 优先使用 `$XDG_RUNTIME_DIR/kanon/run/`；Windows 下使用安全随机端口 TCP Loopback 并注入 32-Byte CSPRNG Token 校验）。在无桌面环境的纯净 Linux 服务器、Docker 容器或最小化 Alpine 系统中，环境变量 `$XDG_RUNTIME_DIR` 经常未被设置。若代码静默降级为标准 `/tmp/kanon-run/`，由于公共 `/tmp` 的黏滞位特性和共享可见性，会导致本地其他用户窥探甚至通过符号链接劫持 socket 文件。因此规范补充如下硬性分支规定：
+  - **UID 隔离回退**：当 `$XDG_RUNTIME_DIR` 为空时，回退目录为 `/tmp/kanon-run-$UID/`（通过 POSIX `libc::getuid()` 获取调用方真实 Effective UID）。
+  - **强制 0700 权限**：核心与 Supervisor 在创建或检测该目录时，必须通过系统调用强制显式设为 `0700`（仅当前 UID 拥有 `rwx------` 权限），若存在权限冲突或符号链接劫持则立即拒绝启动。
 - **核心端点 (`core.sock`)**：Rust 核心启动 gRPC 服务端，监听 `core.sock`，向所有 Host 提供 `BotApiService`（主动发消息、事件灌入、LLM 代理等）。
 - **宿主独立端点 (`host_<id>.sock`)**：Supervisor 为每个拉起的 Host 分配专属通信端点，Host 在该端点启动 gRPC 服务端，提供 `MessagePipelineService`。Rust 核心作为 Client 连接各 Host 端点发起命令调度与 Tool Calling。
 - **架构收益**：保持标准 gRPC 纯粹语义，双向互相调用完全解耦，绝无应用层帧路由负担，每个端点均可使用 `grpcurl` 独立排障。
@@ -325,6 +325,29 @@ message ReplySegment {
 message RawCustomSegment {
   string type_name = 1;
   google.protobuf.Struct payload = 2;
+}
+
+// --- 流水线事件与前置过滤核心定义 (含关键枚举) ---
+
+message PipelineEventRequest {
+  string event_id = 1;
+  string platform = 2;
+  string channel_id = 3;
+  string sender_id = 4;
+  string raw_text = 5;
+  repeated MessageSegment segments = 6;
+  google.protobuf.Struct metadata = 7;
+}
+
+message PreFilterResult {
+  enum Action {
+    PASS = 0;
+    BLOCK = 1;
+    MODIFY = 2;
+  }
+  Action action = 1;
+  string modified_text = 2;
+  repeated MessageSegment reply_messages = 3;
 }
 
 // --- Tool Calling 双模载荷定义 (消除四次序列化损耗) ---
@@ -649,11 +672,10 @@ sequenceDiagram
 - **平台内时序保障**：同一平台内部由独立 Worker 串行消费，严格保证 FIFO 消息递送顺序；
 - **背压与死信追踪**：单平台队列饱和时，溢出消息立即丢弃并自动持久化归档至死信日志，同时上报 `outbound_failed` 阶段，不静默膨胀内存。
 
-**出站单平台独立短路熔断器 (Per-Platform Circuit Breaker)**：
-- 为杜绝目标平台长期宕机或网络中断导致单平台队列持续满载丢包及产生不必要的网络重试开销，Supervisor 为每个注册平台分配专属的独立断路器（`CircuitBreaker`）；
-- **熔断阈值与状态转移**：单平台出站投递若连续遭遇 **5 次失败**（网络异常、超时或平台拒绝），断路器自动熔断切换至 `Open`（熔断开启）状态；
-- **极速短路 (Fast-Skip)**：当断路器处于 `Open` 状态时，后续路由到该平台的出站请求直接短路失败，不再发起无意义的网络 I/O，并立即将未投递消息写入死信队列；
-- **半开探测 (Half-Open Probe)**：熔断窗口期（默认 30 秒）到期后，断路器自动进入 `Half-Open` 试探状态，放行单条出站请求试探远端服务可用性；若试探成功则自动复位至 `Closed` 状态并重置失败计数，若依然失败则重新转入 `Open` 状态；
+**出站单平台故障熔断器 (Circuit Breaker)**：
+若目标平台 API 出现长时间物理级宕机（例如网络切断或服务崩溃持续数小时），每条出站消息重试 2 次会造成单平台队列持续占满，队列持续溢出并对同一故障地址发起无意义的重试请求。为此系统补齐单平台独立熔断机制：
+- **短路阈值**：当特定平台的出站调用连续失败达到 **5 次**时，该平台的 Dispatcher Worker 自动进入 `CircuitOpen` 状态。
+- **短路行为**：熔断期间后续消息直接丢弃或落盘到死信存储并上报 `outbound_failed`，不再触发实际网络 I/O，并以 30 秒为周期进入 `Half-Open` 状态发送单条试探探测，探测成功后恢复，防止阻塞 worker 协程与连接句柄。
 - **控制面状态透出**：`GET /api/v1/adapters` 实时输出各个适配器的熔断器健康状态（`circuit_state: "closed" | "open" | "half_open"`），使运维能够实时监控各平台连接质量与故障熔断状态。
 
 **出站死信队列与持久化归档 (Outbound Dead-Letter Queue & Cold Persistence)**：

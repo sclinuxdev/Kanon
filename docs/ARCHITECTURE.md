@@ -210,6 +210,14 @@ priority = 100
 name = "fetch_weather"
 description = "根据指定城市名称实时获取当前气温、风向与穿衣出行建议"
 parameters = { type = "object", properties = { city = { type = "string", description = "城市名称，例如：北京、上海、杭州" } }, required = ["city"] }
+
+# 平台适配器声明（可选）：声明后本插件成为该平台的适配器
+# 核心据此把 platform 匹配的出站消息路由到本宿主（OnDeliverMessage），
+# 插件侧再通过 BotApiService.IngestEvent 把平台入站消息推回流水线。
+# 能力声明放在静态清单而非 PluginMeta：核心必须在收到第一条消息之前就知道平台归属。
+[adapter]
+platform = "weather_im"
+display_name = "Weather IM Adapter"
 ```
 
 ---
@@ -532,7 +540,8 @@ sequenceDiagram
 | `GET` | `/api/v1/personas` | 查询系统预设及动态注册人设列表 |
 | `GET` | `/api/v1/metrics` | 导出 Prometheus 格式的系统与消息吞吐指标 |
 | `POST` | `/api/v1/chat/completions` | 在线沙盒对话调试，支持标准 JSON 与 `text/event-stream` 流式输出 |
-| `GET` | `/api/v1/adapters` | 查询已注册的平台适配器及其连接存活状态（待适配器注册表落地后实现） |
+| `GET` | `/api/v1/adapters` | 查询已注册的平台适配器（内置 + 插件声明）及其连接存活状态 |
+| `POST` | `/api/v1/adapters/{platform}/ingest` | 平台入站数据面：Fast-ACK 接收外部消息并推入核心流水线 |
 
 ### 9.3 实时数据流 (WebSocket)
 
@@ -553,6 +562,8 @@ sequenceDiagram
 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `KANON_API_ADDR` | `127.0.0.1:8080` | 管理网关监听地址（默认仅回环，避免误暴露） |
+| `KANON_WEBHOOK_PLATFORM` | `webhook` | 内置 Webhook 适配器服务的平台标识（入站路径 `/api/v1/adapters/<平台>/ingest`） |
+| `KANON_WEBHOOK_CALLBACK_URL` | 未设置 | 出站回调地址；未设置时适配器仅支持入站，控制面显示 `connected: false`，出站投递显式报错而非假装成功 |
 | `KANON_LLM_BASE_URL` | 未设置 | 模型网关基址；未设置时聊天调试端点显式返回 `503`，绝不以假 Provider 掩盖缺失配置 |
 | `KANON_LLM_API_KEY` | 未设置 | 模型服务凭证 |
 | `KANON_LLM_MODEL` | `gpt-4o-mini` | 默认模型标识 |
@@ -561,6 +572,27 @@ sequenceDiagram
 
 插件配置持久化位置遵循数据隔离规范：`./data/plugins/<plugin_id>/config.json`，采用「临时文件 + `rename`」原子提交，
 写入顺序为 **校验 → 宿主热重载确认 → 落盘**，宿主拒绝时不会留下半更新配置。
+
+### 9.5 平台适配器契约 (Platform Adapter Contract)
+
+微内核自身不实现任何 IM 协议：**平台适配器**独占一个平台标识（与 `PipelineEventRequest.platform` 同值），负责两个方向：
+
+1. **入站 (Inbound)**：把平台消息经 `EventIngress` 非阻塞推入核心 → 保持 Fast-ACK 语义（队列满时返回 `accepted=false` 或 HTTP `503`，绝不阻塞平台回调）。
+2. **出站 (Outbound)**：把 `DeliverMessageRequest` 真正投递到平台 API，失败必须显式上报。
+
+两条实现路径共用同一契约与同一条出站路由：
+
+| 路径 | 注册方式 | 出站投递 | 入站 |
+| :--- | :--- | :--- | :--- |
+| **内置 (Built-in)** | 进程内实现 `PlatformAdapter` 并注册到 `AdapterRegistry`（内置优先于插件，是运维的显式覆盖） | 直接调用适配器 `deliver()`，零 IPC 开销 | 由适配器自行推送（HTTP 网关路由或自建长轮询任务） |
+| **插件 (Plugin)** | `plugin.toml` 声明 `[adapter] platform = "..."`，核心从静态清单发现，**无需注册调用** | `MessagePipelineService.OnDeliverMessage` RPC 投递到宿主进程 | 插件经 `BotApiService.IngestEvent` 推回；Rust/Python/TS SDK 的 `ctx.core.ingest_event(...)` 已封装 |
+
+**出站调度与背压**：流水线工作循环绝不等待平台 I/O（避免单一慢平台造成队头阻塞），回复统一进入有界出站队列，
+由独立 dispatcher 任务串行投递（保持同一平台的消息顺序）。队列满时丢弃并上报 `outbound_failed` 阶段，
+不静默膨胀内存。控制面可通过 `/ws/v1/events` 观察 `outbound_queued → outbound_delivered / outbound_failed` 全链路。
+
+**插件侧能力**：声明 `[adapter]` 但未实现出站钩子的插件会收到明确的失败响应（`success=false` + 原因），
+核心据此记录投递失败 —— 契约不允许「假成功」。三语言 SDK 的默认 `on_deliver_message` / `onDeliverMessage` 均已改为显式拒绝。
 
 ---
 

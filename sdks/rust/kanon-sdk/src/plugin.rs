@@ -5,8 +5,8 @@
 
 use async_trait::async_trait;
 use kanon_proto::v1::{
-    CommandExecuteRequest, CommandExecuteResponse, PipelineEventRequest,
-    PluginMeta, PreFilterResult, ToolCallRequest, ToolCallResponse,
+    CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse,
+    PipelineEventRequest, PluginMeta, PreFilterResult, ToolCallRequest, ToolCallResponse,
 };
 use crate::context::PluginContext;
 
@@ -53,6 +53,26 @@ pub trait Plugin: Send + Sync + 'static {
             success: true,
             error_message: String::new(),
             payload: None,
+        })
+    }
+
+    /// Publishes an outbound message for the platform this plugin serves as an adapter.
+    ///
+    /// The core routes every reply whose `platform` matches the plugin's `[adapter]` manifest
+    /// declaration to this hook. The default implementation reports failure instead of pretending
+    /// to deliver: a plugin that declares itself an adapter but never overrides this hook would
+    /// otherwise silently swallow user-visible replies.
+    async fn on_deliver_message(
+        &self,
+        req: DeliverMessageRequest,
+    ) -> PluginResult<DeliverMessageResponse> {
+        Ok(DeliverMessageResponse {
+            success: false,
+            message_id: String::new(),
+            error_message: format!(
+                "plugin does not implement on_deliver_message for platform '{}'",
+                req.platform
+            ),
         })
     }
 }

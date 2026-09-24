@@ -1,11 +1,15 @@
-//! Kanon Official Rust SDK (Skeleton)
+//! Kanon Official Rust SDK.
 //!
-//! Provides traits and types for developing out-of-process Rust plugins.
+//! Provides the trait and runtime types for developing out-of-process Rust plugins, including
+//! platform adapters: declare `[adapter] platform = "..."` in `plugin.toml`, implement
+//! [`Plugin::on_deliver_message`] for outbound delivery, and push inbound messages back through
+//! the [`CoreHandle`] exposed on [`PluginContext::core`].
 
 pub mod plugin;
 pub mod context;
 pub mod host;
 
+pub use context::CoreHandle;
 pub use host::KanonHost;
 pub use kanon_proto as proto;
 

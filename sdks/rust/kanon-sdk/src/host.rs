@@ -10,7 +10,6 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
-use kanon_proto::v1::bot_api_service_client::BotApiServiceClient;
 use kanon_proto::v1::message_pipeline_service_server::{
     MessagePipelineService, MessagePipelineServiceServer,
 };
@@ -25,7 +24,7 @@ use kanon_proto::v1::{
     ToolCallResponse,
 };
 use kanon_transport::{connect_ipc, IpcListener};
-use crate::context::PluginContext;
+use crate::context::{CoreHandle, PluginContext};
 use crate::plugin::Plugin;
 
 /// Out-of-process gRPC host for a Kanon plugin.
@@ -84,42 +83,29 @@ impl<P: Plugin> KanonHost<P> {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        // 1. Initialize plugin lifecycle
-        let meta = self.plugin.read().await.meta();
-        let plugin_id = meta.id.clone();
+        let plugin_id = self.plugin.read().await.meta().id;
+
+        // 1. Connect to Core before initializing the plugin: adapter plugins capture the core
+        //    handle from their context during `on_load`, so the connection must already exist.
+        let core_handle = self.connect_core(&plugin_id).await;
+
+        // 2. Initialize plugin lifecycle
         let data_dir = PathBuf::from(format!("./data/plugins/{plugin_id}"));
         let mut ctx = PluginContext::new(data_dir, None);
+        match core_handle {
+            Some(handle) => ctx = ctx.with_core(handle),
+            None => tracing::warn!(
+                plugin_id = %plugin_id,
+                "Core is not reachable; continuing in standalone mode with ctx.core = None"
+            ),
+        }
 
         self.plugin.write().await.on_load(&mut ctx).await?;
         tracing::info!(plugin_id = %plugin_id, socket = %self.socket_path.display(), "Plugin loaded successfully");
 
-        // 2. Bind IPC Listener
+        // 3. Bind IPC Listener
         let listener = IpcListener::bind(&self.socket_path)?;
         let incoming = listener.incoming();
-
-        // 3. Register with Core if core_sock is specified
-        if let Some(ref core_path) = self.core_sock {
-            let host_id = std::env::var("KANON_HOST_ID").unwrap_or_else(|_| plugin_id.clone());
-            let endpoint = self.socket_path.to_string_lossy().to_string();
-            let loaded_plugin_ids = vec![plugin_id.clone()];
-
-            if let Ok(channel) = connect_ipc(core_path.clone()).await {
-                let mut client = BotApiServiceClient::new(channel);
-                let reg_req = RegisterHostRequest {
-                    host_id,
-                    runtime: "rust".to_string(),
-                    endpoint,
-                    loaded_plugin_ids,
-                };
-                if let Err(e) = client.register_host(reg_req).await {
-                    tracing::warn!(error = %e, "Failed to register with Core, will proceed with hosting");
-                } else {
-                    tracing::info!("Successfully registered with Core IPC server");
-                }
-            } else {
-                tracing::debug!("Core socket not reachable at startup, continuing in standalone mode");
-            }
-        }
 
         // 4. Start gRPC services
         let host_svc = HostServiceImpl {
@@ -144,6 +130,43 @@ impl<P: Plugin> KanonHost<P> {
         }
 
         Ok(())
+    }
+
+    /// Registers this host with the Core microkernel and returns a reusable core handle.
+    ///
+    /// Registration doubles as the reachability probe: the handle is only produced when the core
+    /// actually answered, so a dead or foreign socket yields `None` (standalone mode) instead of a
+    /// handle that would fail on the first ingest.
+    async fn connect_core(&self, plugin_id: &str) -> Option<CoreHandle> {
+        let core_path = self.core_sock.as_ref()?;
+
+        let channel = match connect_ipc(core_path.clone()).await {
+            Ok(channel) => channel,
+            Err(e) => {
+                tracing::warn!(error = %e, "Core socket not reachable at startup; running standalone");
+                return None;
+            }
+        };
+
+        let handle = CoreHandle::new(channel);
+        let host_id = std::env::var("KANON_HOST_ID").unwrap_or_else(|_| plugin_id.to_string());
+        let registration = RegisterHostRequest {
+            host_id,
+            runtime: "rust".to_string(),
+            endpoint: self.socket_path.to_string_lossy().to_string(),
+            loaded_plugin_ids: vec![plugin_id.to_string()],
+        };
+
+        match handle.register_host(registration).await {
+            Ok(_) => {
+                tracing::info!("Successfully registered with Core IPC server");
+                Some(handle)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to register with Core; running standalone");
+                None
+            }
+        }
     }
 }
 
@@ -253,12 +276,20 @@ impl<P: Plugin> MessagePipelineService for PipelineServiceImpl<P> {
 
     async fn on_deliver_message(
         &self,
-        _request: Request<DeliverMessageRequest>,
+        request: Request<DeliverMessageRequest>,
     ) -> Result<Response<DeliverMessageResponse>, Status> {
-        Ok(Response::new(DeliverMessageResponse {
-            success: true,
-            message_id: "delivered_1".to_string(),
-            error_message: String::new(),
-        }))
+        let req = request.into_inner();
+        let plugin = self.plugin.read().await;
+
+        // Mirror `on_execute_command`: a plugin error becomes an explicit failure response rather
+        // than a fabricated success, so the core can report the delivery as failed.
+        match plugin.on_deliver_message(req).await {
+            Ok(resp) => Ok(Response::new(resp)),
+            Err(e) => Ok(Response::new(DeliverMessageResponse {
+                success: false,
+                message_id: String::new(),
+                error_message: e.to_string(),
+            })),
+        }
     }
 }

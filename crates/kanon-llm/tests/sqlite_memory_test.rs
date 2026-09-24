@@ -1,5 +1,6 @@
 //! Integration tests for embedded SQLite-backed conversation memory (`SqliteMemory`).
 
+use std::sync::Arc;
 use kanon_llm::gateway::types::{ChatMessage, Role, ToolCall};
 use kanon_llm::memory::Memory;
 use kanon_llm::sqlite_memory::SqliteMemory;
@@ -345,5 +346,49 @@ async fn test_sqlite_memory_atomic_replace_history() {
     assert_eq!(disk_msgs[0].content.as_deref(), Some("Updated System with context"));
     assert_eq!(disk_msgs[1].content.as_deref(), Some("Summary of previous conversation: discussed items 1 to 5."));
     assert_eq!(disk_msgs[2].content.as_deref(), Some("New question based on summary"));
+}
+
+#[tokio::test]
+async fn test_sqlite_memory_concurrent_same_session_ordering() {
+    let dir = tempdir().expect("Failed to create temporary directory");
+    let db_path = dir.path().join("concurrent_order.db");
+
+    let memory = Arc::new(SqliteMemory::open(&db_path, 100).expect("Failed to open SQLite database"));
+    let session_key = "concurrent_sess";
+
+    let mut handles = Vec::new();
+    for i in 0..25 {
+        let mem = Arc::clone(&memory);
+        handles.push(tokio::spawn(async move {
+            mem.push_message(
+                session_key,
+                ChatMessage::user(format!("msg_{i:02}")),
+            )
+            .await
+            .unwrap();
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+
+    // 1. Fetch from active memory cache
+    let cache_msgs = memory.get_messages(session_key).await.unwrap();
+    assert_eq!(cache_msgs.len(), 25);
+
+    // 2. Fetch directly from a cold SQLite connection (bypassing the original in-memory cache)
+    let cold_memory = SqliteMemory::open(&db_path, 100).expect("Failed to reload SQLite database");
+    let disk_msgs = cold_memory.get_messages(session_key).await.unwrap();
+    assert_eq!(disk_msgs.len(), 25);
+
+    // 3. Verify absolute 1:1 order consistency between memory cache and SQLite disk persistence
+    for (idx, (c, d)) in cache_msgs.iter().zip(disk_msgs.iter()).enumerate() {
+        assert_eq!(
+            c.content, d.content,
+            "Message mismatch at index {idx}: cache had {:?} but disk had {:?}",
+            c.content, d.content
+        );
+    }
 }
 

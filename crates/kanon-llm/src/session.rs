@@ -150,7 +150,14 @@ pub enum SessionStatus {
     Archived,
 }
 
-/// Runtime metadata and state attributes associated with an active conversation session.
+/// Ephemeral runtime metadata and state attributes associated with an active conversation session.
+///
+/// **Boundary & Persistence Semantics**:
+/// While conversational messages and chat history are durably persisted to disk via
+/// [`SqliteMemory`](crate::SqliteMemory), session turn tallies, dynamic variables, and idle status
+/// are managed in memory during process execution by [`SessionManager`].
+///
+/// To make this lifecycle explicit in call sites, the [`RuntimeSessionMetadata`] type alias is provided.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMetadata {
     /// Unique session identifier key.
@@ -196,6 +203,10 @@ impl SessionMetadata {
         current_unix_timestamp().saturating_sub(self.last_active_at) >= idle_threshold
     }
 }
+
+/// Explicit type alias for in-memory session metadata, clarifying that it is transient runtime
+/// state rather than durably serialized database records.
+pub type RuntimeSessionMetadata = SessionMetadata;
 
 /// Comprehensive session lifecycle and state manager.
 ///

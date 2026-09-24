@@ -458,8 +458,8 @@ impl Agent {
                 // Branch B: Resolve tool on external gRPC plugin hosts
                 let target = find_tool_target(&call.name, hosts);
 
-                let (target_host, plugin_id) = match target {
-                    Some((h, pid)) => (h, pid),
+                let (target_host, plugin_id, actual_tool_name) = match target {
+                    Some((h, pid, tname)) => (h, pid, tname),
                     None => {
                         tracing::warn!(tool = %call.name, "Requested tool not declared by any native tool or active host");
                         let err_msg = format!("Tool '{}' not registered", call.name);
@@ -491,7 +491,7 @@ impl Agent {
 
                 let tool_req = ToolCallRequest {
                     call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
+                    tool_name: actual_tool_name,
                     session_id: session_id.to_string(),
                     payload: structured_args.map(tool_call_request::Payload::StructuredArgs),
                 };
@@ -698,8 +698,8 @@ impl Agent {
                 }
 
                 let target = find_tool_target(&call.name, hosts);
-                let (target_host, plugin_id) = match target {
-                    Some((h, pid)) => (h, pid),
+                let (target_host, plugin_id, actual_tool_name) = match target {
+                    Some((h, pid, tname)) => (h, pid, tname),
                     None => {
                         let err_msg = format!("Tool '{}' not registered", call.name);
                         self.memory
@@ -715,7 +715,7 @@ impl Agent {
                 };
                 let tool_req = ToolCallRequest {
                     call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
+                    tool_name: actual_tool_name,
                     session_id: session_id.to_string(),
                     payload: structured_args.map(tool_call_request::Payload::StructuredArgs),
                 };
@@ -827,18 +827,58 @@ impl Agent {
     }
 }
 
-/// Helper locating the owning host and plugin ID for a tool name.
-fn find_tool_target<H: ToolHost>(tool_name: &str, hosts: &[Arc<H>]) -> Option<(Arc<H>, String)> {
+/// Helper locating the owning host, plugin ID, and canonical tool name for an invoked tool name.
+///
+/// Resolves both:
+/// 1. Canonical namespaced names (`<sanitized_plugin_id>__<tool_name>`).
+/// 2. Bare tool names (`<tool_name>`), provided there is exactly one matching plugin.
+///
+/// If multiple plugins offer the same bare name and an ambiguous invocation is received,
+/// returns `None` and logs an error to prevent silent, non-deterministic routing.
+fn find_tool_target<H: ToolHost>(
+    tool_name: &str,
+    hosts: &[Arc<H>],
+) -> Option<(Arc<H>, String, String)> {
+    // 1. Check for exact namespaced match first: <plugin_id>__<tool_name>
     for host in hosts {
         for plugin in host.plugin_metas() {
-            for tool in &plugin.tools {
-                if tool.name == tool_name {
-                    return Some((host.clone(), plugin.id.clone()));
+            let prefix = format!("{}__{}", crate::tool_router::sanitize_tool_identifier(&plugin.id), "");
+            if tool_name.starts_with(&prefix) {
+                let base_name = &tool_name[prefix.len()..];
+                for tool in &plugin.tools {
+                    if tool.name == base_name {
+                        return Some((host.clone(), plugin.id.clone(), tool.name.clone()));
+                    }
                 }
             }
         }
     }
-    None
+
+    // 2. Search for bare tool name across all plugins
+    let mut matches = Vec::new();
+    for host in hosts {
+        for plugin in host.plugin_metas() {
+            for tool in &plugin.tools {
+                if tool.name == tool_name {
+                    matches.push((host.clone(), plugin.id.clone(), tool.name.clone()));
+                }
+            }
+        }
+    }
+
+    if matches.len() == 1 {
+        Some(matches.remove(0))
+    } else if matches.len() > 1 {
+        tracing::error!(
+            tool_name = %tool_name,
+            match_count = matches.len(),
+            "Ambiguous tool invocation: multiple plugins declare '{}'; invoke via namespaced name",
+            tool_name
+        );
+        None
+    } else {
+        None
+    }
 }
 
 /// Fluent builder for constructing customizable [`Agent`] instances.

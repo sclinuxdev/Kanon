@@ -245,9 +245,15 @@ message SendMessageRequest {
 }
 
 message SendMessageResponse {
+  // Whether the outbound message was accepted into the outbound dispatch queue.
+  // Delivery to the external platform is asynchronous and subject to platform breakers and DLQ.
   bool success = 1;
+  // Internal tracking ID assigned to this queued outbound message.
   string message_id = 2;
+  // Rejection explanation if queue admission failed.
   string error_message = 3;
+  // Explicit admission flag confirming the message is queued for outbound dispatch.
+  bool accepted = 4;
 }
 
 message LLMRequest {

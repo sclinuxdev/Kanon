@@ -41,8 +41,12 @@ impl PluginDataDir {
 
     /// Resolves and ensures the isolated directory for a specific plugin identifier.
     ///
-    /// Creates the directory recursively if it does not yet exist.
+    /// Validates `plugin_id` against directory traversal attacks (`..`, `/`, `\`, NUL)
+    /// before creating the directory recursively if it does not yet exist.
     pub fn resolve_plugin_dir(&self, plugin_id: &str) -> std::io::Result<PathBuf> {
+        crate::id::PluginId::validate(plugin_id).map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?;
         let dir = self.base_dir.join(plugin_id);
         std::fs::create_dir_all(&dir)?;
         Ok(dir)

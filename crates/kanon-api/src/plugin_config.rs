@@ -254,20 +254,9 @@ fn declared_defaults(schema: Option<&Value>) -> Value {
     Value::Object(defaults)
 }
 
-/// Ensures a plugin identifier is a safe single path segment.
+/// Ensures a plugin identifier conforms to canonical security constraints.
 fn validate_plugin_id(plugin_id: &str) -> Result<(), ApiError> {
-    let invalid = plugin_id.is_empty()
-        || plugin_id == "."
-        || plugin_id == ".."
-        || plugin_id.contains('/')
-        || plugin_id.contains('\\')
-        || plugin_id.contains('\0');
-
-    if invalid {
-        return Err(ApiError::BadRequest(format!(
-            "Invalid plugin identifier '{plugin_id}'"
-        )));
-    }
-
-    Ok(())
+    kanon_storage::PluginId::validate(plugin_id).map_err(|err| {
+        ApiError::BadRequest(format!("Invalid plugin identifier '{plugin_id}': {err}"))
+    })
 }

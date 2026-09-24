@@ -58,7 +58,8 @@ pub struct CircuitBreakerConfig {
     /// Number of consecutive errors or timeouts required to trip the breaker.
     pub failure_threshold: usize,
     /// Maximum allowable sliding window average RTT before tripping the breaker.
-    pub latency_threshold: Duration,
+    /// If `None`, RTT-based latency tripping is disabled (e.g. for external chat platforms).
+    pub latency_threshold: Option<Duration>,
     /// Capacity of the sliding sample window for RTT calculations.
     pub window_size: usize,
     /// Minimum samples required in the sliding window before RTT can trip the circuit.
@@ -69,18 +70,45 @@ pub struct CircuitBreakerConfig {
     pub cooldown_period: Duration,
     /// Number of consecutive successful probes in `HalfOpen` required to recover to `Closed`.
     pub half_open_success_threshold: usize,
+    /// Maximum number of concurrent in-flight trial probes permitted in `HalfOpen` state.
+    /// Defaults to 1 to prevent storming a recovering endpoint.
+    pub max_half_open_probes: usize,
 }
 
-impl Default for CircuitBreakerConfig {
-    fn default() -> Self {
+impl CircuitBreakerConfig {
+    /// Configuration baseline tailored for local inter-process communication (IPC) with plugin hosts.
+    /// Uses 50ms latency threshold for local sub-process execution.
+    pub fn for_host() -> Self {
         Self {
             failure_threshold: 5,
-            latency_threshold: Duration::from_millis(50),
+            latency_threshold: Some(Duration::from_millis(50)),
             window_size: 20,
             min_samples_for_latency: 5,
             cooldown_period: Duration::from_secs(5),
             half_open_success_threshold: 2,
+            max_half_open_probes: 1,
         }
+    }
+
+    /// Configuration baseline tailored for external chat platform delivery (Webhooks, HTTP REST).
+    /// Latency-based tripping is disabled because WAN/HTTP RTT naturally exceeds IPC thresholds.
+    /// Trips exclusively on delivery failures and timeouts, with single-probe recovery.
+    pub fn for_platform() -> Self {
+        Self {
+            failure_threshold: 5,
+            latency_threshold: None,
+            window_size: 20,
+            min_samples_for_latency: 5,
+            cooldown_period: Duration::from_secs(30),
+            half_open_success_threshold: 1,
+            max_half_open_probes: 1,
+        }
+    }
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self::for_host()
     }
 }
 
@@ -89,13 +117,14 @@ struct CircuitBreakerInner {
     state: CircuitState,
     consecutive_failures: usize,
     consecutive_successes: usize,
+    half_open_in_flight: usize,
     rtt_window: VecDeque<Duration>,
     last_state_change: Instant,
     tripped_at: Option<Instant>,
     last_failure_reason: Option<String>,
 }
 
-/// Thread-safe adaptive circuit breaker for a managed plugin host.
+/// Thread-safe adaptive circuit breaker for a managed plugin host or outbound delivery platform.
 pub struct CircuitBreaker {
     config: CircuitBreakerConfig,
     inner: Mutex<CircuitBreakerInner>,
@@ -108,6 +137,7 @@ impl CircuitBreaker {
             state: CircuitState::Closed,
             consecutive_failures: 0,
             consecutive_successes: 0,
+            half_open_in_flight: 0,
             rtt_window: VecDeque::with_capacity(config.window_size),
             last_state_change: Instant::now(),
             tripped_at: None,
@@ -119,18 +149,30 @@ impl CircuitBreaker {
         }
     }
 
-    /// Creates a new circuit breaker with standard production defaults.
+    /// Creates a new circuit breaker with standard host IPC defaults.
     pub fn with_defaults() -> Self {
         Self::new(CircuitBreakerConfig::default())
     }
 
-    /// Evaluates whether an outbound request to this host should be permitted.
+    /// Creates a new circuit breaker configured specifically for plugin host IPC.
+    pub fn for_host() -> Self {
+        Self::new(CircuitBreakerConfig::for_host())
+    }
+
+    /// Creates a new circuit breaker configured specifically for platform outbound delivery.
+    pub fn for_platform() -> Self {
+        Self::new(CircuitBreakerConfig::for_platform())
+    }
+
+    /// Evaluates whether an outbound request to this target should be permitted.
     ///
     /// - If `Closed`: returns `true`.
     /// - If `Open`: evaluates whether the cooldown window has elapsed. If so, transitions
-    ///   the state to `HalfOpen` and returns `true` for a trial probe. Otherwise returns `false`
+    ///   the state to `HalfOpen`, grants a single probe permit, and returns `true`. Otherwise returns `false`
     ///   to immediately trigger fast-skip.
-    /// - If `HalfOpen`: returns `true` to allow probing.
+    /// - If `HalfOpen`: checks whether current in-flight probes are within `max_half_open_probes`.
+    ///   If permitted, increments in-flight count and returns `true`; otherwise returns `false`
+    ///   to prevent concurrent probe storms.
     pub fn allow_request(&self) -> bool {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match guard.state {
@@ -145,12 +187,21 @@ impl CircuitBreaker {
                     guard.state = CircuitState::HalfOpen;
                     guard.last_state_change = now;
                     guard.consecutive_successes = 0;
+                    guard.half_open_in_flight = 1;
                     true
                 } else {
                     false
                 }
             }
-            CircuitState::HalfOpen => true,
+            CircuitState::HalfOpen => {
+                if guard.half_open_in_flight < self.config.max_half_open_probes {
+                    guard.half_open_in_flight += 1;
+                    true
+                } else {
+                    // Maximum in-flight probes already active; reject concurrent requests
+                    false
+                }
+            }
         }
     }
 
@@ -158,11 +209,11 @@ impl CircuitBreaker {
     ///
     /// # Behavior by State
     /// - **Closed**: Resets `consecutive_failures` to 0 and appends `rtt` to the sliding window.
-    ///   If the window has at least `min_samples_for_latency` and the average RTT exceeds
-    ///   `latency_threshold`, trips the circuit to `Open`.
-    /// - **HalfOpen**: Increments `consecutive_successes`. When `half_open_success_threshold`
-    ///   is reached, recovers the circuit back to `Closed`.
-    /// - **Open**: If an in-flight request somehow completes while Open, transitions to HalfOpen.
+    ///   If `latency_threshold` is configured, checks whether window average RTT exceeds
+    ///   the threshold, and if so, trips the circuit to `Open`.
+    /// - **HalfOpen**: Decrements `half_open_in_flight` and increments `consecutive_successes`.
+    ///   When `half_open_success_threshold` is reached, recovers the circuit back to `Closed`.
+    /// - **Open**: Leaves state as Open, clearing in-flight counter.
     pub fn record_success(&self, rtt: Duration) {
         let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
@@ -177,31 +228,35 @@ impl CircuitBreaker {
             CircuitState::Closed => {
                 guard.consecutive_failures = 0;
 
-                // Inspect sliding window average RTT once sufficient samples have accumulated
-                if guard.rtt_window.len() >= self.config.min_samples_for_latency {
+                // Inspect sliding window average RTT if configured
+                if let Some(threshold) = self.config.latency_threshold
+                    && guard.rtt_window.len() >= self.config.min_samples_for_latency
+                {
                     let total_micros: u128 = guard.rtt_window.iter().map(|d| d.as_micros()).sum();
                     let avg_micros = total_micros / (guard.rtt_window.len() as u128);
                     let avg_rtt = Duration::from_micros(avg_micros as u64);
 
-                    if avg_rtt >= self.config.latency_threshold {
+                    if avg_rtt >= threshold {
                         tracing::warn!(
                             avg_rtt_ms = avg_rtt.as_millis(),
-                            threshold_ms = self.config.latency_threshold.as_millis(),
+                            threshold_ms = threshold.as_millis(),
                             window_samples = guard.rtt_window.len(),
                             "Sliding window average RTT exceeded threshold; tripping circuit to Open"
                         );
                         guard.state = CircuitState::Open;
                         guard.last_state_change = now;
                         guard.tripped_at = Some(now);
+                        guard.half_open_in_flight = 0;
                         guard.last_failure_reason = Some(format!(
                             "Average RTT ({:.2}ms) exceeded threshold ({:.2}ms)",
                             avg_rtt.as_secs_f64() * 1000.0,
-                            self.config.latency_threshold.as_secs_f64() * 1000.0
+                            threshold.as_secs_f64() * 1000.0
                         ));
                     }
                 }
             }
             CircuitState::HalfOpen => {
+                guard.half_open_in_flight = guard.half_open_in_flight.saturating_sub(1);
                 guard.consecutive_successes += 1;
                 tracing::debug!(
                     success_count = guard.consecutive_successes,
@@ -218,12 +273,12 @@ impl CircuitBreaker {
                     guard.last_state_change = now;
                     guard.consecutive_failures = 0;
                     guard.consecutive_successes = 0;
+                    guard.half_open_in_flight = 0;
                     guard.last_failure_reason = None;
                 }
             }
             CircuitState::Open => {
-                // If a slow request completed after breaker tripped, leave state as Open
-                // but retain the sample for statistics.
+                guard.half_open_in_flight = 0;
             }
         }
     }
@@ -254,6 +309,7 @@ impl CircuitBreaker {
                     guard.state = CircuitState::Open;
                     guard.last_state_change = now;
                     guard.tripped_at = Some(now);
+                    guard.half_open_in_flight = 0;
                 }
             }
             CircuitState::HalfOpen => {
@@ -265,9 +321,11 @@ impl CircuitBreaker {
                 guard.last_state_change = now;
                 guard.tripped_at = Some(now);
                 guard.consecutive_successes = 0;
+                guard.half_open_in_flight = 0;
             }
             CircuitState::Open => {
-                // Already open; update failure context
+                guard.last_state_change = now;
+                guard.half_open_in_flight = 0;
             }
         }
     }
@@ -338,6 +396,7 @@ impl CircuitBreaker {
         guard.state = CircuitState::Closed;
         guard.consecutive_failures = 0;
         guard.consecutive_successes = 0;
+        guard.half_open_in_flight = 0;
         guard.rtt_window.clear();
         guard.last_state_change = Instant::now();
         guard.tripped_at = None;

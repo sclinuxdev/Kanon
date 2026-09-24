@@ -161,7 +161,7 @@ impl PipelineEngine {
         let mut breakers = self.platform_circuit_breakers.write().await;
         breakers
             .entry(platform.to_string())
-            .or_insert_with(|| Arc::new(CircuitBreaker::with_defaults()))
+            .or_insert_with(|| Arc::new(CircuitBreaker::for_platform()))
             .clone()
     }
 
@@ -404,21 +404,27 @@ impl PipelineEngine {
     }
 
     /// Reports an outbound drop when a specific platform's worker queue is saturated,
-    /// and asynchronously flushes the dropped message to the dead-letter queue log.
-    fn report_outbound_queue_full(&self, dropped: DeliverMessageRequest) {
+    /// and durably flushes the dropped message to the dead-letter queue log before returning.
+    async fn report_outbound_queue_full(&self, dropped: DeliverMessageRequest) {
         let platform = dropped.platform.clone();
         let channel_id = dropped.channel_id.clone();
         tracing::warn!(
             platform = %platform,
             channel_id = %channel_id,
-            "Platform outbound queue saturated; dropping message to dead letter to prevent cross-platform backpressure"
+            "Platform outbound queue saturated; persisting message to dead letter to prevent cross-platform backpressure"
         );
-        let dead_letter = Arc::clone(&self.dead_letter);
-        tokio::spawn(async move {
-            let _ = dead_letter
-                .write_record(&dropped, "platform outbound queue saturated")
-                .await;
-        });
+        if let Err(err) = self
+            .dead_letter
+            .write_record(&dropped, "platform outbound queue saturated")
+            .await
+        {
+            tracing::error!(
+                platform = %platform,
+                channel_id = %channel_id,
+                error = %err,
+                "Failed to persist dead letter record for saturated outbound queue"
+            );
+        }
         self.observe(PipelineStage::OutboundFailed {
             platform,
             channel_id,
@@ -469,11 +475,11 @@ impl PipelineEngine {
                     self.spawn_platform_worker(platform.clone(), rx);
                     workers.insert(platform, new_tx.clone());
                     if let Err(mpsc::error::TrySendError::Full(dropped)) = new_tx.try_send(req) {
-                        self.report_outbound_queue_full(dropped);
+                        self.report_outbound_queue_full(dropped).await;
                     }
                 }
                 Err(mpsc::error::TrySendError::Full(dropped)) => {
-                    self.report_outbound_queue_full(dropped);
+                    self.report_outbound_queue_full(dropped).await;
                 }
             }
         }

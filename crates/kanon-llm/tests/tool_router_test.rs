@@ -56,11 +56,15 @@ struct MockToolHost {
 
 impl MockToolHost {
     fn new(host_id: &str, tools: Vec<ToolMeta>) -> Self {
+        Self::with_plugin(host_id, "mock.plugin.test", tools)
+    }
+
+    fn with_plugin(host_id: &str, plugin_id: &str, tools: Vec<ToolMeta>) -> Self {
         Self {
             host_id: host_id.to_string(),
             plugins: vec![PluginMeta {
-                id: "mock.plugin.test".to_string(),
-                name: "Mock Test Plugin".to_string(),
+                id: plugin_id.to_string(),
+                name: plugin_id.to_string(),
                 version: "1.0.0".to_string(),
                 author: "Test".to_string(),
                 description: "Test".to_string(),
@@ -85,7 +89,15 @@ impl ToolHost for MockToolHost {
     async fn call_tool(&self, req: ToolCallRequest) -> Result<ToolCallResponse, tonic::Status> {
         self.tool_calls_received.fetch_add(1, Ordering::SeqCst);
 
-        if req.tool_name == "add_numbers" {
+        if req.tool_name == "search" {
+            let result_struct = json_to_prost_struct(&serde_json::json!({ "found": true, "host": self.host_id })).unwrap();
+            Ok(ToolCallResponse {
+                call_id: req.call_id,
+                success: true,
+                error_message: String::new(),
+                payload: Some(tool_call_response::Payload::StructuredResult(result_struct)),
+            })
+        } else if req.tool_name == "add_numbers" {
             let structured_args = match req.payload {
                 Some(tool_call_request::Payload::StructuredArgs(s)) => prost_struct_to_json(s),
                 _ => serde_json::Value::Null,
@@ -259,4 +271,96 @@ fn test_prost_json_roundtrip() {
 
     assert_eq!(json_input, json_output);
 }
+
+#[tokio::test]
+async fn test_aggregate_tools_disambiguates_duplicate_names() {
+    use kanon_llm::tool_router::aggregate_tools;
+
+    let tool_a = ToolMeta {
+        name: "search".to_string(),
+        description: "Search weather reports".to_string(),
+        parameters: None,
+    };
+    let tool_b = ToolMeta {
+        name: "search".to_string(),
+        description: "Search github repositories".to_string(),
+        parameters: None,
+    };
+    let unique_tool = ToolMeta {
+        name: "calc".to_string(),
+        description: "Unique calculator tool".to_string(),
+        parameters: None,
+    };
+
+    let host_a = Arc::new(MockToolHost::with_plugin("host_weather", "org.weather", vec![tool_a]));
+    let host_b = Arc::new(MockToolHost::with_plugin("host_github", "org.github", vec![tool_b, unique_tool]));
+
+    let defs = aggregate_tools(&[host_a, host_b]);
+    assert_eq!(defs.len(), 3);
+
+    let names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
+    // Unique tool remains bare
+    assert!(names.contains(&"calc".to_string()), "Unique tool must retain bare name");
+    // Colliding tool names must be namespaced using model-safe identifiers
+    assert!(names.contains(&"org_weather__search".to_string()), "Colliding tool must be namespaced");
+    assert!(names.contains(&"org_github__search".to_string()), "Colliding tool must be namespaced");
+}
+
+#[tokio::test]
+async fn test_tool_router_namespaced_duplicate_dispatch() {
+    let tool_call = ToolCall {
+        id: "call_github_1".to_string(),
+        name: "org_github__search".to_string(),
+        arguments: serde_json::json!({ "query": "kanon" }),
+    };
+
+    let mock_provider = Arc::new(MockLlmProvider::new(vec![
+        ChatResponse {
+            content: None,
+            tool_calls: vec![tool_call],
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+        },
+        ChatResponse {
+            content: Some("Search completed via github plugin".to_string()),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+        },
+    ]));
+
+    let memory = Arc::new(ConversationManager::new(10));
+    let router = ToolRouter::new(mock_provider, memory, "test-model");
+
+    let tool_a = ToolMeta {
+        name: "search".to_string(),
+        description: "Search weather reports".to_string(),
+        parameters: None,
+    };
+    let tool_b = ToolMeta {
+        name: "search".to_string(),
+        description: "Search github repositories".to_string(),
+        parameters: None,
+    };
+
+    let host_a = Arc::new(MockToolHost::with_plugin("host_weather", "org.weather", vec![tool_a]));
+    let host_b = Arc::new(MockToolHost::with_plugin("host_github", "org.github", vec![tool_b]));
+    let hosts = vec![host_a.clone(), host_b.clone()];
+
+    let output = router
+        .execute("session_ns", "Search kanon on github", &hosts)
+        .await
+        .expect("Execution should succeed");
+
+    assert_eq!(output.content, "Search completed via github plugin");
+    // Host B should have received the invocation with unnamespaced "search"
+    assert_eq!(host_b.tool_calls_received.load(Ordering::SeqCst), 1);
+    // Host A should NOT have been invoked
+    assert_eq!(host_a.tool_calls_received.load(Ordering::SeqCst), 0);
+    assert_eq!(output.executed_tools.len(), 1);
+    assert_eq!(output.executed_tools[0].plugin_id, "org.github");
+    assert_eq!(output.executed_tools[0].host_id, "host_github");
+}
+
+
 

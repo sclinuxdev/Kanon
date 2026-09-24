@@ -293,6 +293,7 @@ async fn test_send_message_dispatches_to_platform_adapter() {
         .into_inner();
 
     assert!(send_resp.success, "SendMessage must report success");
+    assert!(send_resp.accepted, "SendMessage must explicitly report accepted=true for outbound queue admission");
     assert!(!send_resp.message_id.is_empty());
 
     // Wait for the outbound dispatcher and platform worker to process the delivery

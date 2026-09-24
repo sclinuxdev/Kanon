@@ -61,11 +61,12 @@ fn create_test_host(host_id: &str, priority: i32, config: CircuitBreakerConfig) 
 async fn test_circuit_breaker_consecutive_failures_and_cooldown_recovery() {
     let config = CircuitBreakerConfig {
         failure_threshold: 3,
-        latency_threshold: Duration::from_millis(50),
+        latency_threshold: Some(Duration::from_millis(50)),
         window_size: 10,
         min_samples_for_latency: 5,
         cooldown_period: Duration::from_millis(50), // fast cooldown for test
         half_open_success_threshold: 2,
+        max_half_open_probes: 1,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -109,11 +110,12 @@ async fn test_circuit_breaker_consecutive_failures_and_cooldown_recovery() {
 async fn test_circuit_breaker_half_open_probe_failure_trips_back_to_open() {
     let config = CircuitBreakerConfig {
         failure_threshold: 1,
-        latency_threshold: Duration::from_millis(50),
+        latency_threshold: Some(Duration::from_millis(50)),
         window_size: 10,
         min_samples_for_latency: 5,
         cooldown_period: Duration::from_millis(30),
         half_open_success_threshold: 2,
+        max_half_open_probes: 1,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -139,11 +141,12 @@ async fn test_circuit_breaker_half_open_probe_failure_trips_back_to_open() {
 async fn test_circuit_breaker_sliding_window_latency_tripping() {
     let config = CircuitBreakerConfig {
         failure_threshold: 10,
-        latency_threshold: Duration::from_millis(20), // 20ms threshold
+        latency_threshold: Some(Duration::from_millis(20)), // 20ms threshold
         window_size: 5,
         min_samples_for_latency: 3,
         cooldown_period: Duration::from_secs(1),
         half_open_success_threshold: 2,
+        max_half_open_probes: 1,
     };
     let cb = CircuitBreaker::new(config);
 
@@ -327,4 +330,60 @@ async fn test_pipeline_engine_tool_router_fast_skips_open_host() {
         "Expected CircuitBreakerTripped stage during tool_router phase"
     );
 }
+
+#[tokio::test]
+async fn test_platform_circuit_breaker_ignores_high_latency() {
+    let cb = CircuitBreaker::for_platform();
+
+    // Record 10 successful deliveries with 120ms WAN RTT each (> 50ms IPC threshold)
+    for _ in 0..10 {
+        cb.record_success(Duration::from_millis(120));
+    }
+
+    // Platform circuit breaker must NOT trip on latency; remains Closed and accepts requests
+    assert_eq!(cb.state(), CircuitState::Closed);
+    assert!(cb.allow_request());
+
+    // Only trips if failure threshold is reached
+    for i in 1..=4 {
+        cb.record_failure(&format!("delivery timeout {i}"));
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+    cb.record_failure("delivery timeout 5");
+    assert_eq!(cb.state(), CircuitState::Open);
+    assert!(!cb.allow_request());
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_half_open_limits_concurrent_probes() {
+    let mut config = CircuitBreakerConfig::for_platform();
+    config.cooldown_period = Duration::from_millis(30);
+    config.max_half_open_probes = 1;
+
+    let cb = CircuitBreaker::new(config);
+
+    // Trip to Open
+    for _ in 0..5 {
+        cb.record_failure("error");
+    }
+    assert_eq!(cb.state(), CircuitState::Open);
+    assert!(!cb.allow_request());
+
+    // Wait for cooldown
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    // First caller transitions breaker to HalfOpen and claims the single probe permit
+    assert!(cb.allow_request(), "First probe should be granted");
+    assert_eq!(cb.state(), CircuitState::HalfOpen);
+
+    // Concurrent callers while probe is in flight must be rejected!
+    assert!(!cb.allow_request(), "Second concurrent probe must be rejected");
+    assert!(!cb.allow_request(), "Third concurrent probe must be rejected");
+
+    // Once in-flight probe finishes successfully, breaker recovers to Closed
+    cb.record_success(Duration::from_millis(10));
+    assert_eq!(cb.state(), CircuitState::Closed);
+    assert!(cb.allow_request(), "Normal traffic admitted after recovery");
+}
+
 

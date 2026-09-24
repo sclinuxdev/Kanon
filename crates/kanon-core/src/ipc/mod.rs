@@ -218,6 +218,7 @@ impl BotApiService for CoreApiService {
 
         match sender.try_send(deliver_req) {
             Ok(()) => Ok(Response::new(SendMessageResponse {
+                accepted: true,
                 success: true,
                 message_id: event_id,
                 error_message: String::new(),
@@ -229,6 +230,7 @@ impl BotApiService for CoreApiService {
                     "Outbound queue is full; SendMessage request rejected"
                 );
                 Ok(Response::new(SendMessageResponse {
+                    accepted: false,
                     success: false,
                     message_id: String::new(),
                     error_message: "Outbound queue full; delivery dropped".to_string(),

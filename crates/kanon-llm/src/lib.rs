@@ -39,7 +39,8 @@ pub use prompt::{
     DynamicPromptHook, Persona, PersonaRegistry, PromptComposer, PromptTemplate,
 };
 pub use session::{
-    SessionKey, SessionManager, SessionMetadata, SessionScope, SessionStatus,
+    RuntimeSessionMetadata, SessionKey, SessionManager, SessionMetadata, SessionScope,
+    SessionStatus,
 };
 pub use sqlite_memory::{PersistentMemory, SqliteMemory};
 pub use summary::{ContextSummarizer, SummaryConfig, SummaryHook};

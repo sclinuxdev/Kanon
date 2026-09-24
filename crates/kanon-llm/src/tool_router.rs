@@ -56,10 +56,36 @@ pub struct ToolRouterOutput {
     pub executed_tools: Vec<ExecutedToolCall>,
 }
 
+/// Sanitizes a plugin identifier so it is compliant with model tool naming constraints.
+/// Both OpenAI and Anthropic require tool names to adhere to `^[a-zA-Z0-9_-]{1,64}$`.
+pub fn sanitize_tool_identifier(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect()
+}
+
+/// Constructs the canonical namespaced tool name for a plugin tool:
+/// `<sanitized_plugin_id>__<tool_name>`
+pub fn namespaced_tool_name(plugin_id: &str, tool_name: &str) -> String {
+    format!("{}__{}", sanitize_tool_identifier(plugin_id), tool_name)
+}
+
 /// Dynamically aggregates tool definitions declared across all active plugin hosts.
 ///
-/// Directly translates Protobuf Struct schemas into `serde_json::Value` in memory.
+/// Prevents name collision: if multiple plugins declare tools with identical names,
+/// they are automatically disambiguated with namespacing (`<plugin_id>__<tool_name>`).
 pub fn aggregate_tools<H: ToolHost>(hosts: &[Arc<H>]) -> Vec<ToolDefinition> {
+    // 1. First pass: count tool name occurrences across all plugins
+    let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for host in hosts {
+        for plugin in host.plugin_metas() {
+            for tool in &plugin.tools {
+                *name_counts.entry(tool.name.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // 2. Second pass: build definitions, namespacing any collided names
     let mut definitions = Vec::new();
     for host in hosts {
         for plugin in host.plugin_metas() {
@@ -72,9 +98,26 @@ pub fn aggregate_tools<H: ToolHost>(hosts: &[Arc<H>]) -> Vec<ToolDefinition> {
                     }),
                 };
 
+                let is_duplicate = name_counts.get(&tool.name).copied().unwrap_or(0) > 1;
+                let (resolved_name, description) = if is_duplicate {
+                    let ns_name = namespaced_tool_name(&plugin.id, &tool.name);
+                    tracing::warn!(
+                        tool_name = %tool.name,
+                        plugin_id = %plugin.id,
+                        namespaced = %ns_name,
+                        "Duplicate tool name across plugins; disambiguated via namespacing"
+                    );
+                    (
+                        ns_name,
+                        format!("{} (plugin: {})", tool.description, plugin.id),
+                    )
+                } else {
+                    (tool.name.clone(), tool.description.clone())
+                };
+
                 definitions.push(ToolDefinition {
-                    name: tool.name.clone(),
-                    description: tool.description.clone(),
+                    name: resolved_name,
+                    description,
                     parameters,
                 });
             }

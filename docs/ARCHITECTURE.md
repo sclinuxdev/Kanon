@@ -750,6 +750,9 @@ sequenceDiagram
 ### 12.1 存储模型边界 (Storage Model Boundaries)
 - **无内置全局集中式 KV 存储**：微内核已彻底移除原存根性质的内存 KV 模块（`crates/kanon-storage/src/kv.rs` 已删除）。`BotApiService.SetStorage` 与 `GetStorage` 端点当前显式返回 `Status::unimplemented`。
 - **本地专属存储第一原则**：所有业务持久化（用户状态、业务缓存等）必须在插件所属的 `./data/plugins/<plugin_id>/` 独立目录中本地持久化（推荐 SQLite、DuckDB 或文件系统）。核心不代理业务读写，亦不提供跨插件共享的分布式数据库抽象。
+- **会话元数据运行时与持久化边界 (Session Metadata vs History Boundary)**：
+  - **对话历史消息与窗口持久化**：用户与模型的多轮对话历史、系统提示词及滑动窗口截断状态均通过 `SqliteMemory`（`crates/kanon-llm/src/sqlite_memory.rs`）以 SQLite WAL 模式强持久化，在单会话内具备串行写入一致性与跨进程重启持久性。
+  - **会话运行时状态瞬态性 (`RuntimeSessionMetadata`)**：`SessionMetadata`（即 `RuntimeSessionMetadata`，包含动态局部变量 `variables`、活跃轮次计数 `turn_count`、空闲超时探测状态）由 `SessionManager` 在内存（DashMap）中维护，为运行期瞬态数据。微内核重启时运行时活跃会话计数与内存变量将平滑重置，而底层对话消息历史完整保留。
 
 ### 12.2 宿主环境与语言运行时依赖 (Language Host Runtime Dependencies)
 - **Rust 核心自包含**：`kanon-core` 与 `kanon-api` 编译产物为零动态外部依赖的单一原生二进制。

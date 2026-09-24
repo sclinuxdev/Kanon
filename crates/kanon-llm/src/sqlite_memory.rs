@@ -38,6 +38,9 @@ pub struct SqliteMemory {
     cache: Arc<DashMap<String, SessionMemory>>,
     /// LRU session access queue tracking recency for cache eviction.
     lru_order: Arc<Mutex<VecDeque<String>>>,
+    /// Per-session serialization lock ensuring sequential consistency across concurrent operations
+    /// on the same session (preventing SQLite commit and memory cache update order divergence).
+    session_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
     /// Maximum count of active sessions kept in the in-memory cache.
     max_cached_sessions: usize,
     /// Default sliding window message limit per session.
@@ -96,6 +99,9 @@ impl SqliteMemory {
 
     /// Returns estimated token utilization for a session.
     pub async fn estimated_tokens(&self, session_key: &str) -> usize {
+        let lock = self.session_lock(session_key);
+        let _guard = lock.lock().await;
+
         if self.ensure_session_cached(session_key).await.is_err() {
             return 0;
         }
@@ -122,6 +128,9 @@ impl SqliteMemory {
 
     /// Commits and updates the timestamp for a specific session.
     pub async fn commit_session(&self, session_key: &str) -> Result<(), MemoryError> {
+        let lock = self.session_lock(session_key);
+        let _guard = lock.lock().await;
+
         let now = current_timestamp();
         let conn = self.conn.lock().await;
         conn.execute(
@@ -164,10 +173,19 @@ impl SqliteMemory {
             conn: Arc::new(Mutex::new(conn)),
             cache: Arc::new(DashMap::new()),
             lru_order: Arc::new(Mutex::new(VecDeque::new())),
+            session_locks: Arc::new(DashMap::new()),
             max_cached_sessions: Self::DEFAULT_CACHE_CAPACITY,
             default_max_messages,
             default_max_tokens: None,
         })
+    }
+
+    /// Retrieves or allocates the serialization lock for a session key.
+    fn session_lock(&self, session_key: &str) -> Arc<Mutex<()>> {
+        self.session_locks
+            .entry(session_key.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Updates LRU order and evicts least recently accessed sessions if cache capacity is exceeded.
@@ -183,6 +201,13 @@ impl SqliteMemory {
             if let Some(evicted_key) = lru.pop_front() {
                 if evicted_key != session_key {
                     self.cache.remove(&evicted_key);
+                    // Also evict the session lock if it is no longer actively held
+                    if let Some(entry) = self.session_locks.get(&evicted_key)
+                        && Arc::strong_count(&entry) <= 2
+                    {
+                        drop(entry);
+                        self.session_locks.remove(&evicted_key);
+                    }
                 } else {
                     // Put back if it's the current active key and break
                     lru.push_back(evicted_key);
@@ -289,6 +314,9 @@ fn current_timestamp() -> i64 {
 #[async_trait]
 impl Memory for SqliteMemory {
     async fn push_message(&self, session_key: &str, message: ChatMessage) -> Result<(), MemoryError> {
+        let lock = self.session_lock(session_key);
+        let _guard = lock.lock().await;
+
         self.ensure_session_cached(session_key).await?;
 
         let role_str = match message.role {
@@ -348,6 +376,9 @@ impl Memory for SqliteMemory {
     }
 
     async fn extend_messages(&self, session_key: &str, messages: Vec<ChatMessage>) -> Result<(), MemoryError> {
+        let lock = self.session_lock(session_key);
+        let _guard = lock.lock().await;
+
         self.ensure_session_cached(session_key).await?;
 
         let now = current_timestamp();
@@ -406,6 +437,9 @@ impl Memory for SqliteMemory {
     }
 
     async fn set_system_prompt(&self, session_key: &str, prompt: String) -> Result<(), MemoryError> {
+        let lock = self.session_lock(session_key);
+        let _guard = lock.lock().await;
+
         self.ensure_session_cached(session_key).await?;
 
         let now = current_timestamp();
@@ -434,6 +468,9 @@ impl Memory for SqliteMemory {
     }
 
     async fn get_system_prompt(&self, session_key: &str) -> Result<Option<String>, MemoryError> {
+        let lock = self.session_lock(session_key);
+        let _guard = lock.lock().await;
+
         self.ensure_session_cached(session_key).await?;
         Ok(self.cache
             .get(session_key)
@@ -441,6 +478,9 @@ impl Memory for SqliteMemory {
     }
 
     async fn get_messages(&self, session_key: &str) -> Result<Vec<ChatMessage>, MemoryError> {
+        let lock = self.session_lock(session_key);
+        let _guard = lock.lock().await;
+
         self.ensure_session_cached(session_key).await?;
         Ok(self.cache
             .get(session_key)
@@ -449,6 +489,9 @@ impl Memory for SqliteMemory {
     }
 
     async fn clear(&self, session_key: &str) -> Result<(), MemoryError> {
+        let lock = self.session_lock(session_key);
+        let _guard = lock.lock().await;
+
         {
             let mut conn = self.conn.lock().await;
             let tx = conn.transaction()?;
@@ -479,6 +522,9 @@ impl Memory for SqliteMemory {
         system_prompt: Option<String>,
         messages: Vec<ChatMessage>,
     ) -> Result<(), MemoryError> {
+        let lock = self.session_lock(session_key);
+        let _guard = lock.lock().await;
+
         let now = current_timestamp();
 
         // 1. Execute deletion, session upsert, and messages insertion within a single atomic transaction.

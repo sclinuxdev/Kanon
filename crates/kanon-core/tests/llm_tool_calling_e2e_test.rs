@@ -16,6 +16,8 @@
 //!    - Mock LLM synthesizes final answer based on tool output;
 //!    - Outbound queue receives delivery request with final answer.
 
+mod common;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -228,13 +230,22 @@ async fn test_llm_tool_calling_e2e_lifecycle() {
     let memory = Arc::new(ConversationManager::new(20));
     let tool_router = Arc::new(ToolRouter::new(provider, memory.clone(), "mock-model"));
 
-    // 6. Set up outbound delivery queue and configure PipelineEngine with ToolRouter
+    // 6. Register a built-in adapter for the fixture platform and start the pipeline worker with
+    //    the ToolRouter plus the outbound dispatcher that delivers replies.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<DeliverMessageRequest>(100);
+    supervisor
+        .adapters()
+        .register(common::ChannelAdapter::shared("test_im", outbound_tx))
+        .await
+        .expect("adapter registration");
+
     let engine = Arc::new(
-        PipelineEngine::new(supervisor.clone(), Some(outbound_tx))
-            .with_tool_router(tool_router),
+        PipelineEngine::new(supervisor.clone()).with_tool_router(tool_router),
     );
-    let worker_handle = engine.start_worker(event_rx);
+    let worker_handle = engine.clone().start_worker(event_rx);
+    let dispatcher_handle = engine
+        .start_outbound_dispatcher()
+        .expect("outbound dispatcher starts");
 
     // 7. Connect gRPC client to Core IPC socket
     let core_channel = connect_ipc(&core_sock)
@@ -311,6 +322,7 @@ async fn test_llm_tool_calling_e2e_lifecycle() {
     // Clean Shutdown and Resource Teardown
     // =========================================================================
     worker_handle.abort();
+    dispatcher_handle.abort();
     let _ = mock_shutdown_tx.send(());
     supervisor
         .stop_host("demo_rust")

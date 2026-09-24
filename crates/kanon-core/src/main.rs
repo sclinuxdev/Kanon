@@ -18,8 +18,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Initialize process supervisor and start the central pipeline worker loop.
     let supervisor = Arc::new(Supervisor::new(None, Some(server.socket_path().to_path_buf())));
-    let engine = Arc::new(PipelineEngine::new(supervisor.clone(), None));
-    let worker_handle = engine.start_worker(event_rx);
+    let engine = Arc::new(PipelineEngine::new(supervisor.clone()));
+    let worker_handle = engine.clone().start_worker(event_rx);
+
+    // Outbound replies are routed through the platform adapter registry. A bare microkernel has
+    // no adapters registered, so deliveries fail explicitly with `UnknownPlatform` rather than
+    // disappearing silently.
+    let dispatcher_handle = engine.clone().start_outbound_dispatcher();
 
     server
         .run(async {
@@ -28,6 +33,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
 
     worker_handle.abort();
+    if let Some(handle) = dispatcher_handle {
+        handle.abort();
+    }
     let _ = supervisor.stop_all().await;
 
     tracing::info!("Kanon Core Engine shut down gracefully");

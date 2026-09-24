@@ -1,10 +1,18 @@
 //! Central Pipeline Engine and asynchronous worker loop.
 //!
 //! Consumes inbound events from the CoreApiService MPSC queue, sequences them through
-//! the PreFilter interception chain and CommandRouter, and emits outbound delivery requests.
+//! the PreFilter interception chain and CommandRouter, and dispatches outbound replies to the
+//! platform adapter that owns the destination platform.
+//!
+//! # Why outbound is queued instead of awaited
+//! Platform delivery performs network I/O against an external service. Awaiting it inside the
+//! pipeline worker would let one slow platform stall every other conversation (head-of-line
+//! blocking), so replies are handed to a bounded queue drained by an independent dispatcher task.
+//! The queue is deliberately bounded: when a platform cannot keep up, the overflow is reported as
+//! an explicit `OutboundFailed` stage instead of growing memory without limit.
 
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use kanon_llm::tool_router::ToolRouter;
@@ -13,10 +21,17 @@ use kanon_proto::v1::{
     DeliverMessageRequest, IngestEventRequest, MessageSegment, PipelineEventRequest,
 };
 
+use crate::adapter::{AdapterError, AdapterKind};
 use crate::pipeline::command::CommandRouter;
 use crate::pipeline::observer::{PipelineObserver, PipelineStage};
 use crate::pipeline::pre_filter::{PreFilterChain, PreFilterOutcome};
-use crate::supervisor::Supervisor;
+use crate::supervisor::{AdapterRoute, Supervisor};
+
+/// Default depth of the outbound delivery queue.
+///
+/// Sized so that a slow platform absorbs a burst of replies without dropping any, while keeping
+/// worst-case memory bounded.
+pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 
 /// Result produced after processing an event through the pipeline engine.
 #[derive(Debug, Clone)]
@@ -57,29 +72,44 @@ pub enum PipelineResult {
     Passed(PipelineEventRequest),
 }
 
+/// Result produced after delivering an outbound message through a platform adapter.
+#[derive(Debug, Clone)]
+pub struct DeliveryOutcome {
+    /// Which adapter route served the message.
+    pub kind: AdapterKind,
+    /// Platform that accepted the message.
+    pub platform: String,
+    /// Platform-assigned message identifier, when reported.
+    pub message_id: String,
+}
+
 /// Central event processing engine driving the message pipeline.
 pub struct PipelineEngine {
-    /// Reference to the process supervisor managing active plugin hosts.
+    /// Reference to the process supervisor managing active plugin hosts and adapters.
     supervisor: Arc<Supervisor>,
-    /// Optional outbound channel for sending formatted replies to IM platform adapters.
-    outbound_sender: Option<mpsc::Sender<DeliverMessageRequest>>,
     /// Optional ToolRouter driving LLM reasoning and cross-language tool calling.
     tool_router: Option<Arc<ToolRouter>>,
     /// Optional lifecycle observer used by the management control plane for tracing.
     observer: Option<Arc<dyn PipelineObserver>>,
+    /// Producer side of the bounded outbound delivery queue.
+    outbound_sender: mpsc::Sender<DeliverMessageRequest>,
+    /// Consumer side, taken exactly once by [`PipelineEngine::start_outbound_dispatcher`].
+    outbound_receiver: Mutex<Option<mpsc::Receiver<DeliverMessageRequest>>>,
 }
 
 impl PipelineEngine {
-    /// Creates a new `PipelineEngine` with the given supervisor and optional outbound message channel.
-    pub fn new(
-        supervisor: Arc<Supervisor>,
-        outbound_sender: Option<mpsc::Sender<DeliverMessageRequest>>,
-    ) -> Self {
+    /// Creates a new `PipelineEngine` bound to a supervisor.
+    ///
+    /// The outbound delivery queue is created here so producers always have a valid sender, even
+    /// when the dispatcher task has not been started yet.
+    pub fn new(supervisor: Arc<Supervisor>) -> Self {
+        let (outbound_sender, outbound_receiver) = mpsc::channel(DEFAULT_OUTBOUND_QUEUE_CAPACITY);
         Self {
             supervisor,
-            outbound_sender,
             tool_router: None,
             observer: None,
+            outbound_sender,
+            outbound_receiver: Mutex::new(Some(outbound_receiver)),
         }
     }
 
@@ -95,6 +125,11 @@ impl PipelineEngine {
         self
     }
 
+    /// Returns a handle for enqueuing outbound messages from outside the worker loop.
+    pub fn outbound_sender(&self) -> mpsc::Sender<DeliverMessageRequest> {
+        self.outbound_sender.clone()
+    }
+
     /// Publishes a lifecycle stage to the attached observer, if any.
     ///
     /// Observation is deliberately infallible: tracing must never alter pipeline outcomes.
@@ -102,6 +137,133 @@ impl PipelineEngine {
         if let Some(ref observer) = self.observer {
             observer.on_stage(&stage);
         }
+    }
+
+    /// Delivers one outbound message to the adapter owning its platform.
+    ///
+    /// Routing order is built-in adapter first, then plugin host. Every failure path is explicit:
+    /// an unrouted platform, an unreachable plugin host, or a plugin that reports `success=false`
+    /// all become [`AdapterError`] values instead of a silent drop.
+    pub async fn deliver_outbound(
+        &self,
+        request: DeliverMessageRequest,
+    ) -> Result<DeliveryOutcome, AdapterError> {
+        let platform = request.platform.clone();
+
+        match self.supervisor.resolve_adapter(&platform).await {
+            Some(AdapterRoute::Builtin(adapter)) => {
+                let response = adapter.deliver(request).await?;
+                if !response.success {
+                    return Err(AdapterError::Delivery {
+                        platform,
+                        reason: response.error_message,
+                    });
+                }
+                Ok(DeliveryOutcome {
+                    kind: AdapterKind::Builtin,
+                    platform,
+                    message_id: response.message_id,
+                })
+            }
+            Some(AdapterRoute::Plugin { host, plugin_id }) => {
+                let host_id = host.host_id.clone();
+                let response = host.deliver_message(request).await.map_err(|status| {
+                    AdapterError::Delivery {
+                        platform: platform.clone(),
+                        reason: format!("plugin '{plugin_id}' on host '{host_id}' failed: {status}"),
+                    }
+                })?;
+
+                if !response.success {
+                    return Err(AdapterError::Delivery {
+                        platform,
+                        reason: format!(
+                            "plugin '{plugin_id}' on host '{host_id}' rejected the message: {}",
+                            response.error_message
+                        ),
+                    });
+                }
+
+                Ok(DeliveryOutcome {
+                    kind: AdapterKind::Plugin,
+                    platform,
+                    message_id: response.message_id,
+                })
+            }
+            None => Err(AdapterError::UnknownPlatform(platform)),
+        }
+    }
+
+    /// Drains the outbound queue, delivering each message and emitting a trace stage per attempt.
+    ///
+    /// Delivery is sequential on purpose: it preserves per-platform message ordering and bounds
+    /// concurrency to one in-flight request per queue, which external platform APIs generally
+    /// require.
+    pub async fn run_outbound_loop(&self, mut receiver: mpsc::Receiver<DeliverMessageRequest>) {
+        tracing::info!("Outbound adapter dispatcher started");
+
+        while let Some(request) = receiver.recv().await {
+            let platform = request.platform.clone();
+            let channel_id = request.channel_id.clone();
+            let segment_count = request.segments.len();
+
+            match self.deliver_outbound(request).await {
+                Ok(outcome) => {
+                    tracing::debug!(
+                        platform = %outcome.platform,
+                        channel_id = %channel_id,
+                        message_id = %outcome.message_id,
+                        "Outbound message delivered"
+                    );
+                    self.observe(PipelineStage::OutboundDelivered {
+                        platform: outcome.platform,
+                        channel_id,
+                        segment_count,
+                        target: outcome.kind,
+                        message_id: outcome.message_id,
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        platform = %platform,
+                        channel_id = %channel_id,
+                        error = %err,
+                        "Outbound delivery failed"
+                    );
+                    self.observe(PipelineStage::OutboundFailed {
+                        platform,
+                        channel_id,
+                        reason: err.to_string(),
+                    });
+                }
+            }
+        }
+
+        tracing::info!("Outbound adapter dispatcher terminated");
+    }
+
+    /// Spawns the outbound dispatcher task.
+    ///
+    /// Returns `None` when the dispatcher was already started: the queue has exactly one consumer,
+    /// so a second call cannot be honoured and must not silently steal messages.
+    pub fn start_outbound_dispatcher(self: Arc<Self>) -> Option<JoinHandle<()>> {
+        let receiver = self
+            .outbound_receiver
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
+
+        let receiver = match receiver {
+            Some(receiver) => receiver,
+            None => {
+                tracing::error!("Outbound dispatcher already running; ignoring duplicate start");
+                return None;
+            }
+        };
+
+        Some(tokio::spawn(async move {
+            self.run_outbound_loop(receiver).await;
+        }))
     }
 
     /// Processes a single inbound event through the PreFilter chain and command dispatcher.
@@ -280,38 +442,57 @@ impl PipelineEngine {
 
             let result = self.process_event(event).await;
 
-            if let Some(ref outbound_tx) = self.outbound_sender {
-                let replies = match &result {
-                    PipelineResult::Blocked { replies, .. } => replies,
-                    PipelineResult::CommandExecuted { replies, .. } => replies,
-                    PipelineResult::LlmReplied { replies, .. } => replies,
-                    _ => &[][..],
+            let replies = match &result {
+                PipelineResult::Blocked { replies, .. } => replies,
+                PipelineResult::CommandExecuted { replies, .. } => replies,
+                PipelineResult::LlmReplied { replies, .. } => replies,
+                _ => &[][..],
+            };
+
+            if !replies.is_empty() {
+                let deliver_req = DeliverMessageRequest {
+                    platform,
+                    channel_id,
+                    recipient_id,
+                    segments: replies.to_vec(),
                 };
 
-                if !replies.is_empty() {
-                    let deliver_req = DeliverMessageRequest {
-                        platform,
-                        channel_id,
-                        recipient_id,
-                        segments: replies.to_vec(),
-                    };
+                let platform = deliver_req.platform.clone();
+                let channel_id = deliver_req.channel_id.clone();
+                let segment_count = deliver_req.segments.len();
 
-                    let segment_count = deliver_req.segments.len();
-                    let deliver_platform = deliver_req.platform.clone();
-                    let deliver_channel = deliver_req.channel_id.clone();
-
-                    if let Err(e) = outbound_tx.send(deliver_req).await {
-                        tracing::warn!(
-                            event_id = %event_id,
-                            error = %e,
-                            "Failed to enqueue outbound message; receiver dropped"
-                        );
-                    } else {
+                // Non-blocking hand-off: the pipeline worker must never await platform I/O.
+                match self.outbound_sender.try_send(deliver_req) {
+                    Ok(()) => {
                         self.observe(PipelineStage::OutboundQueued {
                             event_id,
-                            platform: deliver_platform,
-                            channel_id: deliver_channel,
+                            platform,
+                            channel_id,
                             segment_count,
+                        });
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(
+                            platform = %platform,
+                            channel_id = %channel_id,
+                            "Outbound queue is full; dropping reply to protect pipeline latency"
+                        );
+                        self.observe(PipelineStage::OutboundFailed {
+                            platform,
+                            channel_id,
+                            reason: "outbound queue is full; reply dropped".to_string(),
+                        });
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::warn!(
+                            platform = %platform,
+                            channel_id = %channel_id,
+                            "Outbound dispatcher is not running; dropping reply"
+                        );
+                        self.observe(PipelineStage::OutboundFailed {
+                            platform,
+                            channel_id,
+                            reason: "outbound dispatcher is not running; reply dropped".to_string(),
                         });
                     }
                 }

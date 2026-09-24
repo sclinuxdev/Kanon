@@ -8,6 +8,8 @@
 //! 5. Execution on the target plugin host (`demo-rust-plugin`);
 //! 6. Outbound message delivery to the adapter channel.
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,10 +82,20 @@ async fn test_pipeline_router_end_to_end_lifecycle() {
     assert_eq!(managed_host.meta.len(), 1);
     assert_eq!(managed_host.meta[0].commands[0].name, "rustcalc");
 
-    // 4. Set up outbound message channel and start PipelineEngine worker loop.
+    // 4. Register a built-in adapter for the fixture platform, then start the pipeline worker
+    //    and the outbound dispatcher that routes replies through the adapter registry.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<DeliverMessageRequest>(100);
-    let engine = Arc::new(PipelineEngine::new(supervisor.clone(), Some(outbound_tx)));
-    let worker_handle = engine.start_worker(event_rx);
+    supervisor
+        .adapters()
+        .register(common::ChannelAdapter::shared("test_im", outbound_tx))
+        .await
+        .expect("adapter registration");
+
+    let engine = Arc::new(PipelineEngine::new(supervisor.clone()));
+    let worker_handle = engine.clone().start_worker(event_rx);
+    let dispatcher_handle = engine
+        .start_outbound_dispatcher()
+        .expect("outbound dispatcher starts");
 
     // 5. Connect gRPC client to Core IPC socket.
     let core_channel = connect_ipc(&core_sock)
@@ -223,6 +235,7 @@ async fn test_pipeline_router_end_to_end_lifecycle() {
     // Clean Shutdown and Resource Teardown
     // =========================================================================
     worker_handle.abort();
+    dispatcher_handle.abort();
     supervisor
         .stop_host("demo_rust")
         .await

@@ -79,6 +79,23 @@ pub struct ToolDefinitionEntry {
     pub parameters: Option<serde_json::Value>,
 }
 
+/// Platform adapter capability declared under `[adapter]` in `plugin.toml`.
+///
+/// Declaring this section is what turns a plugin into a platform adapter: the core routes every
+/// outbound message whose `platform` matches to this plugin's host via `OnDeliverMessage`, and the
+/// plugin pushes inbound messages back through `BotApiService.IngestEvent`.
+///
+/// The declaration lives in the manifest rather than in `PluginMeta` on purpose: the core must
+/// know which host owns a platform *before* receiving traffic, and a static file cannot disagree
+/// with itself after a hot reload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdapterSection {
+    /// Platform identifier served by this plugin (matches `PipelineEventRequest.platform`).
+    pub platform: String,
+    /// Human-readable name shown in the management console.
+    pub display_name: Option<String>,
+}
+
 /// Complete representation of a parsed `plugin.toml` manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -93,6 +110,9 @@ pub struct PluginManifest {
     /// for form rendering without launching the plugin sub-process.
     #[serde(default)]
     pub config_schema: Option<serde_json::Value>,
+    /// Optional platform adapter capability declaration.
+    #[serde(default)]
+    pub adapter: Option<AdapterSection>,
     /// List of statically declared commands.
     #[serde(default)]
     pub commands: Vec<CommandDefinition>,

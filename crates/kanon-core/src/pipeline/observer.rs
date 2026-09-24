@@ -13,6 +13,8 @@
 
 use serde::Serialize;
 
+use crate::adapter::AdapterKind;
+
 /// A single message lifecycle transition emitted by the pipeline engine.
 ///
 /// Serialized with an internal `stage` tag so that WebSocket clients can dispatch on the
@@ -77,7 +79,7 @@ pub enum PipelineStage {
         /// Character length of the generated reply.
         content_length: usize,
     },
-    /// Outbound replies were enqueued towards a platform adapter.
+    /// Outbound replies were enqueued towards the outbound dispatcher.
     OutboundQueued {
         /// Unique identifier of the inbound event that produced the replies.
         event_id: String,
@@ -87,6 +89,28 @@ pub enum PipelineStage {
         channel_id: String,
         /// Number of outbound message segments enqueued.
         segment_count: usize,
+    },
+    /// An outbound message was accepted by the platform adapter responsible for it.
+    OutboundDelivered {
+        /// Destination platform.
+        platform: String,
+        /// Destination channel.
+        channel_id: String,
+        /// Number of delivered message segments.
+        segment_count: usize,
+        /// Whether a built-in adapter or a plugin host served the message.
+        target: AdapterKind,
+        /// Platform-assigned message identifier, when the adapter reported one.
+        message_id: String,
+    },
+    /// An outbound message could not be delivered; the reason is always explicit.
+    OutboundFailed {
+        /// Destination platform.
+        platform: String,
+        /// Destination channel.
+        channel_id: String,
+        /// Failure reason reported by routing or by the adapter.
+        reason: String,
     },
 }
 
@@ -102,6 +126,8 @@ impl PipelineStage {
             PipelineStage::CommandNotFound { .. } => "command_not_found",
             PipelineStage::LlmReplied { .. } => "llm_replied",
             PipelineStage::OutboundQueued { .. } => "outbound_queued",
+            PipelineStage::OutboundDelivered { .. } => "outbound_delivered",
+            PipelineStage::OutboundFailed { .. } => "outbound_failed",
         }
     }
 
@@ -116,6 +142,9 @@ impl PipelineStage {
             | PipelineStage::CommandNotFound { event_id, .. }
             | PipelineStage::LlmReplied { event_id, .. }
             | PipelineStage::OutboundQueued { event_id, .. } => event_id,
+            // Delivery stages are emitted by the outbound dispatcher, which no longer knows the
+            // originating event identifier: the delivery queue carries routing keys only.
+            PipelineStage::OutboundDelivered { .. } | PipelineStage::OutboundFailed { .. } => "",
         }
     }
 }

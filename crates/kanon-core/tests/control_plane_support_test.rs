@@ -236,7 +236,7 @@ async fn pipeline_engine_emits_pre_filter_stages() {
     let supervisor = Arc::new(Supervisor::new(Some(run_dir.path().to_path_buf()), None));
     let observer = Arc::new(RecordingObserver::default());
 
-    let engine = PipelineEngine::new(supervisor, None).with_observer(observer.clone());
+    let engine = PipelineEngine::new(supervisor).with_observer(observer.clone());
 
     let result = engine
         .process_event(PipelineEventRequest {
@@ -258,17 +258,14 @@ async fn pipeline_engine_emits_pre_filter_stages() {
     assert_eq!(stages[0].event_id(), "evt-1");
 }
 
-/// The worker loop announces ingested events and queued outbound replies.
+/// The worker loop announces ingested events and queues replies for the dispatcher.
 #[tokio::test]
 async fn pipeline_worker_emits_ingest_and_outbound_stages() {
     let run_dir = tempdir().expect("temp dir");
     let supervisor = Arc::new(Supervisor::new(Some(run_dir.path().to_path_buf()), None));
     let observer = Arc::new(RecordingObserver::default());
-    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel(4);
 
-    let engine = Arc::new(
-        PipelineEngine::new(supervisor, Some(outbound_tx)).with_observer(observer.clone()),
-    );
+    let engine = Arc::new(PipelineEngine::new(supervisor).with_observer(observer.clone()));
 
     let (event_tx, event_rx) = tokio::sync::mpsc::channel(4);
     event_tx
@@ -288,10 +285,9 @@ async fn pipeline_worker_emits_ingest_and_outbound_stages() {
         .expect("event queued");
     drop(event_tx);
 
+    // No dispatcher task runs here and no adapter can produce a reply, so only the inbound
+    // stages are expected: the pipeline itself must never invent outbound traffic.
     engine.run_worker_loop(event_rx).await;
-
-    // No downstream consumer produced replies, so no outbound stage is expected.
-    assert!(outbound_rx.try_recv().is_err());
 
     let stages = observer.stages.lock().expect("stage lock");
     let names: Vec<&str> = stages.iter().map(PipelineStage::name).collect();

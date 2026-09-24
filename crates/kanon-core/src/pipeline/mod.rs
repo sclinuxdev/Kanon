@@ -12,7 +12,7 @@ pub mod observer;
 pub mod pre_filter;
 
 pub use command::{CommandRouter, MatchedCommand};
-pub use engine::{PipelineEngine, PipelineResult};
+pub use engine::{DeliveryOutcome, PipelineEngine, PipelineResult, DEFAULT_OUTBOUND_QUEUE_CAPACITY};
 pub use observer::{PipelineObserver, PipelineStage};
 pub use pre_filter::{
     PreFilterChain, PreFilterOutcome, PREFILTER_TOTAL_DEADLINE, PREFILTER_WARN_THRESHOLD,

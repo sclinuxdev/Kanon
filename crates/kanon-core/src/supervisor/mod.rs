@@ -16,13 +16,14 @@ use tonic::transport::Channel;
 use kanon_proto::v1::message_pipeline_service_client::MessagePipelineServiceClient;
 use kanon_proto::v1::plugin_host_service_client::PluginHostServiceClient;
 use kanon_proto::v1::{
-    CommandExecuteRequest, CommandExecuteResponse, GetPluginMetaRequest,
-    PipelineEventRequest, PluginMeta, PreFilterResult, ReloadPluginConfigRequest,
-    ReloadPluginConfigResponse, ToolCallRequest, ToolCallResponse,
+    CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest,
+    DeliverMessageResponse, GetPluginMetaRequest, PipelineEventRequest, PluginMeta, PreFilterResult,
+    ReloadPluginConfigRequest, ReloadPluginConfigResponse, ToolCallRequest, ToolCallResponse,
 };
 use kanon_transport::{
     connect_ipc, core_socket_path, default_run_dir, host_socket_path,
 };
+use crate::adapter::{AdapterDescriptor, AdapterKind, AdapterRegistry};
 use crate::manifest::PluginManifest;
 
 /// Errors arising during supervisor operations.
@@ -181,6 +182,48 @@ impl ManagedHost {
     pub fn declares_plugin(&self, plugin_id: &str) -> bool {
         self.meta.iter().any(|m| m.id == plugin_id)
     }
+
+    /// Returns the platform identifiers this host serves as an adapter, from its static manifest.
+    ///
+    /// Only manifest-declared platforms are returned: adapter ownership must be knowable before
+    /// the first message arrives, so it cannot depend on a runtime handshake value.
+    pub fn adapter_platforms(&self) -> Vec<String> {
+        self.manifest
+            .as_ref()
+            .and_then(|manifest| manifest.adapter.as_ref())
+            .map(|adapter| vec![adapter.platform.clone()])
+            .unwrap_or_default()
+    }
+
+    /// Returns the console-facing adapter name declared by this host, when it is an adapter.
+    pub fn adapter_display_name(&self) -> Option<String> {
+        self.manifest
+            .as_ref()
+            .and_then(|manifest| manifest.adapter.as_ref())
+            .map(|adapter| {
+                adapter
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| adapter.platform.clone())
+            })
+    }
+
+    /// Returns the plugin identifier of this host's adapter declaration, when present.
+    ///
+    /// The manifest's plugin id is authoritative here even before a handshake reports metadata.
+    pub fn adapter_plugin_id(&self) -> Option<String> {
+        self.manifest
+            .as_ref()
+            .filter(|manifest| manifest.adapter.is_some())
+            .map(|manifest| manifest.plugin.id.clone())
+            .or_else(|| {
+                // A host spawned as a raw executable may still serve an adapter reported by the
+                // live process; fall back to the first declared plugin so routing keeps working.
+                self.adapter_platforms()
+                    .first()
+                    .and_then(|_| self.meta.first().map(|meta| meta.id.clone()))
+            })
+    }
 }
 
 impl std::fmt::Debug for ManagedHost {
@@ -254,6 +297,17 @@ impl ManagedHost {
             .await?;
         Ok(response.into_inner())
     }
+
+    /// Hands an outbound message to this host so the plugin acting as a platform adapter can
+    /// publish it to the target platform.
+    pub async fn deliver_message(
+        &self,
+        request: DeliverMessageRequest,
+    ) -> Result<DeliverMessageResponse, tonic::Status> {
+        let mut client = self.pipeline_client.lock().await;
+        let response = client.on_deliver_message(request).await?;
+        Ok(response.into_inner())
+    }
 }
 
 #[tonic::async_trait]
@@ -274,6 +328,36 @@ impl kanon_llm::tool_router::ToolHost for ManagedHost {
     }
 }
 
+/// Where an outbound message for a platform should be delivered.
+#[derive(Clone)]
+pub enum AdapterRoute {
+    /// An in-process adapter registered on the [`AdapterRegistry`].
+    Builtin(Arc<dyn crate::adapter::PlatformAdapter>),
+    /// A plugin host whose manifest declares the platform.
+    Plugin {
+        /// Host process that owns the adapter plugin.
+        host: Arc<ManagedHost>,
+        /// Plugin identifier declared by the manifest.
+        plugin_id: String,
+    },
+}
+
+impl std::fmt::Debug for AdapterRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AdapterRoute::Builtin(adapter) => f
+                .debug_struct("AdapterRoute::Builtin")
+                .field("platform", &adapter.platform())
+                .finish(),
+            AdapterRoute::Plugin { host, plugin_id } => f
+                .debug_struct("AdapterRoute::Plugin")
+                .field("host_id", &host.host_id)
+                .field("plugin_id", plugin_id)
+                .finish(),
+        }
+    }
+}
+
 /// Supervisor responsible for managing the lifecycle of out-of-process plugin hosts.
 pub struct Supervisor {
     /// Base directory where IPC sockets and temporary state reside.
@@ -282,6 +366,8 @@ pub struct Supervisor {
     core_sock_path: PathBuf,
     /// Registry of active managed plugin host instances.
     hosts: Arc<RwLock<HashMap<String, Arc<ManagedHost>>>>,
+    /// Registry of in-process platform adapters.
+    adapters: Arc<AdapterRegistry>,
 }
 
 impl Supervisor {
@@ -302,7 +388,89 @@ impl Supervisor {
             run_dir,
             core_sock_path,
             hosts: Arc::new(RwLock::new(HashMap::new())),
+            adapters: Arc::new(AdapterRegistry::new()),
         }
+    }
+
+    /// Returns the built-in adapter registry owned by this supervisor.
+    ///
+    /// The composition root registers in-process adapters here; plugin-declared adapters are
+    /// discovered from host manifests instead of being registered, so host restarts and crashes
+    /// can never leave stale routing entries behind.
+    pub fn adapters(&self) -> &Arc<AdapterRegistry> {
+        &self.adapters
+    }
+
+    /// Resolves the adapter responsible for a platform.
+    ///
+    /// Built-in adapters win over plugins: an in-process adapter is the operator's explicit
+    /// override, and it can never be unavailable because of a crashed sub-process.
+    pub async fn resolve_adapter(&self, platform: &str) -> Option<AdapterRoute> {
+        if let Some(adapter) = self.adapters.get(platform).await {
+            return Some(AdapterRoute::Builtin(adapter));
+        }
+
+        let hosts = self.hosts.read().await;
+        for host in hosts.values() {
+            if host.adapter_platforms().iter().any(|p| p == platform) {
+                let plugin_id = host
+                    .adapter_plugin_id()
+                    .unwrap_or_else(|| host.host_id.clone());
+                return Some(AdapterRoute::Plugin {
+                    host: host.clone(),
+                    plugin_id,
+                });
+            }
+        }
+
+        None
+    }
+
+    /// Builds the console-facing adapter catalog: built-ins first, then plugin adapters.
+    pub async fn adapter_catalog(&self) -> Vec<AdapterDescriptor> {
+        let mut catalog: Vec<AdapterDescriptor> = self
+            .adapters
+            .list()
+            .await
+            .iter()
+            .map(|adapter| AdapterDescriptor {
+                platform: adapter.platform().to_string(),
+                display_name: adapter.display_name().to_string(),
+                kind: AdapterKind::Builtin,
+                connected: adapter.is_connected(),
+                plugin_id: None,
+                host_id: None,
+            })
+            .collect();
+
+        for host in self.hosts.read().await.values() {
+            let platforms = host.adapter_platforms();
+            if platforms.is_empty() {
+                continue;
+            }
+
+            let display_name = host
+                .adapter_display_name()
+                .unwrap_or_else(|| host.host_id.clone());
+            let plugin_id = host.adapter_plugin_id();
+
+            for platform in platforms {
+                catalog.push(AdapterDescriptor {
+                    platform,
+                    display_name: display_name.clone(),
+                    kind: AdapterKind::Plugin,
+                    // A host present in the registry is a live process; a crashed host is removed
+                    // by the supervisor, so presence is the connection signal.
+                    connected: true,
+                    plugin_id: plugin_id.clone(),
+                    host_id: Some(host.host_id.clone()),
+                });
+            }
+        }
+
+        // Deterministic ordering keeps console tables stable across polls.
+        catalog.sort_by(|a, b| a.platform.cmp(&b.platform));
+        catalog
     }
 
     /// Returns a reference to the active run directory.

@@ -18,6 +18,7 @@ use kanon_proto::v1::{
 };
 use kanon_transport::{core_socket_path, IpcListener};
 
+use crate::adapter::{EventIngress, IngestError};
 use kanon_llm::{ChatMessage, ChatRequest, LlmGateway};
 use tokio_stream::StreamExt;
 
@@ -43,8 +44,8 @@ pub struct HostRegistration {
 /// Core implementation of the [`BotApiService`] gRPC service.
 #[derive(Debug, Clone)]
 pub struct CoreApiService {
-    /// Non-blocking sender for incoming events, isolated with a high-watermark buffer.
-    event_sender: mpsc::Sender<IngestEventRequest>,
+    /// Shared Fast-ACK ingest handle; also handed to platform adapters.
+    ingress: EventIngress,
     /// Thread-safe registry of connected and registered plugin hosts.
     hosts: Arc<RwLock<HashMap<String, HostRegistration>>>,
     /// Optional shared LLM gateway instance for delegating model completions.
@@ -53,12 +54,20 @@ pub struct CoreApiService {
 
 impl CoreApiService {
     /// Creates a new `CoreApiService` with the specified event queue sender.
-    pub fn new(event_sender: mpsc::Sender<IngestEventRequest>) -> Self {
+    ///
+    /// Accepts anything convertible into an [`EventIngress`] so callers may keep handing over a
+    /// raw `mpsc::Sender` while adapters share the very same ingress handle.
+    pub fn new(ingress: impl Into<EventIngress>) -> Self {
         Self {
-            event_sender,
+            ingress: ingress.into(),
             hosts: Arc::new(RwLock::new(HashMap::new())),
             gateway: None,
         }
+    }
+
+    /// Returns the shared ingest handle, so adapters can push inbound events.
+    pub fn ingress(&self) -> &EventIngress {
+        &self.ingress
     }
 
     /// Configures the active LLM gateway instance.
@@ -125,14 +134,14 @@ impl BotApiService for CoreApiService {
             .unwrap_or_default();
 
         // Non-blocking enqueue to guarantee Fast-ACK (< 50µs).
-        match self.event_sender.try_send(req) {
-            Ok(_) => {
+        match self.ingress.try_ingest(req) {
+            Ok(()) => {
                 Ok(Response::new(IngestEventResponse {
                     accepted: true,
                     event_id,
                 }))
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(IngestError::QueueFull) => {
                 // High watermark reached: report backpressure but acknowledge failure quickly.
                 tracing::warn!(
                     event_id = %event_id,
@@ -143,7 +152,7 @@ impl BotApiService for CoreApiService {
                     event_id,
                 }))
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(IngestError::Closed) => {
                 Err(Status::unavailable("Microkernel event queue has been closed"))
             }
         }

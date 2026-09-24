@@ -587,9 +587,14 @@ sequenceDiagram
 | **内置 (Built-in)** | 进程内实现 `PlatformAdapter` 并注册到 `AdapterRegistry`（内置优先于插件，是运维的显式覆盖） | 直接调用适配器 `deliver()`，零 IPC 开销 | 由适配器自行推送（HTTP 网关路由或自建长轮询任务） |
 | **插件 (Plugin)** | `plugin.toml` 声明 `[adapter] platform = "..."`，核心从静态清单发现，**无需注册调用** | `MessagePipelineService.OnDeliverMessage` RPC 投递到宿主进程 | 插件经 `BotApiService.IngestEvent` 推回；Rust/Python/TS SDK 的 `ctx.core.ingest_event(...)` 已封装 |
 
-**出站调度与背压**：流水线工作循环绝不等待平台 I/O（避免单一慢平台造成队头阻塞），回复统一进入有界出站队列，
-由独立 dispatcher 任务串行投递（保持同一平台的消息顺序）。队列满时丢弃并上报 `outbound_failed` 阶段，
-不静默膨胀内存。控制面可通过 `/ws/v1/events` 观察 `outbound_queued → outbound_delivered / outbound_failed` 全链路。
+**出站调度与背压**：流水线工作循环绝不等待平台 I/O。回复统一进入全局有界出站队列后，由 Dispatcher 按 `platform` 分区路由至独立的单平台 Worker 队列（默认容量 64）：
+- **平台并发隔离**：不同平台间并发执行，单一卡顿或故障平台绝不阻塞其他平台的出站吞吐量（避免跨平台队头阻塞）；
+- **平台内时序保障**：同一平台内部由独立 Worker 串行消费，严格保证 FIFO 消息递送顺序；
+- **背压与死信追踪**：单平台队列饱和时，溢出消息立即丢弃并上报 `outbound_failed` 阶段，不静默膨胀内存。
+
+**Webhook 鉴权与出站退避重试**：
+- **HMAC-SHA256 签名校验**：配置 `secret` 时，入站 `/api/v1/adapters/{platform}/ingest` 严格校验 `X-Hub-Signature-256` / `X-Kanon-Signature`（恒定时间比对防时序攻击），验签失败直接返回 HTTP 401 `unauthorized`；出站自动为 Payload 计算签名并注入请求头。
+- **指数退避重试策略**：出站遇网络断连、超时或 HTTP 5xx / 429 瞬态错误时，执行指数退避重试（默认 2 次重试，初始间隔 50ms）；遇到 HTTP 4xx 客户端错误则判定为永久故障，绝不盲目重试。
 
 **插件侧能力**：声明 `[adapter]` 但未实现出站钩子的插件会收到明确的失败响应（`success=false` + 原因），
 核心据此记录投递失败 —— 契约不允许「假成功」。三语言 SDK 的默认 `on_deliver_message` / `onDeliverMessage` 均已改为显式拒绝。

@@ -12,10 +12,11 @@
 
 use axum::Json;
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
-use kanon_core::IngestError;
+use kanon_core::{AdapterRoute, IngestError};
 use kanon_proto::v1::{IngestEventRequest, PipelineEventRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -81,10 +82,13 @@ async fn list_adapters(State(state): State<ApiState>) -> Json<AdapterCatalog> {
 ///
 /// The platform must resolve to a registered adapter (built-in or plugin); accepting messages for
 /// an unserved platform would create conversations that can never be answered.
+/// When the target adapter configures authentication (e.g. Webhook HMAC-SHA256), the signature
+/// is verified against the raw request body before enqueuing.
 async fn ingest_event(
     State(state): State<ApiState>,
     Path(platform): Path<String>,
-    Json(body): Json<IngestRequest>,
+    headers: HeaderMap,
+    body_bytes: Bytes,
 ) -> Result<(StatusCode, Json<IngestAccepted>), ApiError> {
     let platform = platform.trim().to_string();
     if platform.is_empty() {
@@ -92,6 +96,37 @@ async fn ingest_event(
             "Path parameter 'platform' must not be empty".to_string(),
         ));
     }
+
+    let route = state
+        .supervisor()
+        .resolve_adapter(&platform)
+        .await
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("No adapter is registered for platform '{platform}'"))
+        })?;
+
+    // Extract signature header if present (supports X-Hub-Signature-256, X-Kanon-Signature, X-Signature-256)
+    let signature = headers
+        .get("x-hub-signature-256")
+        .or_else(|| headers.get("x-kanon-signature"))
+        .or_else(|| headers.get("x-signature-256"))
+        .and_then(|val| val.to_str().ok());
+
+    // Verify inbound authentication if the adapter enforces it (e.g. HMAC-SHA256)
+    if let AdapterRoute::Builtin(ref adapter) = route {
+        adapter.verify_inbound(signature, &body_bytes).map_err(|err| match err {
+            kanon_core::AdapterError::Authentication { reason, .. } => {
+                ApiError::Unauthorized(reason)
+            }
+            other => ApiError::BadRequest(other.to_string()),
+        })?;
+    }
+
+    // Parse the JSON request body
+    let body: IngestRequest = serde_json::from_slice(&body_bytes).map_err(|err| {
+        ApiError::BadRequest(format!("Failed to parse request JSON body: {err}"))
+    })?;
+
     if body.channel_id.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "Field 'channel_id' must not be empty".to_string(),
@@ -106,12 +141,6 @@ async fn ingest_event(
         return Err(ApiError::BadRequest(
             "Field 'text' must not be empty".to_string(),
         ));
-    }
-
-    if state.supervisor().resolve_adapter(&platform).await.is_none() {
-        return Err(ApiError::NotFound(format!(
-            "No adapter is registered for platform '{platform}'"
-        )));
     }
 
     let ingress = state.ingress().ok_or_else(|| {

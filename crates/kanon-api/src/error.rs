@@ -33,6 +33,9 @@ pub enum ApiError {
     /// A plugin host or IPC round trip failed.
     #[error("{0}")]
     Upstream(String),
+    /// Authentication or signature verification failed.
+    #[error("{0}")]
+    Unauthorized(String),
     /// Unexpected internal failure (filesystem, serialization, task join).
     #[error("{0}")]
     Internal(String),
@@ -44,6 +47,7 @@ impl ApiError {
         match self {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Upstream(_) => StatusCode::BAD_GATEWAY,
@@ -56,6 +60,7 @@ impl ApiError {
         match self {
             ApiError::NotFound(_) => "not_found",
             ApiError::BadRequest(_) => "bad_request",
+            ApiError::Unauthorized(_) => "unauthorized",
             ApiError::Conflict(_) => "conflict",
             ApiError::Unavailable(_) => "unavailable",
             ApiError::Upstream(_) => "upstream_error",

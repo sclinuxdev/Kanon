@@ -153,8 +153,16 @@ async fn register_webhook_adapter(supervisor: &Arc<Supervisor>) -> StartupResult
     let callback_url = std::env::var("KANON_WEBHOOK_CALLBACK_URL")
         .ok()
         .filter(|url| !url.trim().is_empty());
+    let secret = std::env::var("KANON_WEBHOOK_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
-    let adapter = WebhookAdapter::new(platform.clone(), None, callback_url.clone())?;
+    let mut adapter = WebhookAdapter::new(platform.clone(), None, callback_url.clone())?;
+    if let Some(sec) = secret {
+        tracing::info!(platform = %platform, "Webhook adapter configured with HMAC-SHA256 signature verification");
+        adapter = adapter.with_secret(sec);
+    }
+
     supervisor
         .adapters()
         .register(Arc::new(adapter))

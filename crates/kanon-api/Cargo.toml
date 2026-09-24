@@ -27,6 +27,7 @@ tonic = "0.12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+ring = "0.17"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -20,9 +20,30 @@ use serde::Serialize;
 
 /// Timeout applied to callback deliveries.
 ///
-/// Kept short on purpose: the delivery queue is drained sequentially, so a hanging endpoint must
-/// fail fast instead of stalling every other platform's outbound traffic.
+/// Kept short on purpose: the delivery queue is drained sequentially per platform, so a hanging
+/// endpoint must fail fast instead of stalling subsequent deliveries.
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Configuration for outbound HTTP delivery retries with exponential backoff.
+#[derive(Debug, Clone)]
+pub struct WebhookRetryConfig {
+    /// Maximum number of retry attempts after the initial delivery attempt fails.
+    /// Default is 2 (total 3 attempts). Set to 0 to disable retries.
+    pub max_retries: usize,
+    /// Base backoff duration before the first retry attempt.
+    /// Subsequent retries back off exponentially (`initial_backoff * 2^attempt`).
+    /// Default is 50 milliseconds.
+    pub initial_backoff: Duration,
+}
+
+impl Default for WebhookRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(50),
+        }
+    }
+}
 
 /// A generic HTTP bridge adapter.
 pub struct WebhookAdapter {
@@ -32,18 +53,39 @@ pub struct WebhookAdapter {
     display_name: String,
     /// Destination for outbound messages; absent when the adapter is inbound-only.
     callback_url: Option<String>,
+    /// Optional shared secret for HMAC-SHA256 inbound authentication and outbound signing.
+    secret: Option<String>,
+    /// Retry configuration for outbound deliveries.
+    retry_config: WebhookRetryConfig,
     /// Shared HTTP client (connection pooling across deliveries).
     client: reqwest::Client,
 }
 
 impl WebhookAdapter {
-    /// Creates a webhook adapter for `platform`.
+    /// Creates a webhook adapter for `platform` with default retry configuration.
     ///
     /// `callback_url` may be `None`, which makes the adapter inbound-only.
     pub fn new(
         platform: impl Into<String>,
         display_name: Option<String>,
         callback_url: Option<String>,
+    ) -> Result<Self, AdapterError> {
+        Self::with_options(
+            platform,
+            display_name,
+            callback_url,
+            None,
+            WebhookRetryConfig::default(),
+        )
+    }
+
+    /// Full constructor specifying platform, callback URL, secret, and retry settings.
+    pub fn with_options(
+        platform: impl Into<String>,
+        display_name: Option<String>,
+        callback_url: Option<String>,
+        secret: Option<String>,
+        retry_config: WebhookRetryConfig,
     ) -> Result<Self, AdapterError> {
         let platform = platform.into();
         if platform.trim().is_empty() {
@@ -54,6 +96,7 @@ impl WebhookAdapter {
         }
 
         let callback_url = callback_url.filter(|url| !url.trim().is_empty());
+        let secret = secret.filter(|s| !s.trim().is_empty());
 
         let client = reqwest::Client::builder()
             .timeout(DELIVERY_TIMEOUT)
@@ -67,13 +110,38 @@ impl WebhookAdapter {
             display_name: display_name.unwrap_or_else(|| platform.clone()),
             platform,
             callback_url,
+            secret,
+            retry_config,
             client,
         })
+    }
+
+    /// Attaches an HMAC-SHA256 secret for inbound signature verification and outbound signing.
+    pub fn with_secret(mut self, secret: impl Into<String>) -> Self {
+        let s = secret.into();
+        self.secret = if s.trim().is_empty() { None } else { Some(s) };
+        self
+    }
+
+    /// Configures the retry policy for outbound deliveries.
+    pub fn with_retry_config(mut self, retry_config: WebhookRetryConfig) -> Self {
+        self.retry_config = retry_config;
+        self
     }
 
     /// Returns the configured callback URL, if any.
     pub fn callback_url(&self) -> Option<&str> {
         self.callback_url.as_deref()
+    }
+
+    /// Returns the configured HMAC secret, if any.
+    pub fn secret(&self) -> Option<&str> {
+        self.secret.as_deref()
+    }
+
+    /// Returns the configured retry settings.
+    pub fn retry_config(&self) -> &WebhookRetryConfig {
+        &self.retry_config
     }
 }
 
@@ -91,6 +159,29 @@ impl PlatformAdapter for WebhookAdapter {
         self.callback_url.is_some()
     }
 
+    fn verify_inbound(&self, signature: Option<&str>, payload: &[u8]) -> Result<(), AdapterError> {
+        let Some(ref secret) = self.secret else {
+            // No secret configured: verification is a no-op and accepts all inbound payloads.
+            return Ok(());
+        };
+
+        let Some(sig) = signature.filter(|s| !s.trim().is_empty()) else {
+            return Err(AdapterError::Authentication {
+                platform: self.platform.clone(),
+                reason: "missing signature header (expected X-Hub-Signature-256 or X-Kanon-Signature)".to_string(),
+            });
+        };
+
+        if !verify_hmac_sha256(secret.as_bytes(), payload, sig) {
+            return Err(AdapterError::Authentication {
+                platform: self.platform.clone(),
+                reason: "HMAC-SHA256 signature verification failed".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
     async fn deliver(
         &self,
         request: DeliverMessageRequest,
@@ -103,42 +194,106 @@ impl PlatformAdapter for WebhookAdapter {
         };
 
         let payload = WebhookPayload::from_request(&request);
+        let payload_bytes = serde_json::to_vec(&payload).map_err(|err| AdapterError::Delivery {
+            platform: self.platform.clone(),
+            reason: format!("failed to serialize webhook payload: {err}"),
+        })?;
 
-        let response =
-            self.client
+        // Attach HMAC signature header when secret is configured
+        let signature_header = self.secret.as_ref().map(|sec| {
+            let sig = sign_hmac_sha256(sec.as_bytes(), &payload_bytes);
+            format!("sha256={sig}")
+        });
+
+        let mut attempt = 0;
+        let max_retries = self.retry_config.max_retries;
+        let mut backoff = self.retry_config.initial_backoff;
+
+        loop {
+            let mut req_builder = self
+                .client
                 .post(callback_url)
-                .json(&payload)
-                .send()
-                .await
-                .map_err(|err| AdapterError::Delivery {
-                    platform: self.platform.clone(),
-                    reason: format!("POST {callback_url} failed: {err}"),
-                })?;
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(payload_bytes.clone());
 
-        let status = response.status();
-        if !status.is_success() {
-            // Read the body for diagnostics, but never let a huge error page blow up the log.
-            let body = response.text().await.unwrap_or_default();
-            let excerpt: String = body.chars().take(256).collect();
-            return Err(AdapterError::Delivery {
-                platform: self.platform.clone(),
-                reason: format!("callback returned HTTP {status}: {excerpt}"),
-            });
+            if let Some(ref sig) = signature_header {
+                req_builder = req_builder
+                    .header("x-hub-signature-256", sig.as_str())
+                    .header("x-kanon-signature", sig.as_str());
+            }
+
+            match req_builder.send().await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status.is_success() {
+                        // The callback may answer with a message id; any 2xx without a body still counts
+                        // as delivered, so parsing failure is not treated as a delivery failure.
+                        let message_id = response
+                            .json::<WebhookAck>()
+                            .await
+                            .map(|ack| ack.message_id)
+                            .unwrap_or_default();
+
+                        return Ok(DeliverMessageResponse {
+                            success: true,
+                            message_id,
+                            error_message: String::new(),
+                        });
+                    }
+
+                    // 4xx client errors (except 429 Too Many Requests) are permanent faults: do NOT retry
+                    let is_transient = status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                    let body = response.text().await.unwrap_or_default();
+                    let excerpt: String = body.chars().take(256).collect();
+
+                    if !is_transient || attempt >= max_retries {
+                        return Err(AdapterError::Delivery {
+                            platform: self.platform.clone(),
+                            reason: format!(
+                                "callback returned HTTP {status} (attempt {}/{}): {excerpt}",
+                                attempt + 1,
+                                max_retries + 1
+                            ),
+                        });
+                    }
+
+                    tracing::warn!(
+                        platform = %self.platform,
+                        attempt = attempt + 1,
+                        max_retries = max_retries,
+                        status = %status,
+                        backoff_ms = backoff.as_millis(),
+                        "Transient HTTP failure; backing off and retrying"
+                    );
+                }
+                Err(err) => {
+                    // Network errors (connection refused, reset, timeout) are transient
+                    if attempt >= max_retries {
+                        return Err(AdapterError::Delivery {
+                            platform: self.platform.clone(),
+                            reason: format!(
+                                "POST {callback_url} failed after {} attempts: {err}",
+                                attempt + 1
+                            ),
+                        });
+                    }
+
+                    tracing::warn!(
+                        platform = %self.platform,
+                        attempt = attempt + 1,
+                        max_retries = max_retries,
+                        error = %err,
+                        backoff_ms = backoff.as_millis(),
+                        "Network failure during delivery; backing off and retrying"
+                    );
+                }
+            }
+
+            // Exponential backoff sleep before next attempt
+            tokio::time::sleep(backoff).await;
+            backoff = backoff.saturating_mul(2);
+            attempt += 1;
         }
-
-        // The callback may answer with a message id; any 2xx without a body still counts as
-        // delivered, so parsing failure is not treated as a delivery failure.
-        let message_id = response
-            .json::<WebhookAck>()
-            .await
-            .map(|ack| ack.message_id)
-            .unwrap_or_default();
-
-        Ok(DeliverMessageResponse {
-            success: true,
-            message_id,
-            error_message: String::new(),
-        })
     }
 
     async fn start(&self, _ingress: EventIngress) -> Result<(), AdapterError> {
@@ -146,6 +301,46 @@ impl PlatformAdapter for WebhookAdapter {
         // spawn. Reporting a started loop here would be a lie.
         Ok(())
     }
+}
+
+/// Verifies an HMAC-SHA256 signature for a payload.
+///
+/// Strips optional `sha256=` prefix and compares in constant time using `ring::hmac::verify`.
+pub fn verify_hmac_sha256(secret: &[u8], payload: &[u8], signature: &str) -> bool {
+    let raw_hex = signature.trim().strip_prefix("sha256=").unwrap_or(signature.trim());
+    let Ok(sig_bytes) = decode_hex(raw_hex) else {
+        return false;
+    };
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+    ring::hmac::verify(&key, payload, &sig_bytes).is_ok()
+}
+
+/// Generates an HMAC-SHA256 signature hex string for a payload.
+pub fn sign_hmac_sha256(secret: &[u8], payload: &[u8]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+    let tag = ring::hmac::sign(&key, payload);
+    encode_hex(tag.as_ref())
+}
+
+/// Decodes an even-length hexadecimal string into raw bytes.
+fn decode_hex(hex: &str) -> Result<Vec<u8>, ()> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(());
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).map_err(|_| ()))
+        .collect()
+}
+
+/// Formats raw bytes into a lowercase hexadecimal string.
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
 }
 
 /// JSON payload POSTed to the callback URL.

@@ -12,38 +12,42 @@ async fn test_sqlite_memory_in_memory_isolation_and_prompts() {
     // Configure distinct sessions
     memory
         .set_system_prompt("session_a", "System persona for A".to_string())
-        .await;
+        .await
+        .unwrap();
     memory
         .set_system_prompt("session_b", "System persona for B".to_string())
-        .await;
+        .await
+        .unwrap();
 
     memory
         .push_message("session_a", ChatMessage::user("Hello A"))
-        .await;
+        .await
+        .unwrap();
     memory
         .push_message("session_b", ChatMessage::user("Hello B"))
-        .await;
+        .await
+        .unwrap();
 
     // Verify session isolation
     assert_eq!(
-        memory.get_system_prompt("session_a").await.as_deref(),
+        memory.get_system_prompt("session_a").await.unwrap().as_deref(),
         Some("System persona for A")
     );
     assert_eq!(
-        memory.get_system_prompt("session_b").await.as_deref(),
+        memory.get_system_prompt("session_b").await.unwrap().as_deref(),
         Some("System persona for B")
     );
 
-    let msgs_a = memory.get_messages("session_a").await;
+    let msgs_a = memory.get_messages("session_a").await.unwrap();
     assert_eq!(msgs_a.len(), 2); // System prompt + User message
     assert_eq!(msgs_a[0].role, Role::System);
     assert_eq!(msgs_a[1].content.as_deref(), Some("Hello A"));
 
-    let msgs_b = memory.get_messages("session_b").await;
+    let msgs_b = memory.get_messages("session_b").await.unwrap();
     assert_eq!(msgs_b.len(), 2);
     assert_eq!(msgs_b[1].content.as_deref(), Some("Hello B"));
 
-    assert_eq!(memory.session_count().await, 2);
+    assert_eq!(memory.session_count().await.unwrap(), 2);
 }
 
 #[tokio::test]
@@ -56,11 +60,13 @@ async fn test_sqlite_memory_file_persistence_and_reload() {
         let memory = SqliteMemory::open(&db_path, 10).expect("Failed to open SQLite database");
         memory
             .set_system_prompt("sess_tools", "You are a weather bot.".to_string())
-            .await;
+            .await
+            .unwrap();
 
         memory
             .push_message("sess_tools", ChatMessage::user("Check weather in Tokyo"))
-            .await;
+            .await
+            .unwrap();
 
         let tool_call = ToolCall {
             id: "call_tokyo_001".to_string(),
@@ -72,21 +78,24 @@ async fn test_sqlite_memory_file_persistence_and_reload() {
                 "sess_tools",
                 ChatMessage::assistant_tool_calls(vec![tool_call], None),
             )
-            .await;
+            .await
+            .unwrap();
 
         memory
             .push_message(
                 "sess_tools",
                 ChatMessage::tool_response("call_tokyo_001", r#"{"temp": 18, "condition": "Cloudy"}"#),
             )
-            .await;
+            .await
+            .unwrap();
 
         memory
             .push_message(
                 "sess_tools",
                 ChatMessage::assistant("It is currently 18°C and cloudy in Tokyo."),
             )
-            .await;
+            .await
+            .unwrap();
     }
 
     // Phase 2: Open a fresh SqliteMemory instance on the persisted database file
@@ -94,11 +103,11 @@ async fn test_sqlite_memory_file_persistence_and_reload() {
         let reloaded = SqliteMemory::open(&db_path, 10).expect("Failed to reload SQLite database");
 
         assert_eq!(
-            reloaded.get_system_prompt("sess_tools").await.as_deref(),
+            reloaded.get_system_prompt("sess_tools").await.unwrap().as_deref(),
             Some("You are a weather bot.")
         );
 
-        let messages = reloaded.get_messages("sess_tools").await;
+        let messages = reloaded.get_messages("sess_tools").await.unwrap();
         // Total messages: 1 system prompt + 1 user + 1 assistant tool call + 1 tool response + 1 assistant final = 5
         assert_eq!(messages.len(), 5);
 
@@ -133,18 +142,20 @@ async fn test_sqlite_memory_sliding_window_pruning() {
     let memory = SqliteMemory::open(&db_path, 3).expect("Failed to open SQLite database");
     memory
         .set_system_prompt("sess_prune", "Fixed System Prompt".to_string())
-        .await;
+        .await
+        .unwrap();
 
     // Push 5 user messages
     for i in 1..=5 {
         memory
             .push_message("sess_prune", ChatMessage::user(format!("Message {i}")))
-            .await;
+            .await
+            .unwrap();
     }
 
     // The in-memory cache and persisted SQLite should retain:
     // System Prompt + last 3 messages ("Message 3", "Message 4", "Message 5")
-    let msgs = memory.get_messages("sess_prune").await;
+    let msgs = memory.get_messages("sess_prune").await.unwrap();
     assert_eq!(msgs.len(), 4); // 1 system + 3 windowed
     assert_eq!(msgs[0].role, Role::System);
     assert_eq!(msgs[1].content.as_deref(), Some("Message 3"));
@@ -153,7 +164,7 @@ async fn test_sqlite_memory_sliding_window_pruning() {
 
     // Reload from disk to verify SQLite was pruned synchronously
     let reloaded = SqliteMemory::open(&db_path, 3).expect("Failed to reload SQLite database");
-    let disk_msgs = reloaded.get_messages("sess_prune").await;
+    let disk_msgs = reloaded.get_messages("sess_prune").await.unwrap();
     assert_eq!(disk_msgs.len(), 4);
     assert_eq!(disk_msgs[1].content.as_deref(), Some("Message 3"));
     assert_eq!(disk_msgs[3].content.as_deref(), Some("Message 5"));
@@ -168,7 +179,8 @@ async fn test_sqlite_memory_token_budget_pruning() {
 
     memory
         .set_system_prompt("sess_budget", "System".to_string())
-        .await;
+        .await
+        .unwrap();
 
     // Push messages that will exceed the 40 token budget
     for i in 1..=10 {
@@ -177,7 +189,8 @@ async fn test_sqlite_memory_token_budget_pruning() {
                 "sess_budget",
                 ChatMessage::user(format!("Long sentence payload token test number {i}")),
             )
-            .await;
+            .await
+            .unwrap();
     }
 
     let estimated = memory.estimated_tokens("sess_budget").await;
@@ -186,7 +199,7 @@ async fn test_sqlite_memory_token_budget_pruning() {
         "Estimated tokens {estimated} should be within budget 40"
     );
 
-    let msgs = memory.get_messages("sess_budget").await;
+    let msgs = memory.get_messages("sess_budget").await.unwrap();
     // System prompt is retained
     assert_eq!(msgs[0].role, Role::System);
     // Recent messages are kept
@@ -197,15 +210,15 @@ async fn test_sqlite_memory_token_budget_pruning() {
 async fn test_sqlite_memory_clear_and_session_count() {
     let memory = SqliteMemory::open_in_memory(10).expect("Failed to open SQLite database");
 
-    memory.push_message("s1", ChatMessage::user("Hello 1")).await;
-    memory.push_message("s2", ChatMessage::user("Hello 2")).await;
+    memory.push_message("s1", ChatMessage::user("Hello 1")).await.unwrap();
+    memory.push_message("s2", ChatMessage::user("Hello 2")).await.unwrap();
 
-    assert_eq!(memory.session_count().await, 2);
+    assert_eq!(memory.session_count().await.unwrap(), 2);
 
-    memory.clear("s1").await;
-    assert_eq!(memory.session_count().await, 1);
-    assert!(memory.get_messages("s1").await.is_empty());
-    assert_eq!(memory.get_messages("s2").await.len(), 1);
+    memory.clear("s1").await.unwrap();
+    assert_eq!(memory.session_count().await.unwrap(), 1);
+    assert!(memory.get_messages("s1").await.unwrap().is_empty());
+    assert_eq!(memory.get_messages("s2").await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -221,30 +234,30 @@ async fn test_sqlite_memory_lru_cache_eviction_and_reload() {
     assert_eq!(memory.cache_capacity(), 2);
 
     // Populate session 1
-    memory.set_system_prompt("s1", "Prompt 1".to_string()).await;
-    memory.push_message("s1", ChatMessage::user("Hello from 1")).await;
+    memory.set_system_prompt("s1", "Prompt 1".to_string()).await.unwrap();
+    memory.push_message("s1", ChatMessage::user("Hello from 1")).await.unwrap();
 
     // Populate session 2
-    memory.set_system_prompt("s2", "Prompt 2".to_string()).await;
-    memory.push_message("s2", ChatMessage::user("Hello from 2")).await;
+    memory.set_system_prompt("s2", "Prompt 2".to_string()).await.unwrap();
+    memory.push_message("s2", ChatMessage::user("Hello from 2")).await.unwrap();
 
     // Populate session 3 (this triggers LRU eviction of the least recently used session, s1)
-    memory.set_system_prompt("s3", "Prompt 3".to_string()).await;
-    memory.push_message("s3", ChatMessage::user("Hello from 3")).await;
+    memory.set_system_prompt("s3", "Prompt 3".to_string()).await.unwrap();
+    memory.push_message("s3", ChatMessage::user("Hello from 3")).await.unwrap();
 
     // Total sessions tracked in SQLite is 3
-    assert_eq!(memory.session_count().await, 3);
+    assert_eq!(memory.session_count().await.unwrap(), 3);
 
     // Now query s1: It was evicted from RAM cache, but should be transparently
     // reloaded from SQLite back into cache
-    let s1_msgs = memory.get_messages("s1").await;
+    let s1_msgs = memory.get_messages("s1").await.unwrap();
     assert_eq!(s1_msgs.len(), 2);
     assert_eq!(s1_msgs[0].role, Role::System);
     assert_eq!(s1_msgs[0].content.as_deref(), Some("Prompt 1"));
     assert_eq!(s1_msgs[1].content.as_deref(), Some("Hello from 1"));
 
     // Query s3: Should also still be valid
-    let s3_msgs = memory.get_messages("s3").await;
+    let s3_msgs = memory.get_messages("s3").await.unwrap();
     assert_eq!(s3_msgs.len(), 2);
     assert_eq!(s3_msgs[1].content.as_deref(), Some("Hello from 3"));
 }
@@ -263,16 +276,74 @@ async fn test_sqlite_memory_open_in_dir_and_commit_points() {
     assert!(nested_dir.exists(), "Directory should have been automatically created");
     assert!(nested_dir.join("plugin_memory.db").exists(), "DB file should exist");
 
-    memory.set_system_prompt("commit_sess", "Persistent Persona".to_string()).await;
-    memory.push_message("commit_sess", ChatMessage::user("Testing commit")).await;
+    memory.set_system_prompt("commit_sess", "Persistent Persona".to_string()).await.unwrap();
+    memory.push_message("commit_sess", ChatMessage::user("Testing commit")).await.unwrap();
 
     // Test commit point and session commit
     memory.commit_point().await.expect("WAL checkpoint commit failed");
     memory.flush().await.expect("Flush failed");
     memory.commit_session("commit_sess").await.expect("Session commit failed");
 
-    let msgs = memory.get_messages("commit_sess").await;
+    let msgs = memory.get_messages("commit_sess").await.unwrap();
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[1].content.as_deref(), Some("Testing commit"));
+}
+
+#[tokio::test]
+async fn test_sqlite_memory_atomic_replace_history() {
+    let dir = tempdir().expect("Failed to create temporary directory");
+    let db_path = dir.path().join("atomic_replace.db");
+
+    let memory = SqliteMemory::open(&db_path, 10).expect("Failed to open SQLite database");
+    memory
+        .set_system_prompt("sess_atomic", "Original System".to_string())
+        .await
+        .unwrap();
+
+    for i in 1..=5 {
+        memory
+            .push_message("sess_atomic", ChatMessage::user(format!("Old Message {i}")))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(memory.get_messages("sess_atomic").await.unwrap().len(), 6);
+
+    // Atomically replace history with new system prompt and a compact summary message
+    let compacted_messages = vec![
+        ChatMessage::assistant("Summary of previous conversation: discussed items 1 to 5."),
+        ChatMessage::user("New question based on summary"),
+    ];
+
+    memory
+        .replace_history(
+            "sess_atomic",
+            Some("Updated System with context".to_string()),
+            compacted_messages,
+        )
+        .await
+        .unwrap();
+
+    // Verify cache has been atomically updated
+    let msgs = memory.get_messages("sess_atomic").await.unwrap();
+    assert_eq!(msgs.len(), 3); // 1 system + 2 messages
+    assert_eq!(msgs[0].role, Role::System);
+    assert_eq!(msgs[0].content.as_deref(), Some("Updated System with context"));
+    assert_eq!(
+        msgs[1].content.as_deref(),
+        Some("Summary of previous conversation: discussed items 1 to 5.")
+    );
+    assert_eq!(
+        msgs[2].content.as_deref(),
+        Some("New question based on summary")
+    );
+
+    // Verify disk has also been atomically updated by reloading
+    let reloaded = SqliteMemory::open(&db_path, 10).expect("Failed to reload SQLite database");
+    let disk_msgs = reloaded.get_messages("sess_atomic").await.unwrap();
+    assert_eq!(disk_msgs.len(), 3);
+    assert_eq!(disk_msgs[0].content.as_deref(), Some("Updated System with context"));
+    assert_eq!(disk_msgs[1].content.as_deref(), Some("Summary of previous conversation: discussed items 1 to 5."));
+    assert_eq!(disk_msgs[2].content.as_deref(), Some("New question based on summary"));
 }
 

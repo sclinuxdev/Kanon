@@ -234,7 +234,7 @@ async fn test_agent_run_standalone_stream() {
     assert_eq!(accumulated, "Token 1, Token 2, Token 3");
 
     // Verify that memory automatically committed the assistant's response upon stream finish
-    let messages = memory.get_messages(session_id).await;
+    let messages = memory.get_messages(session_id).await.unwrap();
     assert_eq!(messages.len(), 3); // 1 System + 1 User + 1 Assistant
     assert_eq!(messages[0].role, kanon_llm::gateway::types::Role::System);
     assert_eq!(messages[1].role, kanon_llm::gateway::types::Role::User);

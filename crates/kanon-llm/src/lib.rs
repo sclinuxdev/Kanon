@@ -23,7 +23,7 @@ pub use agent::{
     Agent, AgentBuilder, AgentConfig, AgentHook, AgentOutput, AgentTool, NativeTool,
     NativeToolFn, NoopHost,
 };
-pub use error::{AgentError, GatewayError, ToolRouterError};
+pub use error::{AgentError, GatewayError, MemoryError, ToolRouterError};
 pub use gateway::providers::{
     AnthropicMessagesProvider, AnthropicProvider, OpenAiChatProvider, OpenAiProvider,
     OpenAiResponsesProvider, SseDecoder, SseEvent,

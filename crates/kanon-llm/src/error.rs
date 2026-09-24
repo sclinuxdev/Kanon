@@ -87,3 +87,26 @@ impl From<ToolRouterError> for AgentError {
         }
     }
 }
+
+/// Errors arising during conversation memory operations.
+#[derive(Debug, Error)]
+pub enum MemoryError {
+    /// Embedded SQLite database failure.
+    #[error("SQLite memory error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+
+    /// Serialization or JSON parsing error.
+    #[error("Memory serialization error: {0}")]
+    Serialization(String),
+
+    /// Other memory operational failure.
+    #[error("Memory backend failure: {0}")]
+    Backend(String),
+}
+
+impl From<MemoryError> for AgentError {
+    fn from(err: MemoryError) -> Self {
+        Self::Memory(err.to_string())
+    }
+}
+

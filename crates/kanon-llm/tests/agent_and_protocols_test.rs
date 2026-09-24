@@ -13,7 +13,7 @@ use kanon_llm::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role, To
 use kanon_llm::gateway::LlmProvider;
 use kanon_llm::memory::Memory;
 use kanon_llm::tool_router::{json_to_prost_struct, prost_struct_to_json, ToolHost};
-use kanon_llm::{AgentError, GatewayError};
+use kanon_llm::{AgentError, GatewayError, MemoryError};
 use kanon_proto::v1::{
     tool_call_request, tool_call_response, PluginMeta, ToolCallRequest, ToolCallResponse, ToolMeta,
 };
@@ -120,33 +120,36 @@ impl CustomPluginMemory {
 
 #[async_trait]
 impl Memory for CustomPluginMemory {
-    async fn push_message(&self, _session_key: &str, message: ChatMessage) {
+    async fn push_message(&self, _session_key: &str, message: ChatMessage) -> Result<(), MemoryError> {
         self.stored_messages.write().await.push(message);
+        Ok(())
     }
 
-    async fn set_system_prompt(&self, _session_key: &str, prompt: String) {
+    async fn set_system_prompt(&self, _session_key: &str, prompt: String) -> Result<(), MemoryError> {
         *self.system_prompt.write().await = Some(prompt);
+        Ok(())
     }
 
-    async fn get_system_prompt(&self, _session_key: &str) -> Option<String> {
-        self.system_prompt.read().await.clone()
+    async fn get_system_prompt(&self, _session_key: &str) -> Result<Option<String>, MemoryError> {
+        Ok(self.system_prompt.read().await.clone())
     }
 
-    async fn get_messages(&self, _session_key: &str) -> Vec<ChatMessage> {
+    async fn get_messages(&self, _session_key: &str) -> Result<Vec<ChatMessage>, MemoryError> {
         let mut list = Vec::new();
         if let Some(ref sys) = *self.system_prompt.read().await {
             list.push(ChatMessage::system(sys.clone()));
         }
         list.extend(self.stored_messages.read().await.clone());
-        list
+        Ok(list)
     }
 
-    async fn clear(&self, _session_key: &str) {
+    async fn clear(&self, _session_key: &str) -> Result<(), MemoryError> {
         self.stored_messages.write().await.clear();
+        Ok(())
     }
 
-    async fn session_count(&self) -> usize {
-        1
+    async fn session_count(&self) -> Result<usize, MemoryError> {
+        Ok(1)
     }
 }
 
@@ -269,7 +272,7 @@ async fn test_agent_builder_and_execution_with_custom_memory() {
     assert!(output.executed_tools[0].success);
 
     // Verify custom memory received all messages correctly
-    let history = custom_memory.get_messages("sess_custom").await;
+    let history = custom_memory.get_messages("sess_custom").await.unwrap();
     assert_eq!(history.len(), 5);
     assert_eq!(history[0].role, Role::System);
     assert_eq!(history[1].role, Role::User);

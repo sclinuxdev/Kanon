@@ -11,6 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 
+use crate::error::MemoryError;
 use crate::gateway::types::{ChatMessage, Role};
 
 /// Pluggable interface for conversational memory backends.
@@ -20,29 +21,49 @@ use crate::gateway::types::{ChatMessage, Role};
 #[async_trait]
 pub trait Memory: Send + Sync {
     /// Appends a message to the specified session history.
-    async fn push_message(&self, session_key: &str, message: ChatMessage);
+    async fn push_message(&self, session_key: &str, message: ChatMessage) -> Result<(), MemoryError>;
 
     /// Appends multiple messages in sequence.
-    async fn extend_messages(&self, session_key: &str, messages: Vec<ChatMessage>) {
+    async fn extend_messages(&self, session_key: &str, messages: Vec<ChatMessage>) -> Result<(), MemoryError> {
         for msg in messages {
-            self.push_message(session_key, msg).await;
+            self.push_message(session_key, msg).await?;
         }
+        Ok(())
     }
 
     /// Sets or updates the system persona prompt for a session.
-    async fn set_system_prompt(&self, session_key: &str, prompt: String);
+    async fn set_system_prompt(&self, session_key: &str, prompt: String) -> Result<(), MemoryError>;
 
     /// Returns the active system prompt for a session if configured.
-    async fn get_system_prompt(&self, session_key: &str) -> Option<String>;
+    async fn get_system_prompt(&self, session_key: &str) -> Result<Option<String>, MemoryError>;
 
     /// Retrieves a complete snapshot of conversation messages for a session (including system prompt).
-    async fn get_messages(&self, session_key: &str) -> Vec<ChatMessage>;
+    async fn get_messages(&self, session_key: &str) -> Result<Vec<ChatMessage>, MemoryError>;
 
     /// Clears conversation history for the specified session.
-    async fn clear(&self, session_key: &str);
+    async fn clear(&self, session_key: &str) -> Result<(), MemoryError>;
 
     /// Returns the count of active sessions tracked by this backend.
-    async fn session_count(&self) -> usize;
+    async fn session_count(&self) -> Result<usize, MemoryError>;
+
+    /// Atomically replaces the conversation history for a session.
+    ///
+    /// Implementations backed by relational or transactional storage (such as [`SqliteMemory`])
+    /// must execute this within a single transactional boundary, ensuring that previous history
+    /// is preserved intact if any failure occurs during replacement.
+    async fn replace_history(
+        &self,
+        session_key: &str,
+        system_prompt: Option<String>,
+        messages: Vec<ChatMessage>,
+    ) -> Result<(), MemoryError> {
+        self.clear(session_key).await?;
+        if let Some(prompt) = system_prompt {
+            self.set_system_prompt(session_key, prompt).await?;
+        }
+        self.extend_messages(session_key, messages).await?;
+        Ok(())
+    }
 }
 
 /// In-memory conversational state for an individual conversation session.
@@ -291,61 +312,91 @@ impl SlidingWindowMemory {
 
 #[async_trait]
 impl Memory for SlidingWindowMemory {
-    async fn push_message(&self, session_key: &str, message: ChatMessage) {
+    async fn push_message(&self, session_key: &str, message: ChatMessage) -> Result<(), MemoryError> {
         self.push_message_sync(session_key, message);
+        Ok(())
     }
 
-    async fn set_system_prompt(&self, session_key: &str, prompt: String) {
+    async fn set_system_prompt(&self, session_key: &str, prompt: String) -> Result<(), MemoryError> {
         self.set_system_prompt_sync(session_key, prompt);
+        Ok(())
     }
 
-    async fn get_system_prompt(&self, session_key: &str) -> Option<String> {
-        self.sessions
+    async fn get_system_prompt(&self, session_key: &str) -> Result<Option<String>, MemoryError> {
+        Ok(self.sessions
             .get(session_key)
-            .and_then(|s| s.system_prompt().map(|p| p.to_string()))
+            .and_then(|s| s.system_prompt().map(|p| p.to_string())))
     }
 
-    async fn get_messages(&self, session_key: &str) -> Vec<ChatMessage> {
-        self.get_messages_sync(session_key)
+    async fn get_messages(&self, session_key: &str) -> Result<Vec<ChatMessage>, MemoryError> {
+        Ok(self.get_messages_sync(session_key))
     }
 
-    async fn clear(&self, session_key: &str) {
+    async fn clear(&self, session_key: &str) -> Result<(), MemoryError> {
         self.clear_sync(session_key);
+        Ok(())
     }
 
-    async fn session_count(&self) -> usize {
-        self.session_count_sync()
+    async fn session_count(&self) -> Result<usize, MemoryError> {
+        Ok(self.session_count_sync())
+    }
+
+    async fn replace_history(
+        &self,
+        session_key: &str,
+        system_prompt: Option<String>,
+        messages: Vec<ChatMessage>,
+    ) -> Result<(), MemoryError> {
+        let mut session = self
+            .sessions
+            .entry(session_key.to_string())
+            .or_insert_with(|| SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens));
+        session.clear_messages();
+        if let Some(prompt) = system_prompt {
+            session.set_system_prompt(prompt);
+        }
+        session.extend_messages(messages);
+        Ok(())
     }
 }
 
 #[async_trait]
 impl Memory for Arc<dyn Memory> {
-    async fn push_message(&self, session_key: &str, message: ChatMessage) {
-        (**self).push_message(session_key, message).await;
+    async fn push_message(&self, session_key: &str, message: ChatMessage) -> Result<(), MemoryError> {
+        (**self).push_message(session_key, message).await
     }
 
-    async fn extend_messages(&self, session_key: &str, messages: Vec<ChatMessage>) {
-        (**self).extend_messages(session_key, messages).await;
+    async fn extend_messages(&self, session_key: &str, messages: Vec<ChatMessage>) -> Result<(), MemoryError> {
+        (**self).extend_messages(session_key, messages).await
     }
 
-    async fn set_system_prompt(&self, session_key: &str, prompt: String) {
-        (**self).set_system_prompt(session_key, prompt).await;
+    async fn set_system_prompt(&self, session_key: &str, prompt: String) -> Result<(), MemoryError> {
+        (**self).set_system_prompt(session_key, prompt).await
     }
 
-    async fn get_system_prompt(&self, session_key: &str) -> Option<String> {
+    async fn get_system_prompt(&self, session_key: &str) -> Result<Option<String>, MemoryError> {
         (**self).get_system_prompt(session_key).await
     }
 
-    async fn get_messages(&self, session_key: &str) -> Vec<ChatMessage> {
+    async fn get_messages(&self, session_key: &str) -> Result<Vec<ChatMessage>, MemoryError> {
         (**self).get_messages(session_key).await
     }
 
-    async fn clear(&self, session_key: &str) {
-        (**self).clear(session_key).await;
+    async fn clear(&self, session_key: &str) -> Result<(), MemoryError> {
+        (**self).clear(session_key).await
     }
 
-    async fn session_count(&self) -> usize {
+    async fn session_count(&self) -> Result<usize, MemoryError> {
         (**self).session_count().await
+    }
+
+    async fn replace_history(
+        &self,
+        session_key: &str,
+        system_prompt: Option<String>,
+        messages: Vec<ChatMessage>,
+    ) -> Result<(), MemoryError> {
+        (**self).replace_history(session_key, system_prompt, messages).await
     }
 }
 

@@ -32,13 +32,13 @@ async fn test_memory_trait_interface() {
     let memory: Arc<dyn Memory> = Arc::new(SlidingWindowMemory::new(10));
     let key = SlidingWindowMemory::make_session_key("chan_1", "user_alice");
 
-    memory.push_message(&key, ChatMessage::user("Hello")).await;
-    memory.push_message(&key, ChatMessage::assistant("Hi Alice!")).await;
+    memory.push_message(&key, ChatMessage::user("Hello")).await.unwrap();
+    memory.push_message(&key, ChatMessage::assistant("Hi Alice!")).await.unwrap();
 
-    let history = memory.get_messages(&key).await;
+    let history = memory.get_messages(&key).await.unwrap();
     assert_eq!(history.len(), 2);
-    assert_eq!(memory.session_count().await, 1);
+    assert_eq!(memory.session_count().await.unwrap(), 1);
 
-    memory.clear(&key).await;
-    assert_eq!(memory.session_count().await, 0);
+    memory.clear(&key).await.unwrap();
+    assert_eq!(memory.session_count().await.unwrap(), 0);
 }

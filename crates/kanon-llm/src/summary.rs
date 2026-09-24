@@ -68,6 +68,11 @@ impl ContextSummarizer {
         &self.config
     }
 
+    /// Reference to the underlying memory backend.
+    pub fn memory(&self) -> &Arc<dyn Memory> {
+        &self.memory
+    }
+
     /// Evaluates the session conversation token budget and applies summary compression if exceeded.
     ///
     /// Returns `Ok(true)` if summarization occurred, or `Ok(false)` if the conversation
@@ -77,7 +82,7 @@ impl ContextSummarizer {
             return Ok(false);
         }
 
-        let messages = self.memory.get_messages(session_key).await;
+        let messages = self.memory.get_messages(session_key).await?;
         if messages.len() <= self.config.preserve_recent_messages + 1 {
             return Ok(false);
         }
@@ -159,13 +164,7 @@ impl ContextSummarizer {
 
         // Reconstruct conversation history:
         // [Existing System Prompt (if any)] + [Summary Context Message] + [Preserved Recent Messages]
-        let system_prompt = self.memory.get_system_prompt(session_key).await;
-
-        self.memory.clear(session_key).await;
-
-        if let Some(prompt) = system_prompt {
-            self.memory.set_system_prompt(session_key, prompt).await;
-        }
+        let system_prompt = self.memory.get_system_prompt(session_key).await?;
 
         let summary_message = ChatMessage::system(format!(
             "--- Context Summary of Previous Conversation ---\n{summary_text}\n--- End Summary ---"
@@ -175,7 +174,9 @@ impl ContextSummarizer {
         compacted.push(summary_message);
         compacted.extend(recent_messages.iter().cloned());
 
-        self.memory.extend_messages(session_key, compacted).await;
+        // Atomically replace history in a single transaction, eliminating the destructive
+        // clear-and-insert vulnerability window where history could be permanently lost!
+        self.memory.replace_history(session_key, system_prompt, compacted).await?;
 
         Ok(true)
     }
@@ -196,8 +197,14 @@ impl SummaryHook {
 
 #[async_trait]
 impl AgentHook for SummaryHook {
-    async fn on_llm_request(&self, session_id: &str, _request: &mut ChatRequest) -> Result<(), AgentError> {
-        let _ = self.summarizer.compress_session(session_id).await?;
+    async fn on_llm_request(&self, session_id: &str, request: &mut ChatRequest) -> Result<(), AgentError> {
+        let did_compress = self.summarizer.compress_session(session_id).await?;
+        if did_compress {
+            // When compression occurs, immediately update outbound request.messages
+            // so the current LLM turn receives the freshly compacted context instead
+            // of the oversized pre-compressed messages!
+            request.messages = self.summarizer.memory().get_messages(session_id).await?;
+        }
         Ok(())
     }
 }

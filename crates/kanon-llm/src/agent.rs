@@ -267,15 +267,15 @@ impl Agent {
     ) -> Result<AgentOutput, AgentError> {
         // 1. Ensure system prompt is established for this session if configured
         if let Some(ref prompt) = self.system_prompt
-            && self.memory.get_system_prompt(session_id).await.is_none()
+            && self.memory.get_system_prompt(session_id).await?.is_none()
         {
-            self.memory.set_system_prompt(session_id, prompt.clone()).await;
+            self.memory.set_system_prompt(session_id, prompt.clone()).await?;
         }
 
         // 2. Push user message to memory
         self.memory
             .push_message(session_id, ChatMessage::user(user_input))
-            .await;
+            .await?;
 
         // 3. Dynamically aggregate tools from both native tools and active plugin hosts
         let mut tools = Vec::with_capacity(self.tools.len());
@@ -289,7 +289,7 @@ impl Agent {
 
         // 4. Reasoning and tool execution loop
         loop {
-            let messages = self.memory.get_messages(session_id).await;
+            let messages = self.memory.get_messages(session_id).await?;
 
             let mut request = ChatRequest {
                 model: self.config.default_model.clone(),
@@ -317,7 +317,7 @@ impl Agent {
                 if !final_content.is_empty() {
                     self.memory
                         .push_message(session_id, ChatMessage::assistant(&final_content))
-                        .await;
+                        .await?;
                 }
                 return Ok(AgentOutput {
                     content: final_content,
@@ -340,7 +340,7 @@ impl Agent {
                 });
                 self.memory
                     .push_message(session_id, ChatMessage::assistant(&fallback))
-                    .await;
+                    .await?;
                 return Ok(AgentOutput {
                     content: fallback,
                     executed_tools,
@@ -363,7 +363,7 @@ impl Agent {
                         name: None,
                     },
                 )
-                .await;
+                .await?;
 
             // Execute each requested tool call
             for call in response.tool_calls {
@@ -380,7 +380,7 @@ impl Agent {
                     let veto_msg = format!("Tool '{}' execution was denied by agent policy", call.name);
                     self.memory
                         .push_message(session_id, ChatMessage::tool_response(&call.id, &veto_msg))
-                        .await;
+                        .await?;
                     executed_tools.push(ExecutedToolCall {
                         call_id: call.id,
                         tool_name: call.name.clone(),
@@ -413,7 +413,7 @@ impl Agent {
 
                     self.memory
                         .push_message(session_id, ChatMessage::tool_response(&call.id, &result_str))
-                        .await;
+                        .await?;
 
                     if !is_success && self.config.stop_on_tool_failure {
                         return Err(AgentError::Memory(format!("Native tool '{}' failed: {result_str}", call.name)));
@@ -434,7 +434,7 @@ impl Agent {
                                 session_id,
                                 ChatMessage::tool_response(&call.id, &err_msg),
                             )
-                            .await;
+                            .await?;
                         executed_tools.push(ExecutedToolCall {
                             call_id: call.id,
                             tool_name: call.name.clone(),
@@ -504,7 +504,7 @@ impl Agent {
                                 session_id,
                                 ChatMessage::tool_response(&call.id, result_str),
                             )
-                            .await;
+                            .await?;
 
                         if !is_success && self.config.stop_on_tool_failure {
                             tracing::warn!(tool = %call.name, "Tool reported failure and stop_on_tool_failure is enabled");
@@ -529,7 +529,7 @@ impl Agent {
                                     format!("RPC Error: {}", status.message()),
                                 ),
                             )
-                            .await;
+                            .await?;
 
                         if self.config.stop_on_tool_failure {
                             return Err(AgentError::from(status));
@@ -564,15 +564,15 @@ impl Agent {
     ) -> Result<ChatChunkStream, AgentError> {
         // 1. Ensure system prompt is established
         if let Some(ref prompt) = self.system_prompt
-            && self.memory.get_system_prompt(session_id).await.is_none()
+            && self.memory.get_system_prompt(session_id).await?.is_none()
         {
-            self.memory.set_system_prompt(session_id, prompt.clone()).await;
+            self.memory.set_system_prompt(session_id, prompt.clone()).await?;
         }
 
         // 2. Push user message to memory
         self.memory
             .push_message(session_id, ChatMessage::user(user_input))
-            .await;
+            .await?;
 
         // 3. Dynamically aggregate tools
         let mut tools = Vec::with_capacity(self.tools.len());
@@ -585,7 +585,7 @@ impl Agent {
 
         // If tools are available, execute intermediate tool turns first
         while !tools.is_empty() && iterations < self.config.max_iterations {
-            let messages = self.memory.get_messages(session_id).await;
+            let messages = self.memory.get_messages(session_id).await?;
             let mut request = ChatRequest {
                 model: self.config.default_model.clone(),
                 messages,
@@ -610,7 +610,7 @@ impl Agent {
                 if !final_content.is_empty() {
                     self.memory
                         .push_message(session_id, ChatMessage::assistant(&final_content))
-                        .await;
+                        .await?;
                 }
                 let (tx, rx) = tokio::sync::mpsc::channel(2);
                 let _ = tx.send(Ok(ChatChunk::delta(&final_content))).await;
@@ -631,7 +631,7 @@ impl Agent {
                         name: None,
                     },
                 )
-                .await;
+                .await?;
 
             for call in response.tool_calls {
                 let mut permitted = true;
@@ -645,7 +645,7 @@ impl Agent {
                     let veto_msg = format!("Tool '{}' execution was denied by agent policy", call.name);
                     self.memory
                         .push_message(session_id, ChatMessage::tool_response(&call.id, &veto_msg))
-                        .await;
+                        .await?;
                     continue;
                 }
 
@@ -659,7 +659,7 @@ impl Agent {
                     }
                     self.memory
                         .push_message(session_id, ChatMessage::tool_response(&call.id, &result_str))
-                        .await;
+                        .await?;
                     continue;
                 }
 
@@ -670,7 +670,7 @@ impl Agent {
                         let err_msg = format!("Tool '{}' not registered", call.name);
                         self.memory
                             .push_message(session_id, ChatMessage::tool_response(&call.id, &err_msg))
-                            .await;
+                            .await?;
                         continue;
                     }
                 };
@@ -715,20 +715,20 @@ impl Agent {
                         }
                         self.memory
                             .push_message(session_id, ChatMessage::tool_response(&call.id, result_str))
-                            .await;
+                            .await?;
                     }
                     Err(st) => {
                         let err_msg = format!("Tool RPC failed: {st}");
                         self.memory
                             .push_message(session_id, ChatMessage::tool_response(&call.id, &err_msg))
-                            .await;
+                            .await?;
                     }
                 }
             }
         }
 
         // Final streaming generation turn (pure assistant reply)
-        let messages = self.memory.get_messages(session_id).await;
+        let messages = self.memory.get_messages(session_id).await?;
         let mut request = ChatRequest {
             model: self.config.default_model.clone(),
             messages,
@@ -757,8 +757,10 @@ impl Agent {
                         let is_fin = chunk.is_finished;
                         let _ = tx.send(Ok(chunk)).await;
                         if is_fin {
-                            if !accumulated.is_empty() {
-                                memory.push_message(&sid, ChatMessage::assistant(&accumulated)).await;
+                            if !accumulated.is_empty()
+                                && let Err(e) = memory.push_message(&sid, ChatMessage::assistant(&accumulated)).await
+                            {
+                                tracing::error!(session_id = %sid, error = %e, "Failed to persist streaming assistant response to memory");
                             }
                             return;
                         }
@@ -770,8 +772,10 @@ impl Agent {
                 }
             }
 
-            if !accumulated.is_empty() {
-                memory.push_message(&sid, ChatMessage::assistant(&accumulated)).await;
+            if !accumulated.is_empty()
+                && let Err(e) = memory.push_message(&sid, ChatMessage::assistant(&accumulated)).await
+            {
+                tracing::error!(session_id = %sid, error = %e, "Failed to persist streaming assistant response to memory");
             }
         });
 

@@ -85,7 +85,8 @@ async fn test_context_summarizer_compression_lifecycle() {
     let session_id = "test_summary_session";
     memory
         .set_system_prompt(session_id, "Act as an expert math tutor.".to_string())
-        .await;
+        .await
+        .unwrap();
 
     // Fill the conversation with 8 turns
     for i in 1..=8 {
@@ -94,16 +95,18 @@ async fn test_context_summarizer_compression_lifecycle() {
                 session_id,
                 ChatMessage::user(format!("Can you please solve problem equation number {i} in detail?")),
             )
-            .await;
+            .await
+            .unwrap();
         memory
             .push_message(
                 session_id,
                 ChatMessage::assistant(format!("Here is the step by step detailed solution for {i}.")),
             )
-            .await;
+            .await
+            .unwrap();
     }
 
-    let initial_msgs = memory.get_messages(session_id).await;
+    let initial_msgs = memory.get_messages(session_id).await.unwrap();
     let initial_tokens = estimate_conversation_tokens(&initial_msgs);
     assert!(initial_tokens > 200);
 
@@ -123,7 +126,7 @@ async fn test_context_summarizer_compression_lifecycle() {
         .expect("Summarization failed");
     assert!(did_compress);
 
-    let compressed_msgs = memory.get_messages(session_id).await;
+    let compressed_msgs = memory.get_messages(session_id).await.unwrap();
 
     // Structure of compressed messages:
     // 0: System prompt ("Act as an expert math tutor.")
@@ -153,13 +156,15 @@ async fn test_summary_hook_with_agent_integration() {
     let session_id = "agent_hook_session";
     memory
         .set_system_prompt(session_id, "Agent Persona".to_string())
-        .await;
+        .await
+        .unwrap();
 
     // Pre-populate with older dialogue
     for i in 1..=6 {
         memory
             .push_message(session_id, ChatMessage::user(format!("History item {i}")))
-            .await;
+            .await
+            .unwrap();
     }
 
     let config = SummaryConfig {
@@ -186,10 +191,8 @@ async fn test_summary_hook_with_agent_integration() {
 
     assert_eq!(output.content, "Final assistant answer.");
 
-
-
     // Memory should contain compressed summary block + recent messages + latest query & response
-    let msgs = memory.get_messages(session_id).await;
+    let msgs = memory.get_messages(session_id).await.unwrap();
     assert!(msgs.iter().any(|m| m
         .content
         .as_deref()
@@ -205,12 +208,14 @@ async fn test_agent_builder_summary_config_fluent_api() {
     let session_id = "fluent_summary_session";
     memory
         .set_system_prompt(session_id, "Tutor".to_string())
-        .await;
+        .await
+        .unwrap();
 
     for i in 1..=6 {
         memory
             .push_message(session_id, ChatMessage::user(format!("Question {i}")))
-            .await;
+            .await
+            .unwrap();
     }
 
     // Use fluent .summary_config(...) directly on AgentBuilder
@@ -233,12 +238,116 @@ async fn test_agent_builder_summary_config_fluent_api() {
 
     assert_eq!(output.content, "Final assistant answer.");
 
-    let msgs = memory.get_messages(session_id).await;
+    let msgs = memory.get_messages(session_id).await.unwrap();
     assert!(msgs.iter().any(|m| m
         .content
         .as_deref()
         .map(|c| c.contains("Context Summary of Previous Conversation"))
         .unwrap_or(false)));
+}
+
+/// Verifies that `SummaryHook` modifies the in-flight `ChatRequest.messages` on the very
+/// first turn that exceeds the token budget, preventing the bloated uncompressed context
+/// from leaking to the model.
+#[tokio::test]
+async fn test_summary_hook_modifies_inflight_request_on_first_overbudget_turn() {
+    use tokio::sync::Mutex;
+
+    struct InFlightCapturingProvider {
+        captured_messages: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for InFlightCapturingProvider {
+        async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, GatewayError> {
+            let first_msg = request.messages.first().and_then(|m| m.content.as_deref()).unwrap_or_default();
+            if first_msg.contains("Provide a concise, factual summary") {
+                Ok(ChatResponse {
+                    content: Some("Summary of items 1 to 6.".to_string()),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".to_string()),
+                    usage: None,
+                })
+            } else {
+                // Record the actual messages passed to the main model call
+                self.captured_messages.lock().await.push(request.messages.clone());
+                Ok(ChatResponse {
+                    content: Some("Answer after compression.".to_string()),
+                    tool_calls: vec![],
+                    finish_reason: Some("stop".to_string()),
+                    usage: None,
+                })
+            }
+        }
+    }
+
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(InFlightCapturingProvider {
+        captured_messages: captured.clone(),
+    });
+
+    let memory: Arc<dyn Memory> = Arc::new(SlidingWindowMemory::new(50));
+    let session_id = "inflight_test_sess";
+
+    memory
+        .set_system_prompt(session_id, "System persona".to_string())
+        .await
+        .unwrap();
+
+    // Populate with 6 long dialogue turns so token budget is exceeded
+    for i in 1..=6 {
+        memory
+            .push_message(session_id, ChatMessage::user(format!("Lengthy user prompt {i} with lots of tokens")))
+            .await
+            .unwrap();
+        memory
+            .push_message(session_id, ChatMessage::assistant(format!("Lengthy assistant response {i} with tokens")))
+            .await
+            .unwrap();
+    }
+
+    let agent = Agent::builder("inflight_agent", provider)
+        .system_prompt("System persona")
+        .memory(memory.clone())
+        .summary_config(SummaryConfig {
+            enabled: true,
+            trigger_token_budget: 60, // Very low budget to trigger compression immediately
+            preserve_recent_messages: 2,
+            summary_model: None,
+            custom_instruction: None,
+        })
+        .build();
+
+    let output = agent
+        .run_standalone(session_id, "Latest inbound user message")
+        .await
+        .expect("Agent execution failed");
+
+    assert_eq!(output.content, "Answer after compression.");
+
+    let recorded = captured.lock().await;
+    assert_eq!(recorded.len(), 1, "Expected exactly 1 main chat request to be captured");
+
+    let inflight_messages = &recorded[0];
+    // Check that the in-flight request was compressed:
+    // It should have: 1 System prompt + 1 Summary block + 1 preserved assistant message + 1 latest user message = 4 messages
+    // (Instead of the uncompressed 1 System + 12 history turns + 1 latest user = 14 messages!)
+    assert_eq!(inflight_messages.len(), 4);
+    assert_eq!(inflight_messages[0].role, Role::System);
+    assert_eq!(inflight_messages[0].content.as_deref(), Some("System persona"));
+
+    // Second message in request must be the injected summary block
+    assert_eq!(inflight_messages[1].role, Role::System);
+    let summary_text = inflight_messages[1].content.as_deref().unwrap();
+    assert!(summary_text.contains("Context Summary of Previous Conversation"));
+    assert!(summary_text.contains("Summary of items 1 to 6."));
+
+    // Third message is preserved assistant turn 6
+    assert_eq!(inflight_messages[2].role, Role::Assistant);
+
+    // Last message in request must be the latest user input
+    assert_eq!(inflight_messages[3].role, Role::User);
+    assert_eq!(inflight_messages[3].content.as_deref(), Some("Latest inbound user message"));
 }
 
 

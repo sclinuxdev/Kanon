@@ -14,6 +14,8 @@ pub mod agent;
 pub mod error;
 pub mod gateway;
 pub mod memory;
+pub mod prompt;
+pub mod session;
 pub mod sqlite_memory;
 pub mod summary;
 pub mod token;
@@ -33,6 +35,12 @@ pub use gateway::{
     Role, TokenUsage, ToolCall, ToolDefinition,
 };
 pub use memory::{ConversationManager, Memory, SessionMemory, SlidingWindowMemory};
+pub use prompt::{
+    DynamicPromptHook, Persona, PersonaRegistry, PromptComposer, PromptTemplate,
+};
+pub use session::{
+    SessionKey, SessionManager, SessionMetadata, SessionScope, SessionStatus,
+};
 pub use sqlite_memory::{PersistentMemory, SqliteMemory};
 pub use summary::{ContextSummarizer, SummaryConfig, SummaryHook};
 pub use token::{

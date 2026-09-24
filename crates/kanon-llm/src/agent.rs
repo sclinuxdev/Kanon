@@ -194,6 +194,10 @@ pub struct Agent {
     provider: Arc<dyn LlmProvider>,
     /// Pluggable memory backend for conversational history.
     memory: Arc<dyn Memory>,
+    /// Optional session manager tracking lifecycle, turns, and metadata.
+    session_manager: Option<Arc<crate::session::SessionManager>>,
+    /// Optional persona registry for dynamic persona resolution.
+    persona_registry: Option<Arc<crate::prompt::PersonaRegistry>>,
     /// Native in-process tools directly callable without IPC overhead.
     tools: Vec<Arc<dyn AgentTool>>,
     /// Lifecycle interception hooks.
@@ -216,6 +220,16 @@ impl Agent {
     /// Reference to the active memory backend.
     pub fn memory(&self) -> &Arc<dyn Memory> {
         &self.memory
+    }
+
+    /// Reference to the optional session manager.
+    pub fn session_manager(&self) -> Option<&Arc<crate::session::SessionManager>> {
+        self.session_manager.as_ref()
+    }
+
+    /// Reference to the optional persona registry.
+    pub fn persona_registry(&self) -> Option<&Arc<crate::prompt::PersonaRegistry>> {
+        self.persona_registry.as_ref()
     }
 
     /// Reference to the underlying provider.
@@ -319,6 +333,19 @@ impl Agent {
                         .push_message(session_id, ChatMessage::assistant(&final_content))
                         .await?;
                 }
+
+                if let Some(ref sm) = self.session_manager {
+                    let tokens_used = response
+                        .usage
+                        .as_ref()
+                        .map(|u| u.total_tokens as usize)
+                        .unwrap_or_else(|| {
+                            crate::token::estimate_text_tokens(user_input)
+                                + crate::token::estimate_text_tokens(&final_content)
+                        });
+                    sm.record_turn(session_id, tokens_used);
+                }
+
                 return Ok(AgentOutput {
                     content: final_content,
                     executed_tools,
@@ -341,6 +368,13 @@ impl Agent {
                 self.memory
                     .push_message(session_id, ChatMessage::assistant(&fallback))
                     .await?;
+
+                if let Some(ref sm) = self.session_manager {
+                    let tokens_used = crate::token::estimate_text_tokens(user_input)
+                        + crate::token::estimate_text_tokens(&fallback);
+                    sm.record_turn(session_id, tokens_used);
+                }
+
                 return Ok(AgentOutput {
                     content: fallback,
                     executed_tools,
@@ -745,6 +779,8 @@ impl Agent {
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let memory = self.memory.clone();
         let sid = session_id.to_string();
+        let sm_opt = self.session_manager.clone();
+        let user_toks = crate::token::estimate_text_tokens(user_input);
 
         tokio::spawn(async move {
             let mut inner = inner_stream;
@@ -762,6 +798,10 @@ impl Agent {
                             {
                                 tracing::error!(session_id = %sid, error = %e, "Failed to persist streaming assistant response to memory");
                             }
+                            if let Some(ref sm) = sm_opt {
+                                let tokens = user_toks + crate::token::estimate_text_tokens(&accumulated);
+                                sm.record_turn(&sid, tokens);
+                            }
                             return;
                         }
                     }
@@ -776,6 +816,10 @@ impl Agent {
                 && let Err(e) = memory.push_message(&sid, ChatMessage::assistant(&accumulated)).await
             {
                 tracing::error!(session_id = %sid, error = %e, "Failed to persist streaming assistant response to memory");
+            }
+            if let Some(ref sm) = sm_opt {
+                let tokens = user_toks + crate::token::estimate_text_tokens(&accumulated);
+                sm.record_turn(&sid, tokens);
             }
         });
 
@@ -803,6 +847,8 @@ pub struct AgentBuilder {
     system_prompt: Option<String>,
     provider: Arc<dyn LlmProvider>,
     memory: Option<Arc<dyn Memory>>,
+    session_manager: Option<Arc<crate::session::SessionManager>>,
+    persona_registry: Option<Arc<crate::prompt::PersonaRegistry>>,
     tools: Vec<Arc<dyn AgentTool>>,
     hooks: Vec<Arc<dyn AgentHook>>,
     config: AgentConfig,
@@ -817,6 +863,8 @@ impl AgentBuilder {
             system_prompt: None,
             provider,
             memory: None,
+            session_manager: None,
+            persona_registry: None,
             tools: Vec::new(),
             hooks: Vec::new(),
             config: AgentConfig::default(),
@@ -833,6 +881,18 @@ impl AgentBuilder {
     /// Injects a custom memory backend (e.g. SQLite, Redis, or custom plugin memory).
     pub fn memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Injects a session manager for metadata, multi-scope keys, and turn lifecycle tracking.
+    pub fn session_manager(mut self, manager: Arc<crate::session::SessionManager>) -> Self {
+        self.session_manager = Some(manager);
+        self
+    }
+
+    /// Injects a persona registry for dynamic persona resolution.
+    pub fn persona_registry(mut self, registry: Arc<crate::prompt::PersonaRegistry>) -> Self {
+        self.persona_registry = Some(registry);
         self
     }
 
@@ -900,7 +960,17 @@ impl AgentBuilder {
     pub fn build(mut self) -> Agent {
         let memory = self
             .memory
+            .or_else(|| self.session_manager.as_ref().map(|sm| sm.memory().clone()))
             .unwrap_or_else(|| Arc::new(SlidingWindowMemory::default()));
+
+        if let Some(ref session_mgr) = self.session_manager
+            && let Some(ref persona_reg) = self.persona_registry
+        {
+            self.hooks.push(Arc::new(crate::prompt::DynamicPromptHook::new(
+                session_mgr.clone(),
+                persona_reg.clone(),
+            )));
+        }
 
         if let Some(summary_cfg) = self.summary_config
             && summary_cfg.enabled
@@ -918,6 +988,8 @@ impl AgentBuilder {
             system_prompt: self.system_prompt,
             provider: self.provider,
             memory,
+            session_manager: self.session_manager,
+            persona_registry: self.persona_registry,
             tools: self.tools,
             hooks: self.hooks,
             config: self.config,

@@ -54,14 +54,51 @@ pub struct CommandDefinition {
     pub priority: Option<i32>,
 }
 
+/// Declared runtime dependencies under `[dependencies]` in `plugin.toml`.
+///
+/// Only meaningful for interpreted runtimes (Python / TypeScript); Rust plugins
+/// are distributed as pre-compiled artifacts with their dependencies already linked.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginDependencies {
+    /// Locked package requirement strings (e.g. `httpx>=0.25.0`).
+    #[serde(default)]
+    pub packages: Vec<String>,
+}
+
+/// Static tool declaration under `[[tools]]` in `plugin.toml`.
+///
+/// Mirrors the runtime `ToolMeta` reported over gRPC so that the management console
+/// can render the tool catalog without spawning a plugin host sub-process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDefinitionEntry {
+    /// Tool name exposed to the model for function calling.
+    pub name: String,
+    /// Natural language explanation of the tool purpose.
+    pub description: Option<String>,
+    /// JSON Schema object describing accepted parameters.
+    pub parameters: Option<serde_json::Value>,
+}
+
 /// Complete representation of a parsed `plugin.toml` manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
     /// Core plugin metadata.
     pub plugin: PluginSection,
+    /// Optional declared runtime dependency set.
+    #[serde(default)]
+    pub dependencies: Option<PluginDependencies>,
+    /// JSON Schema of the user-facing configuration object (`[config_schema]`).
+    ///
+    /// Retained verbatim so the headless core can hand the schema to the WebUI
+    /// for form rendering without launching the plugin sub-process.
+    #[serde(default)]
+    pub config_schema: Option<serde_json::Value>,
     /// List of statically declared commands.
     #[serde(default)]
     pub commands: Vec<CommandDefinition>,
+    /// List of statically declared tools.
+    #[serde(default)]
+    pub tools: Vec<ToolDefinitionEntry>,
 }
 
 impl PluginManifest {

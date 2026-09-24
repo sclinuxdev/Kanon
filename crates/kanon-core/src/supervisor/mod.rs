@@ -17,7 +17,8 @@ use kanon_proto::v1::message_pipeline_service_client::MessagePipelineServiceClie
 use kanon_proto::v1::plugin_host_service_client::PluginHostServiceClient;
 use kanon_proto::v1::{
     CommandExecuteRequest, CommandExecuteResponse, GetPluginMetaRequest,
-    PipelineEventRequest, PluginMeta, PreFilterResult, ToolCallRequest, ToolCallResponse,
+    PipelineEventRequest, PluginMeta, PreFilterResult, ReloadPluginConfigRequest,
+    ReloadPluginConfigResponse, ToolCallRequest, ToolCallResponse,
 };
 use kanon_transport::{
     connect_ipc, core_socket_path, default_run_dir, host_socket_path,
@@ -48,6 +49,25 @@ pub enum SupervisorError {
     /// Requested host was not found in the supervisor registry.
     #[error("Host '{0}' not found in supervisor")]
     HostNotFound(String),
+    /// Requested plugin is not loaded by any active host.
+    #[error("Plugin '{0}' is not loaded by any active host")]
+    PluginNotFound(String),
+    /// Host was registered without a launch specification (e.g. externally attached).
+    ///
+    /// Restart cannot be honoured because the microkernel never owned the process handle
+    /// and therefore cannot faithfully reconstruct its command line.
+    #[error("Host '{0}' has no recorded launch specification and cannot be restarted")]
+    RestartUnavailable(String),
+    /// Configuration payload was not a JSON object and cannot be mapped to `google.protobuf.Struct`.
+    #[error("Plugin configuration payload must be a JSON object")]
+    InvalidConfigPayload,
+    /// Host explicitly rejected the configuration reload request.
+    #[error("Host '{host_id}' rejected configuration reload for plugin '{plugin_id}': {reason}")]
+    ConfigReloadRejected {
+        host_id: String,
+        plugin_id: String,
+        reason: String,
+    },
     /// Runtime environment was not found or is unsupported.
     #[error("Runtime environment '{runtime}' is not available: {reason}")]
     RuntimeUnavailable { runtime: String, reason: String },
@@ -57,6 +77,35 @@ impl From<tonic::Status> for SupervisorError {
     fn from(status: tonic::Status) -> Self {
         Self::Rpc(Box::new(status))
     }
+}
+
+/// Recorded recipe describing how a host process was launched.
+///
+/// Retaining the launch recipe is what makes control-plane restarts truthful:
+/// the supervisor can only respawn a process it knows how to reconstruct.
+#[derive(Debug, Clone)]
+pub enum LaunchSpec {
+    /// Host was spawned from a raw executable with an explicit argument vector.
+    Direct {
+        /// Executable path passed to the OS.
+        executable: PathBuf,
+        /// Argument vector passed alongside the executable.
+        args: Vec<String>,
+        /// Pipeline execution priority retained across restarts.
+        priority: i32,
+    },
+    /// Host was spawned from a `plugin.toml` manifest.
+    ///
+    /// On restart the runtime launcher (Python interpreter / Node binary / native
+    /// executable) is re-resolved, so toolchain upgrades are picked up automatically.
+    Manifest {
+        /// Absolute or project-relative path to the manifest file.
+        manifest_path: PathBuf,
+        /// Optional pre-built artifact overriding the manifest entrypoint.
+        executable_override: Option<PathBuf>,
+        /// Pipeline execution priority retained across restarts.
+        priority: i32,
+    },
 }
 
 /// Represents a running child plugin host managed by the supervisor.
@@ -75,10 +124,17 @@ pub struct ManagedHost {
     pub meta: Vec<PluginMeta>,
     /// Execution priority for pipeline scheduling (lower executes first, default 500).
     pub priority: i32,
+    /// Retained launch recipe, absent for externally registered hosts.
+    launch_spec: Option<LaunchSpec>,
+    /// Static manifest that produced this host, retained for control-plane queries.
+    pub manifest: Option<PluginManifest>,
 }
 
 impl ManagedHost {
     /// Creates a new `ManagedHost` with an established channel, primarily used in testing or direct registration.
+    ///
+    /// The host is registered without a launch recipe, meaning it cannot be restarted
+    /// by the supervisor (see [`SupervisorError::RestartUnavailable`]).
     pub fn new(
         host_id: String,
         socket_path: PathBuf,
@@ -94,7 +150,53 @@ impl ManagedHost {
             pipeline_client: Mutex::new(MessagePipelineServiceClient::new(channel)),
             meta,
             priority,
+            launch_spec: None,
+            manifest: None,
         }
+    }
+
+    /// Attaches a retained launch recipe to this host.
+    pub fn with_launch_spec(mut self, spec: LaunchSpec) -> Self {
+        self.launch_spec = Some(spec);
+        self
+    }
+
+    /// Attaches a static manifest to this host for metadata and config-schema queries.
+    pub fn with_manifest(mut self, manifest: PluginManifest) -> Self {
+        self.manifest = Some(manifest);
+        self
+    }
+
+    /// Returns the retained launch recipe, if the supervisor spawned this process.
+    pub fn launch_spec(&self) -> Option<&LaunchSpec> {
+        self.launch_spec.as_ref()
+    }
+
+    /// Returns the static manifest retained for this host, if any.
+    pub fn manifest(&self) -> Option<&PluginManifest> {
+        self.manifest.as_ref()
+    }
+
+    /// Returns `true` when this host declares the given plugin identifier.
+    pub fn declares_plugin(&self, plugin_id: &str) -> bool {
+        self.meta.iter().any(|m| m.id == plugin_id)
+    }
+}
+
+impl std::fmt::Debug for ManagedHost {
+    /// Renders the control-plane view of the host.
+    ///
+    /// Child processes and gRPC clients are intentionally omitted: they have no meaningful
+    /// textual representation and are guarded by mutexes that must not be locked for logging.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let plugin_ids: Vec<&str> = self.meta.iter().map(|meta| meta.id.as_str()).collect();
+        f.debug_struct("ManagedHost")
+            .field("host_id", &self.host_id)
+            .field("socket_path", &self.socket_path)
+            .field("plugin_ids", &plugin_ids)
+            .field("priority", &self.priority)
+            .field("restartable", &self.launch_spec.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -131,6 +233,25 @@ impl ManagedHost {
     ) -> Result<ToolCallResponse, tonic::Status> {
         let mut client = self.pipeline_client.lock().await;
         let response = client.on_call_tool(req).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Pushes a refreshed configuration object to this host and triggers in-process hot reload.
+    ///
+    /// The plugin host updates its memory-resident configuration cache synchronously, so the
+    /// next PreFilter / command invocation observes the new values without a process restart.
+    pub async fn reload_config(
+        &self,
+        plugin_id: &str,
+        config: kanon_proto::prost_types::Struct,
+    ) -> Result<ReloadPluginConfigResponse, tonic::Status> {
+        let mut client = self.host_client.lock().await;
+        let response = client
+            .reload_plugin_config(ReloadPluginConfigRequest {
+                plugin_id: plugin_id.to_string(),
+                config: Some(config),
+            })
+            .await?;
         Ok(response.into_inner())
     }
 }
@@ -215,6 +336,29 @@ impl Supervisor {
         args: &[&str],
         priority: i32,
     ) -> Result<Arc<ManagedHost>, SupervisorError> {
+        let spec = LaunchSpec::Direct {
+            executable: executable_path.as_ref().to_path_buf(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            priority,
+        };
+        self.launch_host(host_id, executable_path.as_ref(), args, priority, spec, None)
+            .await
+    }
+
+    /// Core host launch routine shared by every spawn path.
+    ///
+    /// `spec` records how the process was launched so that a later control-plane restart
+    /// can faithfully reconstruct the same command line, and `manifest` retains the static
+    /// plugin declaration for metadata / configuration-schema queries.
+    async fn launch_host(
+        &self,
+        host_id: &str,
+        executable_path: &Path,
+        args: &[&str],
+        priority: i32,
+        spec: LaunchSpec,
+        manifest: Option<PluginManifest>,
+    ) -> Result<Arc<ManagedHost>, SupervisorError> {
         let socket_path = host_socket_path(host_id, Some(&self.run_dir));
 
         // Clean up stale socket file if it exists prior to launching child.
@@ -225,12 +369,12 @@ impl Supervisor {
         tracing::info!(
             host_id = %host_id,
             priority = priority,
-            executable = %executable_path.as_ref().display(),
+            executable = %executable_path.display(),
             socket = %socket_path.display(),
             "Spawning plugin host process"
         );
 
-        let mut cmd = Command::new(executable_path.as_ref());
+        let mut cmd = Command::new(executable_path);
         cmd.args(args)
             .env("KANON_HOST_ID", host_id)
             .env("KANON_HOST_SOCK", &socket_path)
@@ -273,15 +417,19 @@ impl Supervisor {
             "Handshake completed successfully with plugin host"
         );
 
-        let managed_host = Arc::new(ManagedHost {
-            host_id: host_id.to_string(),
-            socket_path: socket_path.clone(),
-            child: Mutex::new(Some(child)),
-            host_client: Mutex::new(host_client),
-            pipeline_client: Mutex::new(pipeline_client),
-            meta: plugins,
-            priority,
-        });
+        let managed_host = Arc::new(
+            ManagedHost {
+                host_id: host_id.to_string(),
+                socket_path: socket_path.clone(),
+                child: Mutex::new(Some(child)),
+                host_client: Mutex::new(host_client),
+                pipeline_client: Mutex::new(pipeline_client),
+                meta: plugins,
+                priority,
+                launch_spec: Some(spec),
+                manifest,
+            },
+        );
 
         self.hosts
             .write()
@@ -307,16 +455,31 @@ impl Supervisor {
         let priority = manifest.plugin.priority.unwrap_or(500);
         let parent = manifest_path_ref.parent().unwrap_or_else(|| Path::new("."));
 
+        // Manifest-driven launches are replayed through the manifest on restart, so the
+        // recipe only needs to remember the manifest location and priority.
+        let spec = LaunchSpec::Manifest {
+            manifest_path: manifest_path_ref.to_path_buf(),
+            executable_override: executable_override.map(Path::to_path_buf),
+            priority,
+        };
+
         if let Some(override_path) = executable_override {
             return self
-                .spawn_plugin_with_priority(&host_id, override_path, &[], priority)
+                .launch_host(
+                    &host_id,
+                    override_path,
+                    &[],
+                    priority,
+                    spec,
+                    Some(manifest),
+                )
                 .await;
         }
 
         match manifest.plugin.runtime.as_str() {
             "rust" => {
                 let exec_path = parent.join(&manifest.plugin.entrypoint);
-                self.spawn_plugin_with_priority(&host_id, exec_path, &[], priority)
+                self.launch_host(&host_id, &exec_path, &[], priority, spec, Some(manifest))
                     .await
             }
             "python" => {
@@ -351,7 +514,7 @@ impl Supervisor {
                     manifest_str.as_ref(),
                 ];
 
-                self.spawn_plugin_with_priority(&host_id, python_bin, &args, priority)
+                self.launch_host(&host_id, &python_bin, &args, priority, spec, Some(manifest))
                     .await
             }
             "typescript" | "ts" => {
@@ -384,7 +547,7 @@ impl Supervisor {
                     manifest_str.as_ref(),
                 ];
 
-                self.spawn_plugin_with_priority(&host_id, node_bin, &args, priority)
+                self.launch_host(&host_id, &node_bin, &args, priority, spec, Some(manifest))
                     .await
             }
             other => Err(SupervisorError::RuntimeUnavailable {
@@ -392,6 +555,92 @@ impl Supervisor {
                 reason: format!("Unsupported plugin runtime '{other}' declared in manifest"),
             }),
         }
+    }
+
+    /// Restarts the host process identified by `host_id` using its recorded launch recipe.
+    ///
+    /// The old process is terminated and unregistered first, then relaunched with an identical
+    /// command line and a fresh `GetPluginMeta` handshake, so a failed relaunch surfaces as an
+    /// explicit error while the registry never retains a half-dead host entry.
+    pub async fn restart_host(&self, host_id: &str) -> Result<Arc<ManagedHost>, SupervisorError> {
+        let host = self
+            .get_host(host_id)
+            .await
+            .ok_or_else(|| SupervisorError::HostNotFound(host_id.to_string()))?;
+
+        let spec = host
+            .launch_spec()
+            .cloned()
+            .ok_or_else(|| SupervisorError::RestartUnavailable(host_id.to_string()))?;
+        let manifest = host.manifest().cloned();
+
+        tracing::info!(host_id = %host_id, "Restarting plugin host process");
+
+        self.stop_host(host_id).await?;
+
+        match &spec {
+            LaunchSpec::Direct { executable, args, priority } => {
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                self.launch_host(
+                    host_id,
+                    executable,
+                    &arg_refs,
+                    *priority,
+                    spec.clone(),
+                    manifest,
+                )
+                .await
+            }
+            LaunchSpec::Manifest { manifest_path, executable_override, .. } => {
+                self.spawn_from_manifest(manifest_path, executable_override.as_deref())
+                    .await
+            }
+        }
+    }
+
+    /// Locates the host process that declares the given plugin identifier.
+    pub async fn find_host_for_plugin(&self, plugin_id: &str) -> Option<Arc<ManagedHost>> {
+        self.hosts
+            .read()
+            .await
+            .values()
+            .find(|host| host.declares_plugin(plugin_id))
+            .cloned()
+    }
+
+    /// Pushes an updated configuration object to the host owning `plugin_id` and triggers hot reload.
+    ///
+    /// This is a cross-process round trip: the plugin host refreshes its in-memory configuration
+    /// cache synchronously and reports failure explicitly instead of silently keeping stale values.
+    pub async fn reload_plugin_config(
+        &self,
+        plugin_id: &str,
+        config: &serde_json::Value,
+    ) -> Result<(), SupervisorError> {
+        let host = self
+            .find_host_for_plugin(plugin_id)
+            .await
+            .ok_or_else(|| SupervisorError::PluginNotFound(plugin_id.to_string()))?;
+
+        let structured = kanon_llm::tool_router::json_to_prost_struct(config)
+            .ok_or(SupervisorError::InvalidConfigPayload)?;
+
+        let response = host.reload_config(plugin_id, structured).await?;
+        if !response.success {
+            return Err(SupervisorError::ConfigReloadRejected {
+                host_id: host.host_id.clone(),
+                plugin_id: plugin_id.to_string(),
+                reason: response.error_message,
+            });
+        }
+
+        tracing::info!(
+            plugin_id = %plugin_id,
+            host_id = %host.host_id,
+            "Plugin configuration reloaded"
+        );
+
+        Ok(())
     }
 
     /// Directly registers an externally created or mocked `ManagedHost` (useful for unit tests).

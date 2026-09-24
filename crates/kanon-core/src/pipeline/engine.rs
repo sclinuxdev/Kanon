@@ -14,6 +14,7 @@ use kanon_proto::v1::{
 };
 
 use crate::pipeline::command::CommandRouter;
+use crate::pipeline::observer::{PipelineObserver, PipelineStage};
 use crate::pipeline::pre_filter::{PreFilterChain, PreFilterOutcome};
 use crate::supervisor::Supervisor;
 
@@ -64,6 +65,8 @@ pub struct PipelineEngine {
     outbound_sender: Option<mpsc::Sender<DeliverMessageRequest>>,
     /// Optional ToolRouter driving LLM reasoning and cross-language tool calling.
     tool_router: Option<Arc<ToolRouter>>,
+    /// Optional lifecycle observer used by the management control plane for tracing.
+    observer: Option<Arc<dyn PipelineObserver>>,
 }
 
 impl PipelineEngine {
@@ -76,6 +79,7 @@ impl PipelineEngine {
             supervisor,
             outbound_sender,
             tool_router: None,
+            observer: None,
         }
     }
 
@@ -85,11 +89,31 @@ impl PipelineEngine {
         self
     }
 
+    /// Attaches a lifecycle observer for control-plane tracing.
+    pub fn with_observer(mut self, observer: Arc<dyn PipelineObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Publishes a lifecycle stage to the attached observer, if any.
+    ///
+    /// Observation is deliberately infallible: tracing must never alter pipeline outcomes.
+    fn observe(&self, stage: PipelineStage) {
+        if let Some(ref observer) = self.observer {
+            observer.on_stage(&stage);
+        }
+    }
+
     /// Processes a single inbound event through the PreFilter chain and command dispatcher.
     pub async fn process_event(&self, event: PipelineEventRequest) -> PipelineResult {
+        let event_id = event.event_id.clone();
         let hosts = self.supervisor.get_all_hosts().await;
 
         // Phase 1: PreFilter Interception Chain
+        self.observe(PipelineStage::PreFilterStarted {
+            event_id: event_id.clone(),
+            host_count: hosts.len(),
+        });
         let filtered_event = match PreFilterChain::execute(event, &hosts).await {
             PreFilterOutcome::Blocked {
                 host_id,
@@ -99,6 +123,10 @@ impl PipelineEngine {
                     host_id = %host_id,
                     "Event blocked by PreFilter chain; halting pipeline execution"
                 );
+                self.observe(PipelineStage::PreFilterBlocked {
+                    event_id,
+                    host_id: host_id.clone(),
+                });
                 return PipelineResult::Blocked {
                     host_id,
                     replies: reply_messages,
@@ -106,6 +134,9 @@ impl PipelineEngine {
             }
             PreFilterOutcome::Passed(evt) => evt,
         };
+        self.observe(PipelineStage::PreFilterPassed {
+            event_id: event_id.clone(),
+        });
 
         // Phase 2: Command Router matching
         // Extract raw text or inspect primary text segment if raw_text is empty.
@@ -130,6 +161,13 @@ impl PipelineEngine {
                     host_id = %target.host.host_id,
                     "Routing slash command to target host"
                 );
+
+                self.observe(PipelineStage::CommandMatched {
+                    event_id: event_id.clone(),
+                    command: cmd_name.clone(),
+                    plugin_id: target.plugin_id.clone(),
+                    host_id: target.host.host_id.clone(),
+                });
 
                 match CommandRouter::dispatch(&target, args, filtered_event.clone()).await {
                     Ok(response) => {
@@ -162,6 +200,10 @@ impl PipelineEngine {
                     command = %cmd_name,
                     "Slash command detected but no matching plugin was registered"
                 );
+                self.observe(PipelineStage::CommandNotFound {
+                    event_id,
+                    command: cmd_name.clone(),
+                });
                 return PipelineResult::CommandNotFound { command: cmd_name };
             }
         }
@@ -178,6 +220,11 @@ impl PipelineEngine {
                             content: output.content.clone(),
                         })),
                     };
+                    self.observe(PipelineStage::LlmReplied {
+                        event_id,
+                        session_id,
+                        content_length: output.content.chars().count(),
+                    });
                     return PipelineResult::LlmReplied {
                         content: output.content,
                         replies: vec![reply],
@@ -224,6 +271,13 @@ impl PipelineEngine {
             let recipient_id = event.sender_id.clone();
             let event_id = event.event_id.clone();
 
+            self.observe(PipelineStage::Ingested {
+                event_id: event_id.clone(),
+                platform: platform.clone(),
+                channel_id: channel_id.clone(),
+                sender_id: recipient_id.clone(),
+            });
+
             let result = self.process_event(event).await;
 
             if let Some(ref outbound_tx) = self.outbound_sender {
@@ -242,12 +296,23 @@ impl PipelineEngine {
                         segments: replies.to_vec(),
                     };
 
+                    let segment_count = deliver_req.segments.len();
+                    let deliver_platform = deliver_req.platform.clone();
+                    let deliver_channel = deliver_req.channel_id.clone();
+
                     if let Err(e) = outbound_tx.send(deliver_req).await {
                         tracing::warn!(
                             event_id = %event_id,
                             error = %e,
                             "Failed to enqueue outbound message; receiver dropped"
                         );
+                    } else {
+                        self.observe(PipelineStage::OutboundQueued {
+                            event_id,
+                            platform: deliver_platform,
+                            channel_id: deliver_channel,
+                            segment_count,
+                        });
                     }
                 }
             }

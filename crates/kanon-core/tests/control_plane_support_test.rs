@@ -1,0 +1,302 @@
+//! Coverage for the manifest extensions, restart safety and pipeline lifecycle observation
+//! added to support the management control plane.
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use kanon_core::PluginManifest;
+use kanon_core::pipeline::{PipelineEngine, PipelineObserver, PipelineResult, PipelineStage};
+use kanon_core::supervisor::{LaunchSpec, ManagedHost, Supervisor, SupervisorError};
+use kanon_proto::v1::{IngestEventRequest, PipelineEventRequest, PluginMeta};
+use tempfile::tempdir;
+
+/// Observer recording every emitted stage for later assertions.
+#[derive(Default)]
+struct RecordingObserver {
+    stages: Mutex<Vec<PipelineStage>>,
+}
+
+impl PipelineObserver for RecordingObserver {
+    fn on_stage(&self, stage: &PipelineStage) {
+        self.stages.lock().expect("stage lock").push(stage.clone());
+    }
+}
+
+/// The documented `[config_schema]`, `[[tools]]` and `[dependencies]` sections are parsed.
+#[test]
+fn manifest_parses_config_schema_tools_and_dependencies() {
+    let toml = r#"
+[plugin]
+id = "org.kanon.plugin.weather"
+name = "Weather"
+version = "1.0.0"
+author = "Kanon Dev"
+description = "Weather lookup"
+runtime = "python"
+entrypoint = "main.py"
+
+[dependencies]
+packages = ["httpx>=0.25.0", "pydantic>=2.0"]
+
+[config_schema]
+type = "object"
+properties = { api_key = { type = "string", title = "API Key" }, default_city = { type = "string", default = "Beijing" } }
+required = ["api_key"]
+
+[[commands]]
+name = "weather"
+description = "Look up weather"
+usage = "/weather <city>"
+
+[[tools]]
+name = "fetch_weather"
+description = "Fetch live weather"
+parameters = { type = "object", properties = { city = { type = "string" } }, required = ["city"] }
+"#;
+
+    let manifest: PluginManifest = toml::from_str(toml).expect("manifest parses");
+
+    assert_eq!(manifest.plugin.id, "org.kanon.plugin.weather");
+    assert_eq!(manifest.commands.len(), 1);
+    assert_eq!(manifest.tools.len(), 1);
+    assert_eq!(manifest.tools[0].name, "fetch_weather");
+    assert_eq!(
+        manifest.tools[0]
+            .parameters
+            .as_ref()
+            .and_then(|params| params.get("required"))
+            .and_then(|required| required.get(0))
+            .and_then(|city| city.as_str()),
+        Some("city")
+    );
+
+    let dependencies = manifest.dependencies.expect("dependencies parsed");
+    assert_eq!(dependencies.packages.len(), 2);
+
+    let schema = manifest.config_schema.expect("config schema parsed");
+    assert_eq!(
+        schema
+            .get("properties")
+            .and_then(|properties| properties.get("default_city"))
+            .and_then(|city| city.get("default"))
+            .and_then(|value| value.as_str()),
+        Some("Beijing")
+    );
+    assert_eq!(
+        schema
+            .get("required")
+            .and_then(|r| r.get(0))
+            .and_then(|v| v.as_str()),
+        Some("api_key")
+    );
+}
+
+/// A manifest without the optional sections still parses with empty defaults.
+#[test]
+fn manifest_tolerates_missing_optional_sections() {
+    let toml = r#"
+[plugin]
+id = "org.kanon.plugin.minimal"
+name = "Minimal"
+version = "0.1.0"
+runtime = "rust"
+entrypoint = "target/release/minimal"
+"#;
+
+    let manifest: PluginManifest = toml::from_str(toml).expect("manifest parses");
+    assert!(manifest.commands.is_empty());
+    assert!(manifest.tools.is_empty());
+    assert!(manifest.dependencies.is_none());
+    assert!(manifest.config_schema.is_none());
+}
+
+/// Externally registered hosts cannot be restarted and say so explicitly.
+#[tokio::test]
+async fn restart_requires_a_recorded_launch_spec() {
+    let run_dir = tempdir().expect("temp dir");
+    let supervisor = Supervisor::new(Some(run_dir.path().to_path_buf()), None);
+
+    let host = Arc::new(ManagedHost::new(
+        "host_external".to_string(),
+        run_dir.path().join("host_external.sock"),
+        tonic::transport::Channel::from_static("http://127.0.0.1:9").connect_lazy(),
+        Vec::<PluginMeta>::new(),
+        500,
+    ));
+    supervisor.register_managed_host(host).await;
+
+    let error = supervisor
+        .restart_host("host_external")
+        .await
+        .expect_err("restart without a launch recipe must fail");
+    assert!(matches!(error, SupervisorError::RestartUnavailable(id) if id == "host_external"));
+
+    let error = supervisor
+        .restart_host("host_missing")
+        .await
+        .expect_err("unknown hosts must fail");
+    assert!(matches!(error, SupervisorError::HostNotFound(id) if id == "host_missing"));
+}
+
+/// Configuration reloads target the host declaring the plugin, or fail explicitly.
+#[tokio::test]
+async fn reload_config_reports_missing_plugin_and_invalid_payload() {
+    let run_dir = tempdir().expect("temp dir");
+    let supervisor = Supervisor::new(Some(run_dir.path().to_path_buf()), None);
+
+    let plugin = PluginMeta {
+        id: "org.kanon.plugin.demo".to_string(),
+        name: "Demo".to_string(),
+        version: "1.0.0".to_string(),
+        ..PluginMeta::default()
+    };
+    let host = Arc::new(ManagedHost::new(
+        "host_demo".to_string(),
+        run_dir.path().join("host_demo.sock"),
+        tonic::transport::Channel::from_static("http://127.0.0.1:9").connect_lazy(),
+        vec![plugin],
+        500,
+    ));
+    supervisor.register_managed_host(host).await;
+
+    let error = supervisor
+        .reload_plugin_config("org.kanon.plugin.absent", &serde_json::json!({}))
+        .await
+        .expect_err("unknown plugins must fail");
+    assert!(
+        matches!(error, SupervisorError::PluginNotFound(id) if id == "org.kanon.plugin.absent")
+    );
+
+    // Non-object payloads cannot be mapped onto `google.protobuf.Struct`.
+    let error = supervisor
+        .reload_plugin_config("org.kanon.plugin.demo", &serde_json::json!("nope"))
+        .await
+        .expect_err("scalar payloads must be rejected");
+    assert!(matches!(error, SupervisorError::InvalidConfigPayload));
+
+    // A declared plugin on an unreachable host surfaces the IPC failure rather than succeeding.
+    let error = supervisor
+        .reload_plugin_config("org.kanon.plugin.demo", &serde_json::json!({ "k": "v" }))
+        .await
+        .expect_err("unreachable hosts must fail the reload");
+    assert!(matches!(error, SupervisorError::Rpc(_)));
+}
+
+/// Launch recipes are retained for supervisor-spawned hosts and absent otherwise.
+#[tokio::test]
+async fn managed_host_exposes_launch_spec_and_manifest() {
+    let manifest: PluginManifest = toml::from_str(
+        r#"
+[plugin]
+id = "org.kanon.plugin.demo"
+name = "Demo"
+version = "1.0.0"
+runtime = "rust"
+entrypoint = "bin/demo"
+"#,
+    )
+    .expect("manifest parses");
+
+    let host = ManagedHost::new(
+        "host_demo".to_string(),
+        PathBuf::from("/tmp/demo.sock"),
+        tonic::transport::Channel::from_static("http://127.0.0.1:9").connect_lazy(),
+        vec![PluginMeta {
+            id: "org.kanon.plugin.demo".to_string(),
+            name: "Demo".to_string(),
+            version: "1.0.0".to_string(),
+            ..PluginMeta::default()
+        }],
+        300,
+    )
+    .with_manifest(manifest)
+    .with_launch_spec(LaunchSpec::Direct {
+        executable: PathBuf::from("bin/demo"),
+        args: vec!["--flag".to_string()],
+        priority: 300,
+    });
+
+    // Routing decisions follow the metadata reported by the live process.
+    assert!(host.declares_plugin("org.kanon.plugin.demo"));
+    assert!(!host.declares_plugin("org.kanon.plugin.other"));
+    assert!(matches!(
+        host.launch_spec(),
+        Some(LaunchSpec::Direct { .. })
+    ));
+    assert_eq!(
+        host.manifest().map(|m| m.plugin.runtime.as_str()),
+        Some("rust")
+    );
+}
+
+/// Processing an event without hosts emits pre-filter entry and pass stages in order.
+#[tokio::test]
+async fn pipeline_engine_emits_pre_filter_stages() {
+    let run_dir = tempdir().expect("temp dir");
+    let supervisor = Arc::new(Supervisor::new(Some(run_dir.path().to_path_buf()), None));
+    let observer = Arc::new(RecordingObserver::default());
+
+    let engine = PipelineEngine::new(supervisor, None).with_observer(observer.clone());
+
+    let result = engine
+        .process_event(PipelineEventRequest {
+            event_id: "evt-1".to_string(),
+            platform: "discord".to_string(),
+            channel_id: "chan".to_string(),
+            sender_id: "user".to_string(),
+            raw_text: "hello".to_string(),
+            segments: vec![],
+            metadata: None,
+        })
+        .await;
+
+    assert!(matches!(result, PipelineResult::Passed(_)));
+
+    let stages = observer.stages.lock().expect("stage lock");
+    let names: Vec<&str> = stages.iter().map(PipelineStage::name).collect();
+    assert_eq!(names, vec!["pre_filter_started", "pre_filter_passed"]);
+    assert_eq!(stages[0].event_id(), "evt-1");
+}
+
+/// The worker loop announces ingested events and queued outbound replies.
+#[tokio::test]
+async fn pipeline_worker_emits_ingest_and_outbound_stages() {
+    let run_dir = tempdir().expect("temp dir");
+    let supervisor = Arc::new(Supervisor::new(Some(run_dir.path().to_path_buf()), None));
+    let observer = Arc::new(RecordingObserver::default());
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel(4);
+
+    let engine = Arc::new(
+        PipelineEngine::new(supervisor, Some(outbound_tx)).with_observer(observer.clone()),
+    );
+
+    let (event_tx, event_rx) = tokio::sync::mpsc::channel(4);
+    event_tx
+        .send(IngestEventRequest {
+            platform: "discord".to_string(),
+            event: Some(PipelineEventRequest {
+                event_id: "evt-9".to_string(),
+                platform: "discord".to_string(),
+                channel_id: "chan".to_string(),
+                sender_id: "user".to_string(),
+                raw_text: "hello".to_string(),
+                segments: vec![],
+                metadata: None,
+            }),
+        })
+        .await
+        .expect("event queued");
+    drop(event_tx);
+
+    engine.run_worker_loop(event_rx).await;
+
+    // No downstream consumer produced replies, so no outbound stage is expected.
+    assert!(outbound_rx.try_recv().is_err());
+
+    let stages = observer.stages.lock().expect("stage lock");
+    let names: Vec<&str> = stages.iter().map(PipelineStage::name).collect();
+    assert_eq!(
+        names,
+        vec!["ingested", "pre_filter_started", "pre_filter_passed"]
+    );
+}

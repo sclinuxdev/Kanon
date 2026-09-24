@@ -373,7 +373,13 @@ impl PipelineEngine {
             event_id: event_id.clone(),
             host_count: hosts.len(),
         });
-        let filtered_event = match PreFilterChain::execute(event, &hosts).await {
+        let filtered_event = match PreFilterChain::execute_with_observer(
+            event,
+            &hosts,
+            self.observer.as_ref(),
+        )
+        .await
+        {
             PreFilterOutcome::Blocked {
                 host_id,
                 reply_messages,
@@ -472,7 +478,31 @@ impl PipelineEngine {
             && !text_candidate.is_empty()
         {
             let session_id = format!("{}:{}", filtered_event.channel_id, filtered_event.sender_id);
-            match router.execute(&session_id, &text_candidate, &hosts).await {
+            // Filter hosts whose circuit breaker is Open to fast-skip them and protect LLM throughput
+            let mut active_hosts = Vec::new();
+            for host in &hosts {
+                if host.circuit_breaker.allow_request() {
+                    active_hosts.push(Arc::clone(host));
+                } else {
+                    tracing::warn!(
+                        host_id = %host.host_id,
+                        event_id = %filtered_event.event_id,
+                        "Circuit breaker is OPEN; fast-skipping host from ToolRouter candidates"
+                    );
+                    self.observe(PipelineStage::CircuitBreakerTripped {
+                        event_id: filtered_event.event_id.clone(),
+                        host_id: host.host_id.clone(),
+                        phase: "tool_router".to_string(),
+                        reason: format!(
+                            "Circuit breaker OPEN (state: {:?}, consecutive failures: {})",
+                            host.circuit_breaker.state(),
+                            host.circuit_breaker.consecutive_failures()
+                        ),
+                    });
+                }
+            }
+
+            match router.execute(&session_id, &text_candidate, &active_hosts).await {
                 Ok(output) if !output.content.is_empty() => {
                     let reply = MessageSegment {
                         segment: Some(Segment::Text(kanon_proto::v1::TextSegment {

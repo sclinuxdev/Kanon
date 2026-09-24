@@ -22,4 +22,7 @@ pub use pipeline::{
     PipelineResult, PipelineStage, PreFilterChain, PreFilterOutcome,
     DEFAULT_OUTBOUND_QUEUE_CAPACITY,
 };
-pub use supervisor::{AdapterRoute, LaunchSpec, ManagedHost, Supervisor, SupervisorError};
+pub use supervisor::{
+    circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState},
+    AdapterRoute, LaunchSpec, ManagedHost, Supervisor, SupervisorError,
+};

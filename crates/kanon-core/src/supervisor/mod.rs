@@ -26,6 +26,9 @@ use kanon_transport::{
 use crate::adapter::{AdapterDescriptor, AdapterKind, AdapterRegistry};
 use crate::manifest::PluginManifest;
 
+pub mod circuit_breaker;
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
+
 /// Errors arising during supervisor operations.
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -129,6 +132,8 @@ pub struct ManagedHost {
     launch_spec: Option<LaunchSpec>,
     /// Static manifest that produced this host, retained for control-plane queries.
     pub manifest: Option<PluginManifest>,
+    /// Adaptive circuit breaker tracking latency beacons and failures for this host.
+    pub circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl ManagedHost {
@@ -153,7 +158,19 @@ impl ManagedHost {
             priority,
             launch_spec: None,
             manifest: None,
+            circuit_breaker: Arc::new(CircuitBreaker::with_defaults()),
         }
+    }
+
+    /// Attaches an adaptive circuit breaker configuration to this host.
+    pub fn with_circuit_breaker(mut self, breaker: Arc<CircuitBreaker>) -> Self {
+        self.circuit_breaker = breaker;
+        self
+    }
+
+    /// Returns a reference to the active circuit breaker for this host.
+    pub fn circuit_breaker(&self) -> &Arc<CircuitBreaker> {
+        &self.circuit_breaker
     }
 
     /// Attaches a retained launch recipe to this host.
@@ -250,9 +267,19 @@ impl ManagedHost {
         &self,
         req: CommandExecuteRequest,
     ) -> Result<CommandExecuteResponse, tonic::Status> {
+        let start = std::time::Instant::now();
         let mut client = self.pipeline_client.lock().await;
-        let response = client.on_execute_command(req).await?;
-        Ok(response.into_inner())
+        match client.on_execute_command(req).await {
+            Ok(response) => {
+                self.circuit_breaker.record_success(start.elapsed());
+                Ok(response.into_inner())
+            }
+            Err(status) => {
+                self.circuit_breaker
+                    .record_failure(&format!("Command gRPC error: {}", status.code()));
+                Err(status)
+            }
+        }
     }
 
     /// Queries the host for fresh plugin metadata.
@@ -263,13 +290,38 @@ impl ManagedHost {
     }
 
     /// Dispatches a tool call to this host for execution via gRPC IPC.
+    ///
+    /// If this host's circuit breaker is currently open, fast-fails immediately without
+    /// waiting for gRPC timeouts, thereby preserving the LLM tool reasoning throughput.
     pub async fn on_call_tool(
         &self,
         req: ToolCallRequest,
     ) -> Result<ToolCallResponse, tonic::Status> {
+        if !self.circuit_breaker.allow_request() {
+            tracing::warn!(
+                host_id = %self.host_id,
+                tool_name = %req.tool_name,
+                "Circuit breaker is OPEN; fast-skipping tool call"
+            );
+            return Err(tonic::Status::unavailable(format!(
+                "Circuit breaker is OPEN for host '{}'",
+                self.host_id
+            )));
+        }
+
+        let start = std::time::Instant::now();
         let mut client = self.pipeline_client.lock().await;
-        let response = client.on_call_tool(req).await?;
-        Ok(response.into_inner())
+        match client.on_call_tool(req).await {
+            Ok(response) => {
+                self.circuit_breaker.record_success(start.elapsed());
+                Ok(response.into_inner())
+            }
+            Err(status) => {
+                self.circuit_breaker
+                    .record_failure(&format!("Tool call gRPC error: {}", status.code()));
+                Err(status)
+            }
+        }
     }
 
     /// Pushes a refreshed configuration object to this host and triggers in-process hot reload.
@@ -297,9 +349,19 @@ impl ManagedHost {
         &self,
         request: DeliverMessageRequest,
     ) -> Result<DeliverMessageResponse, tonic::Status> {
+        let start = std::time::Instant::now();
         let mut client = self.pipeline_client.lock().await;
-        let response = client.on_deliver_message(request).await?;
-        Ok(response.into_inner())
+        match client.on_deliver_message(request).await {
+            Ok(response) => {
+                self.circuit_breaker.record_success(start.elapsed());
+                Ok(response.into_inner())
+            }
+            Err(status) => {
+                self.circuit_breaker
+                    .record_failure(&format!("DeliverMessage gRPC error: {}", status.code()));
+                Err(status)
+            }
+        }
     }
 }
 
@@ -589,6 +651,7 @@ impl Supervisor {
                 priority,
                 launch_spec: Some(spec),
                 manifest,
+                circuit_breaker: Arc::new(CircuitBreaker::with_defaults()),
             },
         );
 

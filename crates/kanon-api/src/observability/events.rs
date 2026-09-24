@@ -245,7 +245,8 @@ impl EventBus {
                 PipelineStage::OutboundFailed { .. } => {
                     MetricsRegistry::incr(&self.metrics.outbound_failed);
                 }
-                PipelineStage::PreFilterStarted { .. } => {}
+                PipelineStage::PreFilterStarted { .. }
+                | PipelineStage::CircuitBreakerTripped { .. } => {}
             },
             TraceEvent::LlmRequest { .. } => {
                 MetricsRegistry::incr(&self.metrics.llm_requests);

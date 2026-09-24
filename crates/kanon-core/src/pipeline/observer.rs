@@ -112,6 +112,17 @@ pub enum PipelineStage {
         /// Failure reason reported by routing or by the adapter.
         reason: String,
     },
+    /// A plugin host was skipped during pipeline processing due to an open circuit breaker.
+    CircuitBreakerTripped {
+        /// Unique identifier of the inbound event.
+        event_id: String,
+        /// Host that was short-circuited.
+        host_id: String,
+        /// Pipeline phase where the host was skipped ("pre_filter" or "tool_router").
+        phase: String,
+        /// Specific reason for tripping or skipping.
+        reason: String,
+    },
 }
 
 impl PipelineStage {
@@ -128,6 +139,7 @@ impl PipelineStage {
             PipelineStage::OutboundQueued { .. } => "outbound_queued",
             PipelineStage::OutboundDelivered { .. } => "outbound_delivered",
             PipelineStage::OutboundFailed { .. } => "outbound_failed",
+            PipelineStage::CircuitBreakerTripped { .. } => "circuit_breaker_tripped",
         }
     }
 
@@ -141,7 +153,8 @@ impl PipelineStage {
             | PipelineStage::CommandMatched { event_id, .. }
             | PipelineStage::CommandNotFound { event_id, .. }
             | PipelineStage::LlmReplied { event_id, .. }
-            | PipelineStage::OutboundQueued { event_id, .. } => event_id,
+            | PipelineStage::OutboundQueued { event_id, .. }
+            | PipelineStage::CircuitBreakerTripped { event_id, .. } => event_id,
             // Delivery stages are emitted by the outbound dispatcher, which no longer knows the
             // originating event identifier: the delivery queue carries routing keys only.
             PipelineStage::OutboundDelivered { .. } | PipelineStage::OutboundFailed { .. } => "",

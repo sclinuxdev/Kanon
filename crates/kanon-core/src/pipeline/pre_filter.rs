@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use kanon_proto::v1::message_segment::Segment;
 use kanon_proto::v1::{MessageSegment, PipelineEventRequest};
 
+use crate::pipeline::observer::{PipelineObserver, PipelineStage};
 use crate::supervisor::ManagedHost;
 
 /// Maximum allowable total duration across the entire PreFilter execution chain.
@@ -38,23 +39,36 @@ pub enum PreFilterOutcome {
 pub struct PreFilterChain;
 
 impl PreFilterChain {
-    /// Executes the pre-filter chain on the provided inbound event.
+    /// Executes the pre-filter chain on the provided inbound event without an observer.
+    pub async fn execute(
+        event: PipelineEventRequest,
+        hosts: &[Arc<ManagedHost>],
+    ) -> PreFilterOutcome {
+        Self::execute_with_observer(event, hosts, None).await
+    }
+
+    /// Executes the pre-filter chain on the provided inbound event with optional lifecycle observation.
     ///
     /// # Execution Guarantees
     /// 1. **Priority Ordering**: Filters run in strictly ascending priority order
     ///    (lower numerical value executes earlier). Ties are broken deterministically by `host_id`.
-    /// 2. **Strict 30ms Deadline**: The cumulative elapsed time across all filters is bounded by
+    /// 2. **Adaptive Circuit Breaker Short-Circuit (Fast-Skip)**: If a host's circuit breaker
+    ///    is currently `Open`, the filter is immediately skipped without waiting for timeouts,
+    ///    and an observation event is emitted to notify control planes.
+    /// 3. **Strict 30ms Deadline**: The cumulative elapsed time across all filters is bounded by
     ///    `PREFILTER_TOTAL_DEADLINE`. If the deadline expires, subsequent filters are skipped and
     ///    the event proceeds downstream.
-    /// 3. **Latency Warnings**: Any single plugin taking longer than `PREFILTER_WARN_THRESHOLD` (5ms)
-    ///    triggers a performance warning log.
-    /// 4. **Action Semantics**:
+    /// 4. **Latency Warnings & Beacon Recording**: Any single plugin taking longer than
+    ///    `PREFILTER_WARN_THRESHOLD` (5ms) triggers a warning log, and measured RTT is recorded
+    ///    into the host's circuit breaker sliding window.
+    /// 5. **Action Semantics**:
     ///    - `Action::Pass (0)`: Proceeds to the next filter in sequence.
     ///    - `Action::Block (1)`: Immediately halts the chain and returns [`PreFilterOutcome::Blocked`].
     ///    - `Action::Modify (2)`: Updates the event text and propagates modified text downstream.
-    pub async fn execute(
+    pub async fn execute_with_observer(
         event: PipelineEventRequest,
         hosts: &[Arc<ManagedHost>],
+        observer: Option<&Arc<dyn PipelineObserver>>,
     ) -> PreFilterOutcome {
         if hosts.is_empty() {
             return PreFilterOutcome::Passed(event);
@@ -73,6 +87,30 @@ impl PreFilterChain {
         let deadline = chain_start + PREFILTER_TOTAL_DEADLINE;
 
         for host in sorted_hosts {
+            // Adaptive Circuit Breaker Check: Fast-skip if breaker is Open
+            if !host.circuit_breaker.allow_request() {
+                tracing::warn!(
+                    host_id = %host.host_id,
+                    event_id = %current_event.event_id,
+                    failures = host.circuit_breaker.consecutive_failures(),
+                    state = ?host.circuit_breaker.state(),
+                    "Host circuit breaker is OPEN; fast-skipping PreFilter without timeout"
+                );
+                if let Some(obs) = observer {
+                    obs.on_stage(&PipelineStage::CircuitBreakerTripped {
+                        event_id: current_event.event_id.clone(),
+                        host_id: host.host_id.clone(),
+                        phase: "pre_filter".to_string(),
+                        reason: format!(
+                            "Circuit breaker OPEN (state: {:?}, consecutive failures: {})",
+                            host.circuit_breaker.state(),
+                            host.circuit_breaker.consecutive_failures()
+                        ),
+                    });
+                }
+                continue;
+            }
+
             let now = Instant::now();
             if now >= deadline {
                 tracing::warn!(
@@ -92,8 +130,14 @@ impl PreFilterChain {
             )
             .await
             {
-                Ok(Ok(result)) => result,
+                Ok(Ok(result)) => {
+                    let filter_elapsed = filter_start.elapsed();
+                    host.circuit_breaker.record_success(filter_elapsed);
+                    result
+                }
                 Ok(Err(status)) => {
+                    host.circuit_breaker
+                        .record_failure(&format!("PreFilter gRPC error: {}", status.code()));
                     tracing::error!(
                         host_id = %host.host_id,
                         event_id = %current_event.event_id,
@@ -103,6 +147,8 @@ impl PreFilterChain {
                     continue;
                 }
                 Err(_timeout_elapsed) => {
+                    host.circuit_breaker
+                        .record_failure("PreFilter execution timed out");
                     tracing::warn!(
                         host_id = %host.host_id,
                         event_id = %current_event.event_id,

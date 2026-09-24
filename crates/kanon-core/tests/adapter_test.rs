@@ -678,7 +678,7 @@ async fn platform_circuit_breaker_trips_and_persists_to_dead_letter() {
 
     // 1. Initial circuit state must be Closed
     assert_eq!(
-        supervisor.platform_circuit_state("unstable_im").await,
+        engine.platform_circuit_state("unstable_im").await,
         CircuitState::Closed
     );
 
@@ -720,12 +720,12 @@ async fn platform_circuit_breaker_trips_and_persists_to_dead_letter() {
 
     // 3. Circuit breaker must now be tripped to Open
     assert_eq!(
-        supervisor.platform_circuit_state("unstable_im").await,
+        engine.platform_circuit_state("unstable_im").await,
         CircuitState::Open
     );
 
     // Verify adapter catalog exposes the Open circuit state to the control plane
-    let catalog = supervisor.adapter_catalog().await;
+    let catalog = engine.adapter_catalog().await;
     let desc = catalog
         .iter()
         .find(|d| d.platform == "unstable_im")

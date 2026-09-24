@@ -3,22 +3,24 @@
 //! Provides the central gRPC endpoint (`core.sock`) through which plugin hosts
 //! communicate with the Core microkernel via [`BotApiService`].
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use kanon_proto::v1::bot_api_service_server::{BotApiService, BotApiServiceServer};
 use kanon_proto::v1::{
-    GetStorageRequest, GetStorageResponse, IngestEventRequest, IngestEventResponse,
-    LlmChunk, LlmRequest, RegisterHostRequest, RegisterHostResponse,
+    DeliverMessageRequest, GetStorageRequest, GetStorageResponse, IngestEventRequest,
+    IngestEventResponse, LlmChunk, LlmRequest, RegisterHostRequest, RegisterHostResponse,
     SendMessageRequest, SendMessageResponse, SetStorageRequest, SetStorageResponse,
 };
 use kanon_transport::{core_socket_path, IpcListener};
 
 use crate::adapter::{EventIngress, IngestError};
+use crate::supervisor::Supervisor;
 use kanon_llm::{ChatMessage, ChatRequest, LlmGateway};
 use tokio_stream::StreamExt;
 
@@ -28,26 +30,15 @@ use tokio_stream::StreamExt;
 /// external IM adapters from downstream LLM reasoning and plugin pipelines.
 pub const DEFAULT_INGEST_QUEUE_CAPACITY: usize = 10_000;
 
-/// Registered plugin host metadata retained in the Core state.
-#[derive(Debug, Clone)]
-pub struct HostRegistration {
-    /// Unique identifier for the host process.
-    pub host_id: String,
-    /// Runtime language ("rust", "python", "typescript").
-    pub runtime: String,
-    /// IPC endpoint path or address for reaching this host.
-    pub endpoint: String,
-    /// List of plugin identifiers loaded by this host.
-    pub loaded_plugin_ids: Vec<String>,
-}
-
 /// Core implementation of the [`BotApiService`] gRPC service.
 #[derive(Debug, Clone)]
 pub struct CoreApiService {
     /// Shared Fast-ACK ingest handle; also handed to platform adapters.
     ingress: EventIngress,
-    /// Thread-safe registry of connected and registered plugin hosts.
-    hosts: Arc<RwLock<HashMap<String, HostRegistration>>>,
+    /// Reference to the central Supervisor managing host lifecycles and registration.
+    supervisor: Option<Arc<Supervisor>>,
+    /// Producer channel connected to the central pipeline outbound dispatcher.
+    outbound_sender: Option<mpsc::Sender<DeliverMessageRequest>>,
     /// Optional shared LLM gateway instance for delegating model completions.
     gateway: Option<Arc<LlmGateway>>,
 }
@@ -60,7 +51,8 @@ impl CoreApiService {
     pub fn new(ingress: impl Into<EventIngress>) -> Self {
         Self {
             ingress: ingress.into(),
-            hosts: Arc::new(RwLock::new(HashMap::new())),
+            supervisor: None,
+            outbound_sender: None,
             gateway: None,
         }
     }
@@ -70,22 +62,30 @@ impl CoreApiService {
         &self.ingress
     }
 
+    /// Configures the attached supervisor instance for unified host registration.
+    pub fn with_supervisor(mut self, supervisor: Arc<Supervisor>) -> Self {
+        self.supervisor = Some(supervisor);
+        self
+    }
+
+    /// Configures the outbound message queue sender for dispatching external messages.
+    pub fn with_outbound_sender(mut self, sender: mpsc::Sender<DeliverMessageRequest>) -> Self {
+        self.outbound_sender = Some(sender);
+        self
+    }
+
     /// Configures the active LLM gateway instance.
     pub fn with_gateway(mut self, gateway: Arc<LlmGateway>) -> Self {
         self.gateway = Some(gateway);
         self
-    }
-
-    /// Returns a snapshot of currently registered hosts.
-    pub async fn get_registered_hosts(&self) -> Vec<HostRegistration> {
-        self.hosts.read().await.values().cloned().collect()
     }
 }
 
 
 #[tonic::async_trait]
 impl BotApiService for CoreApiService {
-    /// Registers a newly initialized plugin host with the Core microkernel.
+    /// Registers a newly initialized plugin host with the Core microkernel,
+    /// converging directly into the Supervisor's unified host registry.
     async fn register_host(
         &self,
         request: Request<RegisterHostRequest>,
@@ -98,20 +98,42 @@ impl BotApiService for CoreApiService {
             "Received Host registration request"
         );
 
-        let registration = HostRegistration {
-            host_id: req.host_id.clone(),
-            runtime: req.runtime,
-            endpoint: req.endpoint,
-            loaded_plugin_ids: req.loaded_plugin_ids,
+        let supervisor = match &self.supervisor {
+            Some(s) => s,
+            None => {
+                return Err(Status::unavailable(
+                    "Supervisor is not configured on CoreApiService; cannot register host",
+                ));
+            }
         };
 
-        self.hosts.write().await.insert(req.host_id.clone(), registration);
-
-        Ok(Response::new(RegisterHostResponse {
-            success: true,
-            message: format!("Host '{}' registered successfully", req.host_id),
-            core_metadata: None,
-        }))
+        match supervisor
+            .register_host_endpoint(
+                &req.host_id,
+                &req.runtime,
+                &req.endpoint,
+                &req.loaded_plugin_ids,
+            )
+            .await
+        {
+            Ok(_) => Ok(Response::new(RegisterHostResponse {
+                success: true,
+                message: format!("Host '{}' registered successfully", req.host_id),
+                core_metadata: None,
+            })),
+            Err(e) => {
+                tracing::error!(
+                    host_id = %req.host_id,
+                    error = %e,
+                    "Failed to register host into unified supervisor registry"
+                );
+                Ok(Response::new(RegisterHostResponse {
+                    success: false,
+                    message: format!("Failed to register host: {e}"),
+                    core_metadata: None,
+                }))
+            }
+        }
     }
 
     /// Ingests an inbound event into the core pipeline with millisecond Fast-ACK.
@@ -158,7 +180,7 @@ impl BotApiService for CoreApiService {
         }
     }
 
-    /// Dispatches an outbound message to the target platform adapter.
+    /// Dispatches an outbound message to the target platform adapter via the pipeline queue.
     async fn send_message(
         &self,
         request: Request<SendMessageRequest>,
@@ -169,12 +191,53 @@ impl BotApiService for CoreApiService {
             channel_id = %req.channel_id,
             "Core received SendMessage request"
         );
-        // Stub implementation for Phase 1.
-        Ok(Response::new(SendMessageResponse {
-            success: true,
-            message_id: "stub_msg_1".to_string(),
-            error_message: String::new(),
-        }))
+
+        let sender = match &self.outbound_sender {
+            Some(s) => s,
+            None => {
+                return Err(Status::unavailable(
+                    "Outbound delivery dispatcher is not configured on CoreApiService",
+                ));
+            }
+        };
+
+        static MSG_SEQ: AtomicU64 = AtomicU64::new(1);
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_default();
+        let event_id = format!("send-{:x}-{:x}", now_ms, MSG_SEQ.fetch_add(1, Ordering::Relaxed));
+
+        let deliver_req = DeliverMessageRequest {
+            platform: req.platform.clone(),
+            channel_id: req.channel_id.clone(),
+            recipient_id: req.recipient_id.clone(),
+            segments: req.segments,
+            event_id: event_id.clone(),
+        };
+
+        match sender.try_send(deliver_req) {
+            Ok(()) => Ok(Response::new(SendMessageResponse {
+                success: true,
+                message_id: event_id,
+                error_message: String::new(),
+            })),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    platform = %req.platform,
+                    channel_id = %req.channel_id,
+                    "Outbound queue is full; SendMessage request rejected"
+                );
+                Ok(Response::new(SendMessageResponse {
+                    success: false,
+                    message_id: String::new(),
+                    error_message: "Outbound queue full; delivery dropped".to_string(),
+                }))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(Status::unavailable("Outbound message queue is closed"))
+            }
+        }
     }
 
     /// Server streaming response type for LLM token generation chunks.
@@ -266,24 +329,31 @@ impl BotApiService for CoreApiService {
 
 
     /// Sets an embedded KV key-value pair.
+    ///
+    /// Centralized KV storage via gRPC is unsupported. Plugins should persist state
+    /// locally within their dedicated `./data/plugins/<id>/` directory (e.g. SQLite / DuckDB)
+    /// to avoid RPC data amplification.
     async fn set_storage(
         &self,
         _request: Request<SetStorageRequest>,
     ) -> Result<Response<SetStorageResponse>, Status> {
-        // Stub implementation for Phase 1.
-        Ok(Response::new(SetStorageResponse { success: true }))
+        Err(Status::unimplemented(
+            "Centralized KV storage via gRPC is unsupported; plugins must persist locally in their dedicated data directory",
+        ))
     }
 
     /// Retrieves an embedded KV key-value pair.
+    ///
+    /// Centralized KV storage via gRPC is unsupported. Plugins should persist state
+    /// locally within their dedicated `./data/plugins/<id>/` directory (e.g. SQLite / DuckDB)
+    /// to avoid RPC data amplification.
     async fn get_storage(
         &self,
         _request: Request<GetStorageRequest>,
     ) -> Result<Response<GetStorageResponse>, Status> {
-        // Stub implementation for Phase 1.
-        Ok(Response::new(GetStorageResponse {
-            found: false,
-            value: vec![],
-        }))
+        Err(Status::unimplemented(
+            "Centralized KV storage via gRPC is unsupported; plugins must persist locally in their dedicated data directory",
+        ))
     }
 }
 

@@ -11,8 +11,9 @@
 //! The queue is deliberately bounded: when a platform cannot keep up, the overflow is reported as
 //! an explicit `OutboundFailed` stage instead of growing memory without limit.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use kanon_llm::tool_router::ToolRouter;
@@ -21,12 +22,12 @@ use kanon_proto::v1::{
     DeliverMessageRequest, IngestEventRequest, MessageSegment, PipelineEventRequest,
 };
 
-use crate::adapter::{AdapterError, AdapterKind};
+use crate::adapter::{AdapterDescriptor, AdapterError, AdapterKind};
 use crate::pipeline::command::CommandRouter;
 use crate::pipeline::dead_letter::DeadLetterWriter;
 use crate::pipeline::observer::{PipelineObserver, PipelineStage};
 use crate::pipeline::pre_filter::{PreFilterChain, PreFilterOutcome};
-use crate::supervisor::circuit_breaker::CircuitBreaker;
+use crate::supervisor::circuit_breaker::{CircuitBreaker, CircuitState};
 use crate::supervisor::{AdapterRoute, Supervisor};
 
 /// Default depth of the outbound delivery queue.
@@ -105,6 +106,8 @@ pub struct PipelineEngine {
     outbound_sender: mpsc::Sender<DeliverMessageRequest>,
     /// Consumer side, taken exactly once by [`PipelineEngine::start_outbound_dispatcher`].
     outbound_receiver: Mutex<Option<mpsc::Receiver<DeliverMessageRequest>>>,
+    /// Adaptive circuit breakers maintaining health status per platform outbound queue.
+    platform_circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
 }
 
 impl PipelineEngine {
@@ -121,6 +124,7 @@ impl PipelineEngine {
             dead_letter: Arc::new(DeadLetterWriter::default()),
             outbound_sender,
             outbound_receiver: Mutex::new(Some(outbound_receiver)),
+            platform_circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -150,6 +154,70 @@ impl PipelineEngine {
     /// Returns a handle for enqueuing outbound messages from outside the worker loop.
     pub fn outbound_sender(&self) -> mpsc::Sender<DeliverMessageRequest> {
         self.outbound_sender.clone()
+    }
+
+    /// Retrieves or instantiates the adaptive circuit breaker for a platform's outbound queue.
+    pub async fn platform_circuit_breaker(&self, platform: &str) -> Arc<CircuitBreaker> {
+        let mut breakers = self.platform_circuit_breakers.write().await;
+        breakers
+            .entry(platform.to_string())
+            .or_insert_with(|| Arc::new(CircuitBreaker::with_defaults()))
+            .clone()
+    }
+
+    /// Evaluates the current operational state of a platform's circuit breaker.
+    pub async fn platform_circuit_state(&self, platform: &str) -> CircuitState {
+        let breakers = self.platform_circuit_breakers.read().await;
+        match breakers.get(platform) {
+            Some(cb) => cb.state(),
+            None => CircuitState::Closed,
+        }
+    }
+
+    /// Builds the console-facing adapter catalog: built-ins first, then plugin adapters,
+    /// annotated with real-time outbound circuit breaker states.
+    pub async fn adapter_catalog(&self) -> Vec<AdapterDescriptor> {
+        let mut catalog: Vec<AdapterDescriptor> = Vec::new();
+        for adapter in self.supervisor.adapters().list().await {
+            let circuit_state = self.platform_circuit_state(adapter.platform()).await;
+            catalog.push(AdapterDescriptor {
+                platform: adapter.platform().to_string(),
+                display_name: adapter.display_name().to_string(),
+                kind: AdapterKind::Builtin,
+                connected: adapter.is_connected(),
+                circuit_state,
+                plugin_id: None,
+                host_id: None,
+            });
+        }
+
+        for host in self.supervisor.get_all_hosts().await {
+            let platforms = host.adapter_platforms();
+            if platforms.is_empty() {
+                continue;
+            }
+
+            let display_name = host
+                .adapter_display_name()
+                .unwrap_or_else(|| host.host_id.clone());
+            let plugin_id = host.adapter_plugin_id();
+
+            for platform in platforms {
+                let circuit_state = self.platform_circuit_state(&platform).await;
+                catalog.push(AdapterDescriptor {
+                    platform,
+                    display_name: display_name.clone(),
+                    kind: AdapterKind::Plugin,
+                    connected: true,
+                    circuit_state,
+                    plugin_id: plugin_id.clone(),
+                    host_id: Some(host.host_id.clone()),
+                });
+            }
+        }
+
+        catalog.sort_by(|a, b| a.platform.cmp(&b.platform));
+        catalog
     }
 
     /// Publishes a lifecycle stage to the attached observer, if any.
@@ -219,7 +287,7 @@ impl PipelineEngine {
     /// Delivers a single outbound message and publishes the resulting observation stage,
     /// protected by the platform's adaptive circuit breaker and cold-storage dead-letter queue.
     pub async fn dispatch_outbound_request(&self, request: DeliverMessageRequest) {
-        let breaker = self.supervisor.platform_circuit_breaker(&request.platform).await;
+        let breaker = self.platform_circuit_breaker(&request.platform).await;
         self.dispatch_outbound_request_with_breaker(request, &breaker).await;
     }
 
@@ -314,7 +382,7 @@ impl PipelineEngine {
         let engine = Arc::clone(self);
         tokio::spawn(async move {
             tracing::debug!(platform = %platform, "Platform outbound worker spawned");
-            let breaker = engine.supervisor.platform_circuit_breaker(&platform).await;
+            let breaker = engine.platform_circuit_breaker(&platform).await;
             loop {
                 // Workers retire after 30 seconds of inactivity to reclaim resources.
                 match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {

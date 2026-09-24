@@ -24,13 +24,13 @@
 
 | 评估维度 | 方案 A：进程外宿主 (Out-of-Process gRPC via UDS) ★选定 | 方案 B：单进程内嵌运行时 (PyO3 + V8/QuickJS) | 方案 C：WebAssembly 沙箱 (Wasmtime / Extism) |
 | :--- | :--- | :--- | :--- |
-| **故障隔离性** | **物理隔离**：插件崩溃/OOM 完全不影响主核心与 IM 会话 | **极差**：插件 C 扩展崩溃导致 Rust 进程直接 crash | **极优**：内存/指令级硬沙箱隔离 |
-| **生态兼容性** | **原生 100% 兼容**：pip / npm / Cargo 生态全功能可用 | **良好但受限**：受制于 PyO3 与 Tokio 线程池死锁风险 | **极差**：大部分带 C 绑定的三方库无法编译为 WASI |
-| **开发体验** | **极致原生**：各自语言的原生调试器、热重载与装饰器 SDK | **中等**：跨语言 FFI 复杂，C/Rust 宏报错晦涩 | **繁琐**：需要复杂的编译工具链将源码编译为 .wasm |
-| **进程间通信延迟**| **极低**：UDS 内部管道传输，耗时 **30~80 微秒**（远低于网络 I/O）| **零开销**：直接内存共享访问 | **微秒级**：Wasm 内存拷贝 |
-| **交付难度** | **标准解耦**：Rust 主二进制独立，联动 `uv`/`node`/`cargo` 纳管环境 | **极难**：分发时必须动态链接特定版本的 libpython | **单文件**：单二进制内嵌运行时 |
+| **故障隔离性** | **物理隔离**：插件崩溃/OOM 不影响主核心与其他会话 | **较弱**：插件 C 扩展崩溃可能导致主进程异常退出 | **极优**：内存/指令级硬沙箱隔离 |
+| **生态兼容性** | **良好兼容**：pip / npm / Cargo 生态大部分功能开箱可用 | **良好但受限**：受制于 PyO3 与 Tokio 异步运行时的死锁风险 | **受限**：带底层 C/C++ 绑定的三方库难以编译为 WASI |
+| **开发体验** | **原生调试**：各自语言的原生调试器、热重载与工具链 | **中等**：跨语言 FFI 较复杂，宏报错较难排查 | **繁琐**：需要专用工具链将源码编译为 .wasm |
+| **进程间通信延迟**| **低延迟**：UDS 内部管道传输，基准耗时通常在微秒级（远低于网络 I/O）| **零开销**：直接内存共享访问 | **微秒级**：Wasm 内存拷贝 |
+| **交付难度** | **标准解耦**：Rust 主二进制独立，按需联动 `uv`/`node`/`cargo` 纳管环境 | **困难**：分发时通常需动态链接特定版本的运行时动态库 | **单文件**：单二进制内嵌运行时 |
 
-**结论**：选定 **方案 A（Out-of-Process Sidecar + gRPC over UDS）**，在保持 Rust 核心极致小巧和高可靠的同时，为 Rust、Python 与 TypeScript 开发者提供完全统一的一等公民开发待遇。
+**结论**：选定 **方案 A（Out-of-Process Sidecar + gRPC over UDS）**，在保持 Rust 核心轻量精炼和高可靠的同时，为 Rust、Python 与 TypeScript 开发者提供统一的开发接入体验。
 
 ---
 
@@ -83,11 +83,11 @@ flowchart TB
     Supervisor -->|纳管进程生命周期 / 注入端点与鉴权 Token| HostDomain
 ```
 
-### 2.2 生产级进程隔离与崩溃防护 (Production Isolation Strategy)
+### 2.2 生产环境进程隔离与崩溃防护 (Process Isolation Strategy)
 
 1. **生产环境默认独立子进程隔离 (Per-Plugin Process)**：
-   - 为彻底消除单插件崩溃传播、同步 I/O 阻塞（如 `time.sleep`、无超时网络请求）拖垮同语言其他插件的问题，**生产环境下每个插件默认独占独立子进程与专有依赖环境 (`.venv` / `node_modules`)**。
-   - 某个插件遭遇 SegFault、OOM 或死锁，仅自身子进程退出，核心与其他插件毫发无伤。
+   - 为有效隔离单插件崩溃传播、同步 I/O 阻塞（如 `time.sleep`、无超时网络请求）拖垮同语言其他插件，**生产环境下每个插件默认独占独立子进程与专有依赖环境 (`.venv` / `node_modules`)**。
+   - 某个插件遭遇 SegFault、OOM 或死锁，仅自身子进程退出，核心与其他插件不受影响。
 2. **轻量开发环境共享模式 (Shared Host for Dev)**：
    - 仅在 `kanon-dev dev` 本地调试或用户显式配置 `group = "shared"` 时，才允许多个受信任的轻量插件合部在同一个共享 Host 进程中以节约开发机内存。
 
@@ -104,7 +104,7 @@ kanon/
 │   ├── kanon-proto/                # gRPC 契约与 Tonic 桩代码生成 (含 prost-types)
 │   ├── kanon-transport/            # 跨平台 IPC 传输层抽象 (UDS / 认证 Loopback TCP)
 │   ├── kanon-core/                 # 核心事件循环、消息流水线、Supervisor 进程监管
-│   ├── kanon-storage/              # 嵌入式 KV 持久化引擎与插件安全目录管理器
+│   ├── kanon-storage/              # 嵌入式持久化支持与插件安全目录隔离管理器
 │   ├── kanon-llm/                  # LLM 多端点路由、Token 滑动窗口与 Tool Calling 状态机
 │   ├── kanon-api/                  # Axum RESTful API 与实时 WebSocket 驱动（供独立前端连接）
 │   └── kanon-dev/                  # 官方专用 CLI：项目管理、模板脚手架、开发热重载与沙盒测试
@@ -117,40 +117,40 @@ kanon/
 
 ### 2.4 运行时设计原则：零外部硬依赖与按需惰性激活 (Zero Hard Dependency Principle)
 
-> **核心哲学**：**Python 与 Node.js / Bun 绝对不是运行 Kanon 的必需品！**  
-> Kanon 核心与 Rust 插件是 100% 独立且自包含的原生二进制程序，可以在没有任何外部脚本解释器的纯净操作系统上完美运转。
+> **核心哲学**：**Python 与 Node.js / Bun 并非运行 Kanon 微内核的必需品。**  
+> Kanon 核心与 Rust 原生插件是独立自包含的原生二进制程序，可以在没有任何外部脚本解释器的纯净操作系统上独立运转。
 
 1. **零硬依赖（独立纯净运行）**：
    - 若用户仅使用 Rust 原生插件、内置组件或基础 IM 网关，Kanon 完全不依赖、不探测、不接触任何 Python 或 Node 环境。
-   - 核心启动内存仅 **15~20MB**，分发时仅需单个独立二进制文件。
+   - 核心具备轻量空载基准（在基础调度下内存占用通常低于 20MB），分发时仅需单个独立二进制文件。
 2. **按需惰性激活 (On-Demand & Lazy Activation)**：
    - 核心启动时**不会盲目启动任何外部子进程**。
    - 仅当扫描 `plugins/` 目录且**确实存在**声明为 `runtime = "python"` 的插件时，Supervisor 才会尝试探测 Python/uv 并拉起 `kanon-pyhost`。
    - 同理，仅当**确实存在**声明为 `runtime = "typescript"` 的插件时，才会尝试探测 Node/Bun 并拉起 `kanon-tshost`。
 3. **环境缺失优雅降级 (Graceful Degradation)**：
    - 若用户放入了 Python 或 TS 插件，但当前操作系统未安装对应运行环境：
-     - Kanon **绝对不会崩溃或拒绝启动**；
+     - Kanon 核心**不会直接崩溃或拒绝启动**；
      - 仅对缺少运行时的插件输出清晰友好的告警日志，将其状态标记为 `RuntimeUnavailable`；
-     - 机器人核心、IM 适配网络连接及所有 Rust 插件依然照常极速运行。
+     - 机器人核心、IM 适配网络连接及所有 Rust 插件依然照常运行。
 4. **可选运行时的极简治理（仅在用户需要时生效）**：
    - **Python**：仅在激活 Python 插件时，优先检测极速工具 `uv`，免配复杂的全局环境。
    - **TypeScript**：仅在激活 TS 插件时，优先检测 `bun` 或 `node/tsx`。
 
 ### 2.5 事件入站异步队列与防锁步机制 (Async Ingest Queue & Lockstep Prevention)
 
-为彻底消灭 **“LLM 慢推理/插件慢 I/O 反向阻塞 IM 适配器心跳”** 的时序锁步隐患，系统确立严格的异步解耦规则：
+为防范 **“LLM 慢推理/插件慢 I/O 反向阻塞 IM 适配器心跳”** 的时序锁步风险，系统确立严格的异步解耦规则：
 
-1. **Fast-ACK 毫秒级快速确认**：
+1. **Fast-ACK 快速确认机制**：
    - 适配器插件调用 `BotApiService.IngestEvent` 时，Rust 核心仅执行两件事：事件有效性基本校验、放入带高水位（默认 10,000 缓冲）的内部 Tokio MPSC 异步通道。
-   - 核心在 **< 50 微秒** 内直接返回 `IngestEventResponse { accepted: true, event_id: ... }`。
+   - 核心在非阻塞推入有界内存通道后立即 Fast-ACK 返回（基准投递延迟通常在微秒级，受 OS 调度与系统负载影响）。
 2. **流水线异步消费与独立出站**：
    - 核心工作协程池独立从 MPSC 通道消费事件，调度 PreFilter 拦截链、LLM 编排与 Tool Calling 状态机。
-   - 无论 LLM 生成耗时 2 秒还是 10 秒，反压完全被内部队列隔离，绝不沿着 gRPC 链路逆向传导至适配器。
-   - 最终出站响应通过独立的 `OnDeliverMessage` 单向调用适配器，适配器底层（WebSocket 心跳、长轮询）永久保持极速保活，零丢包、零断连。
+   - 无论 LLM 生成耗时多久，反压均被内部有界队列隔离，绝不沿着 gRPC 链路逆向传导至适配器。
+   - 最终出站响应通过独立的 `OnDeliverMessage` 单向调用适配器，适配器底层（WebSocket 心跳、长轮询）保持保活稳定性，大幅降低因业务阻塞导致的断连风险。
 
 ### 2.6 Windows 本地 Loopback TCP 密码学鉴权规范 (Loopback Token Authentication)
 
-在 Windows 环境下采用本地端口（`127.0.0.1:EphemeralPort`）通信时，为彻底杜绝同机器上非特权恶意进程伪造请求或注入数据，制定硬性安全约束：
+在 Windows 环境下采用本地端口（`127.0.0.1:EphemeralPort`）通信时，为有效防范同机器上非特权进程伪造请求或注入数据，制定硬性安全约束：
 
 1. **32-Byte 随机 Token 注入**：
    - Supervisor 在拉起任何 Host 子进程前，通过密码学安全随机数生成器 (CSPRNG) 生成 32 字节高熵随机 Token（64 字符十六进制编码）。
@@ -161,11 +161,11 @@ kanon/
 
 ### 2.7 Linux/macOS Unix Domain Socket 目录隔离与权限加固规范 (POSIX Socket Security)
 
-在 Unix/Linux 环境下采用 UDS（Unix Domain Socket）通信时，为彻底杜绝本地非特权多租户环境下的符号链接劫持、套接字投毒与非法窃听，制定强制安全约束：
+在 Unix/Linux 环境下采用 UDS（Unix Domain Socket）通信时，为有效防范本地非特权多租户环境下的符号链接劫持、套接字投毒与非法窃听，制定强制安全约束：
 
 1. **运行目录发现与 UID 安全隔离**：
    - 优先遵循 XDG Base Directory 规范使用 `$XDG_RUNTIME_DIR/kanon/run`；
-   - 若环境变量 `$XDG_RUNTIME_DIR` 未设置（例如无桌面环境、部分 Docker 容器或基础 SSH 会话），强制安全回退至 `/tmp/kanon-run-$UID/`（通过 POSIX `libc::getuid()` 获取调用方真实 Effective UID），彻底消灭多用户同机共享未隔离路径的安全隐患。
+   - 若环境变量 `$XDG_RUNTIME_DIR` 未设置（例如无桌面环境、部分 Docker 容器或基础 SSH 会话），强制安全回退至 `/tmp/kanon-run-$UID/`（通过 POSIX `libc::getuid()` 获取调用方真实 Effective UID），有效消除多用户同机共享未隔离路径的安全风险。
 2. **符号链接攻击防御 (Symlink Rejection)**：
    - 在创建或绑定套接字前，核心与 Host 必须使用 `std::fs::symlink_metadata` 深度检查目录元数据；
    - 若目标运行目录属于符号链接（Symlink），直接拒绝并抛出 `std::io::ErrorKind::PermissionDenied`，防止本地非特权攻击者预先埋设软链接诱骗核心向敏感系统路径写入套接字。
@@ -242,7 +242,7 @@ display_name = "Weather IM Adapter"
 
 ## 4. 通信协议规范 (Protocol Buffers IDL)
 
-协议采用强类型 `oneof` 联合体与 `google.protobuf.Struct` 双模载荷，彻底消灭 JSON 字符串二次序列化开销与 base64 内存膨胀：
+协议采用强类型 `oneof` 联合体与 `google.protobuf.Struct` 双模载荷，显著降低 JSON 字符串二次序列化开销与二进制载荷的内存膨胀：
 
 ```protobuf
 syntax = "proto3";
@@ -526,10 +526,10 @@ export default class GreetingPlugin extends Plugin {
 
 1. **子进程崩溃自愈与故障物理隔离**：
    - 生产环境采用独立子进程，任何插件崩溃（OOM、SegFault、未捕获异常）均被完全限制在其子进程内部。
-   - Supervisor 捕获退出状态码并触发指数退避重启（1s -> 2s -> 4s，最多重试 5 次），核心与其他插件永不中断。
-2. **IPC 超时与自适应背压熔断 (Adaptive Backpressure & Circuit Breaking)**：
-   - 指令执行默认超时 5 秒；LLM Tool Calling 默认超时 15 秒。
-   - **自适应延迟信标**：Supervisor 实时监控与各 Host 通信的往返延迟（RTT）与排队深度。当某插件由于 GC 停顿或同步阻塞导致延迟恶化并突破预警阈值时，核心主动触发短路熔断（Circuit Breaker），暂时绕过该插件的 PreFilter 拦截链，防止阻塞主事件流水线引发级联超时（Thundering Herd）。
+   - Supervisor 捕获退出状态码并触发指数退避重启（1s -> 2s -> 4s，最多重试 5 次），核心与其他插件保持正常运行。
+2. **IPC 超时与分层熔断机制 (Tiered Timeouts & Circuit Breaking)**：
+   - **插件调用超时控制**：指令执行默认超时 5 秒；LLM Tool Calling 默认超时 15 秒；PreFilter 链执行受整体超时预算控制（默认 30ms），超出预算时自动短路跳过后续插件，防止慢脚本拖垮整个流水线。
+   - **平台出站熔断保护 (Platform Circuit Breaker)**：由 `PipelineEngine` 为各出站平台独立维护熔断状态机。当目标平台出站连续失败达 5 次时，自动进入 `Open` 状态进行快速短路与死信归档，并以 30 秒周期进入 `Half-Open` 试探探测，避免无效重试持续挤占系统计算资源与并发通道。
 3. **优雅停机与资源回收**：
    - 主核心捕获 SIGINT/SIGTERM 后，向所有激活的 Host 广播停机通知，宿主触发插件 `on_unload` 钩子并在规定时限内平稳退出，核心自动清理运行时目录下的所有 socket 文件与临时状态。
 
@@ -537,17 +537,18 @@ export default class GreetingPlugin extends Plugin {
 
 ## 7. 插件状态与数据持久化规范 (Persistence & Anti-Amplification Spec)
 
-针对高频 PreFilter 场景下的 I/O 放大风险，采用 **读缓存本地化 + 复杂状态下沉** 的混合架构：
+针对高频 PreFilter 场景下的 I/O 放大风险与进程隔离要求，采用 **读缓存本地化 + 独立数据目录物理隔离** 的工程原则：
 
 1. **配置与元数据本地化缓存 (Read-Cache in Host Memory)**：
    - 只读配置项、白名单、动态参数在插件加载及核心推送 `ReloadPluginConfig` 时，直接常驻于 Host 进程内存字典中。
    - 过滤链与指令处理一律内存命中，严禁每条消息往返一次 gRPC 远程读取配置。
-2. **专属物理数据目录 (Local Storage First)**：
-   - 核心在加载插件时，确保 `./data/plugins/<plugin_id>/` 物理目录就绪，并将路径注入 `ctx.data_dir`。
-   - **强烈推荐**：业务插件的复杂状态、用户积分、会话记录建议在插件内部直接使用嵌入式数据库（如 Python/TS/Rust 内置的 SQLite / DuckDB）对本地文件进行高性能读写，彻底消除通过 gRPC 频繁代存带来的性能惩罚。
-3. **协作型轻量 KV 存储 (Coordinated gRPC KV API)**：
-   - 仅针对多插件协同或需核心统一备份的轻量标量数据，提供 `SetStorage` / `GetStorage` API，由核心统一以 SQLite/RocksDB 持久化。
-   - 插件可自由在该目录下创建 SQLite 数据库、存储图片、音频缓存或自定义格式文件。
+2. **专属物理数据目录与本地持久化 (Local Storage First - 唯一权威方案)**：
+   - 核心在加载插件时，确保 `./data/plugins/<plugin_id>/` 物理隔离目录就绪，并将路径注入 `ctx.data_dir`。
+   - **架构约束**：插件的所有持久化状态（如用户积分、业务会话、缓存、离线数据等）必须在插件内部直接使用嵌入式数据库（如 Python/TS/Rust 内置的 SQLite / DuckDB）或本地扁平文件存储在专属目录下。
+   - 彻底避免在微内核中设计低效的集中式代理存储，保障数据隔离边界清晰且无跨进程序列化 I/O 开销。
+3. **gRPC 集中式 KV 存储边界说明 (Centralized KV Deprecation Notice)**：
+   - Protobuf 契约中虽保留历史 `SetStorage` / `GetStorage` 端点定义，但微内核当前明确将其标记为不支持，调用时显式返回 `Status::unimplemented`（指引插件使用专属数据目录本地持久化）。
+   - 核心不内置全局集中式 KV 数据库，防止核心沦为单点数据库代理并规避多插件数据污染风险。
 
 ---
 
@@ -723,27 +724,45 @@ sequenceDiagram
 
 ## 11. 设计缺陷修正与工程优化对照表 (Defect Fixes & Optimization Matrix)
 
-| 架构维度 | 初稿设计隐患 (V1.0) | 生产级优化方案 (V1.2 Final) | 核心收益与防护目标 |
+| 架构维度 | 初稿设计隐患 (V1.0) | 工程收敛方案 (Convergence Baseline) | 核心收益与防护目标 |
 | :--- | :--- | :--- | :--- |
 | **IPC 路由与端点绑定** | 单一 Socket 混杂监听，多客户端反向 RPC 寻址悖论 | **独立端点目录隔离模型**（Core 监听 `core.sock`，各 Host 监听专属 `host_<id>.sock`） | 保持标准 gRPC 纯粹语义，双向调用完全解耦，支持使用 `grpcurl` 独立排障。 |
-| **故障隔离边界** | 默认单一共享 Host 进程，单插件阻塞/崩溃累及全盘 | **生产默认独立子进程隔离 (`Per-Plugin Process`)**，仅在开发调试模式支持合批共享 | 彻底杜绝同步代码阻塞与 C 扩展段错误 (SegFault) 导致的跨插件连环瘫痪。 |
-| **跨平台传输层** | 硬编码 `/tmp/` 路径，Windows 缺失或存在事件循环兼容坑 | **抽象独立 Crate `kanon-transport`**，Linux/macOS 走 UDS，Windows 走安全认证本地 Loopback TCP | 统一 `IpcListener`/`IpcStream` 抽象，彻底消除 Windows 平台底层兼容性风险。 |
-| **富媒体消息载荷** | 弱类型 `map<string, string>` 反模式，二进制被迫 base64 膨胀 | **`oneof` 强类型联合体**，明确划分文本、图片、音频、艾特，支持本地零拷贝路径与裸二进制 | 彻底恢复 Protobuf 类型安全优势，消灭 33% 内存膨胀与无谓解析开销。 |
-| **Tool Calling 序列化** | 采用 string JSON 传参，跨进程带来四次序列化/反序列化消耗 | **双模载荷 (`oneof { google.protobuf.Struct; bytes }`)** | 大模型字典参数零字符串解析损耗，同时保留超大二进制张量的极速直传通道。 |
-| **持久化访问开销** | 高频 PreFilter 频繁发起 gRPC 远程读取 KV，I/O 放大严重 | **读缓存常驻 Host 内存 + 复杂持久化直接下沉至插件专属目录**（本地 SQLite/DuckDB） | 消除远程数据库代理延迟，消息流转达到微秒级纯内存处理效率。 |
-| **Supervisor 容灾** | 仅依赖静态超时判定，高负载与 GC 停顿引发级联超时雪崩 | **引入自适应延迟信标与短路熔断 (Adaptive Circuit Breaker)** | 监控 RTT 延迟，超阈值自动短路跳过受阻插件，彻底粉碎惊群效应 (Thundering Herd)。 |
-| **运行时依赖定位** | 容易被误解为 Python/Node 为强依赖 | **明确核心自包含与零硬依赖原则**，纯 Rust 运行时 < 20MB，Python/Node 仅按需惰性探测 | 保持 Rust 极简纯净单二进制分发的绝对优势。 |
-| **入站与心跳锁步** | 适配器同步阻塞等待核心处理，大模型慢推理导致 IM 网关反向断连 | **Fast-ACK 异步队列机制**（入站 Tokio MPSC 快速返回，出站独立 OnDeliverMessage） | 彻底斩断反压链，保证适配器 WebSocket 心跳与长轮询毫秒级平稳保活。 |
-| **Windows 本地安全性** | 开放 127.0.0.1 端口暴露于同机非特权进程，存在指令嗅探注入风险 | **CSPRNG 32-Byte 随机 Token 握手鉴权**（私有环境变量注入 + gRPC 首帧恒定时间比对） | 彻底隔绝本机未授权恶意进程伪造请求或探测。 |
+| **故障隔离边界** | 默认单一共享 Host 进程，单插件阻塞/崩溃累及全盘 | **生产默认独立子进程隔离 (`Per-Plugin Process`)**，仅在开发调试模式支持合批共享 | 有效隔离同步代码阻塞与 C 扩展段错误 (SegFault) 导致的跨插件连环瘫痪。 |
+| **跨平台传输层** | 硬编码 `/tmp/` 路径，Windows 缺失或存在事件循环兼容坑 | **抽象独立 Crate `kanon-transport`**，Linux/macOS 走 UDS，Windows 走安全认证本地 Loopback TCP | 统一 `IpcListener`/`IpcStream` 抽象，规范跨平台传输层实现。 |
+| **富媒体消息载荷** | 弱类型 `map<string, string>` 反模式，二进制被迫 base64 膨胀 | **`oneof` 强类型联合体**，明确划分文本、图片、音频、艾特，支持本地零拷贝路径与裸二进制 | 恢复 Protobuf 类型安全优势，降低内存膨胀与额外解析开销。 |
+| **Tool Calling 序列化** | 采用 string JSON 传参，跨进程带来四次序列化/反序列化消耗 | **双模载荷 (`oneof { google.protobuf.Struct; bytes }`)** | 大模型字典参数免除字符串解析损耗，同时保留超大二进制张量的直传通道。 |
+| **持久化访问开销** | 高频 PreFilter 频繁发起 gRPC 远程读取 KV，I/O 放大严重 | **读缓存常驻 Host 内存 + 业务持久化直接下沉至插件专属目录**（本地 SQLite/DuckDB） | 消除集中式数据库代理延迟与数据放大，保障插件存储物理隔离。 |
+| **容灾与超时保护** | 仅依赖静态超时判定，高负载与 GC 停顿引发级联超时雪崩 | **流水线 PreFilter 全局预算 + 单平台出站独立熔断器 (Circuit Breaker)** | 限制插件链慢调用，快速短路已宕机平台，降低系统级联雪崩风险。 |
+| **运行时依赖定位** | 容易被误解为 Python/Node 为强依赖 | **明确核心自包含与按需探测原则**，纯 Rust 运行时具备低开销基线，Python/Node 仅按需惰性探测 | 保持 Rust 极简纯净单二进制分发的部署优势。 |
+| **入站与心跳锁步** | 适配器同步阻塞等待核心处理，大模型慢推理导致 IM 网关反向断连 | **Fast-ACK 异步队列机制**（入站 Tokio MPSC 快速返回，出站独立 OnDeliverMessage） | 解耦入站流水线与出站投递，保障适配器心跳不被下游慢推理阻塞。 |
+| **Windows 本地安全性** | 开放 127.0.0.1 端口暴露于同机非特权进程，存在指令嗅探注入风险 | **CSPRNG 32-Byte 随机 Token 握手鉴权**（私有环境变量注入 + gRPC 首帧恒定时间比对） | 有效防范本机未授权非特权进程伪造请求或探测。 |
 | **Linux IPC 路径与权限安全** | 默认目录权限宽松或依赖不可靠的共享 `/tmp/`，面临符号链接劫持与多租户权限越界 | **基于 UID 隔离的 `/tmp/kanon-run-$UID/` 降级路径 + 强制 `0700` 权限收敛与符号链接深度拦截** | 消除本地多用户非特权攻击者对 UDS 套接字的窃听、替换与权限越界风险。 |
 | **插件配置并发更新竞争** | 多并发热更新时缺乏时序锁，后发请求可能被先发慢请求覆盖产生时序倒退 | **CAS (Compare-And-Swap) 乐观并发控制与单调版本向量**（冲突返回 HTTP 409 Conflict，三语言 SDK 验证版本号） | 保证跨进程与控制面配置更新的严格线性一致性与时序安全性。 |
-| **出站平台级联雪崩与抖动** | 外部平台接口严重劣化或停机时，出站重试导致单平台队列严重堵塞甚至反压 | **单平台独立短路熔断器 (Circuit Breaker)**（连续 5 次失败转为 Open，极速短路，30s 半开自愈探测） | 杜绝死循环重试开销，快速释放系统计算资源，保护底层连接池。 |
-| **出站饱和丢包与死信丢失** | 队列背压打满或永久失败后丢弃消息仅有日志，无法离线对账与重放补发 | **按平台与日期分片的死信冷存储归档 (DLQ JSONL)**（落地 `./data/dead_letter/<platform>_<date>.jsonl`） | 实现不可逆出站失败的 100% 审计追踪与离线补发恢复能力。 |
+| **出站平台级联雪崩与抖动** | 外部平台接口严重劣化或停机时，出站重试导致单平台队列严重堵塞甚至反压 | **单平台独立短路熔断器 (Circuit Breaker)**（连续 5 次失败转为 Open，极速短路，30s 半开自愈探测） | 避免无效重试持续消耗系统资源，保护底层连接池。 |
+| **出站饱和丢包与死信排查** | 队列背压打满或永久失败后丢弃消息仅有日志，无法离线对账与重放补发 | **按平台与日期分片的死信冷存储归档 (DLQ JSONL)**（落地 `./data/dead_letter/<platform>_<date>.jsonl`） | 实现不可逆出站失败的审计追踪与离线排查能力。 |
 
+---
 
+## 12. 系统边界与已知局限 (System Boundaries & Known Limitations)
 
+为贯彻“简单优先、显式优先、失败优先、验证优先”的工程准则，本节坦诚列出当前架构版本的明确系统边界与已知局限性：
 
+### 12.1 存储模型边界 (Storage Model Boundaries)
+- **无内置全局集中式 KV 存储**：微内核已彻底移除原存根性质的内存 KV 模块（`crates/kanon-storage/src/kv.rs` 已删除）。`BotApiService.SetStorage` 与 `GetStorage` 端点当前显式返回 `Status::unimplemented`。
+- **本地专属存储第一原则**：所有业务持久化（用户状态、业务缓存等）必须在插件所属的 `./data/plugins/<plugin_id>/` 独立目录中本地持久化（推荐 SQLite、DuckDB 或文件系统）。核心不代理业务读写，亦不提供跨插件共享的分布式数据库抽象。
 
+### 12.2 宿主环境与语言运行时依赖 (Language Host Runtime Dependencies)
+- **Rust 核心自包含**：`kanon-core` 与 `kanon-api` 编译产物为零动态外部依赖的单一原生二进制。
+- **外部多语言宿主依赖宿主环境**：Python 插件需要主机安装 Python 3.10+ 及包管理器（如 `uv` / `pip`）；TypeScript 插件需要系统安装 `bun` 或 `node`/`tsx`。若系统未安装相应运行时，核心在尝试拉起外部宿主时会显式记录错误并拒绝激活该插件，但不会影响 Rust 原生插件与核心流水线的持续运行。
 
+### 12.3 单机有界队列与背压行为 (Single-Node Bounded Queue & Backpressure)
+- **非分布式消息队列**：流水线调度基于 Tokio 进程内内存 MPSC 通道（入站默认容量 1024，单平台出站默认容量 64），不具备类似 Kafka / RabbitMQ 的跨节点分布式容灾与持久化确认机制。
+- **背压饱和丢弃**：入站队列饱和时，核心立即通过 Fast-ACK 返回 `accepted: false`（HTTP 503）；出站平台队列饱和或断路器处于 `Open` 状态时，消息直接转入死信日志（DLQ JSONL）进行冷归档，不提供消息重放消费者，需由运维人员或外部审计工具介入重放。
 
+### 12.4 性能基准声明与调优空间 (Performance Benchmark & Tuning Disclaimer)
+- **指标基线定位**：文档中所提及的时延与吞吐目标（如 PreFilter 30ms 预算、出站熔断连续 5 次阈值等）均为架构级工程约束与默认配置基线，而非在所有硬件环境下的绝对物理性能保证。
+- **实际性能变量**：端到端延迟主要受大语言模型提供商的网络 RTT、推理生成速度、外部 IM 平台 API 速率限制以及 Python/TS 宿主 GC 与脚本效率影响。生产环境应结合实际负载压测调整通道缓冲区大小与超时时间。
 
+### 12.5 单机拓扑与容灾边界 (Single-Node Topology & HA Scope)
+- **单节点进程模型**：微内核当前设计为单机单节点运行形态，Supervisor 仅负责管理本机子进程，不包含跨主机心跳、主备选举或分布式协同功能。
+- **高可用建议**：生产部署时建议通过外部进程管理工具（如 `systemd`、Docker Compose 或 Kubernetes）提供进程级与容器级的高可用拉起守护。

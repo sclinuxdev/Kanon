@@ -434,8 +434,15 @@ pub struct Supervisor {
     adapters: Arc<AdapterRegistry>,
     /// Monotonically increasing configuration version tracking per plugin for CAS updates.
     config_versions: Arc<RwLock<HashMap<String, u64>>>,
-    /// Adaptive circuit breakers maintaining health status per platform outbound queue.
-    platform_circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+}
+
+impl std::fmt::Debug for Supervisor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Supervisor")
+            .field("run_dir", &self.run_dir)
+            .field("core_sock_path", &self.core_sock_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Supervisor {
@@ -456,31 +463,12 @@ impl Supervisor {
             hosts: Arc::new(RwLock::new(HashMap::new())),
             adapters: Arc::new(AdapterRegistry::new()),
             config_versions: Arc::new(RwLock::new(HashMap::new())),
-            platform_circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
     /// Returns the currently applied configuration version for a plugin (0 if never configured).
     pub async fn config_version(&self, plugin_id: &str) -> u64 {
         self.config_versions.read().await.get(plugin_id).copied().unwrap_or(0)
-    }
-
-    /// Retrieves or instantiates the adaptive circuit breaker for a platform's outbound queue.
-    pub async fn platform_circuit_breaker(&self, platform: &str) -> Arc<CircuitBreaker> {
-        let mut breakers = self.platform_circuit_breakers.write().await;
-        breakers
-            .entry(platform.to_string())
-            .or_insert_with(|| Arc::new(CircuitBreaker::with_defaults()))
-            .clone()
-    }
-
-    /// Evaluates the current operational state of a platform's circuit breaker.
-    pub async fn platform_circuit_state(&self, platform: &str) -> CircuitState {
-        let breakers = self.platform_circuit_breakers.read().await;
-        match breakers.get(platform) {
-            Some(cb) => cb.state(),
-            None => CircuitState::Closed,
-        }
     }
 
     /// Returns the built-in adapter registry owned by this supervisor.
@@ -518,16 +506,18 @@ impl Supervisor {
     }
 
     /// Builds the console-facing adapter catalog: built-ins first, then plugin adapters.
+    ///
+    /// Note: Circuit breaker states default to [`CircuitState::Closed`] here; live platform
+    /// outbound breaker states are tracked and queried through [`crate::pipeline::PipelineEngine::adapter_catalog`].
     pub async fn adapter_catalog(&self) -> Vec<AdapterDescriptor> {
         let mut catalog: Vec<AdapterDescriptor> = Vec::new();
         for adapter in self.adapters.list().await {
-            let circuit_state = self.platform_circuit_state(adapter.platform()).await;
             catalog.push(AdapterDescriptor {
                 platform: adapter.platform().to_string(),
                 display_name: adapter.display_name().to_string(),
                 kind: AdapterKind::Builtin,
                 connected: adapter.is_connected(),
-                circuit_state,
+                circuit_state: CircuitState::Closed,
                 plugin_id: None,
                 host_id: None,
             });
@@ -545,7 +535,6 @@ impl Supervisor {
             let plugin_id = host.adapter_plugin_id();
 
             for platform in platforms {
-                let circuit_state = self.platform_circuit_state(&platform).await;
                 catalog.push(AdapterDescriptor {
                     platform,
                     display_name: display_name.clone(),
@@ -553,7 +542,7 @@ impl Supervisor {
                     // A host present in the registry is a live process; a crashed host is removed
                     // by the supervisor, so presence is the connection signal.
                     connected: true,
-                    circuit_state,
+                    circuit_state: CircuitState::Closed,
                     plugin_id: plugin_id.clone(),
                     host_id: Some(host.host_id.clone()),
                 });
@@ -946,6 +935,75 @@ impl Supervisor {
             .write()
             .await
             .insert(host.host_id.clone(), host);
+    }
+
+    /// Binds an external or gRPC-registered plugin host endpoint into the unified Supervisor registry.
+    ///
+    /// If the host has already been spawned and registered by this supervisor, returns the existing instance.
+    /// Otherwise, establishes an IPC connection to `endpoint`, performs the [`GetPluginMeta`] handshake,
+    /// and inserts a new [`ManagedHost`] into the host registry.
+    pub async fn register_host_endpoint(
+        &self,
+        host_id: &str,
+        _runtime: &str,
+        endpoint: &str,
+        loaded_plugin_ids: &[String],
+    ) -> Result<Arc<ManagedHost>, SupervisorError> {
+        if let Some(existing) = self.get_host(host_id).await {
+            tracing::info!(
+                host_id = %host_id,
+                "Host already known to Supervisor; keeping existing registration"
+            );
+            return Ok(existing);
+        }
+
+        let socket_path = PathBuf::from(endpoint);
+        let channel = connect_ipc(&socket_path).await?;
+        let mut host_client = PluginHostServiceClient::new(channel.clone());
+
+        // Attempt initial GetPluginMeta handshake over the established channel.
+        let plugins = match host_client.get_plugin_meta(GetPluginMetaRequest {}).await {
+            Ok(resp) => resp.into_inner().plugins,
+            Err(status) => {
+                tracing::warn!(
+                    host_id = %host_id,
+                    error = %status,
+                    "GetPluginMeta handshake failed on external host; synthesising metadata from declarations"
+                );
+                loaded_plugin_ids
+                    .iter()
+                    .map(|id| PluginMeta {
+                        id: id.clone(),
+                        name: id.clone(),
+                        version: "0.1.0".to_string(),
+                        author: String::new(),
+                        description: String::new(),
+                        commands: vec![],
+                        tools: vec![],
+                    })
+                    .collect()
+            }
+        };
+
+        let managed_host = Arc::new(ManagedHost::new(
+            host_id.to_string(),
+            socket_path,
+            channel,
+            plugins,
+            500,
+        ));
+
+        self.hosts
+            .write()
+            .await
+            .insert(host_id.to_string(), managed_host.clone());
+
+        tracing::info!(
+            host_id = %host_id,
+            "Externally registered host added to unified Supervisor registry"
+        );
+
+        Ok(managed_host)
     }
 
     /// Retrieves an active managed host by its identifier.

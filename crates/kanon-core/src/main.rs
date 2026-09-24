@@ -13,11 +13,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Starting Kanon Core Microkernel Engine...");
 
     let (event_tx, event_rx) = mpsc::channel(DEFAULT_INGEST_QUEUE_CAPACITY);
-    let service = CoreApiService::new(event_tx);
-    let server = CoreIpcServer::with_default_path(service);
+    let socket_path = kanon_transport::core_socket_path(None);
 
     // Initialize process supervisor and start the central pipeline worker loop.
-    let supervisor = Arc::new(Supervisor::new(None, Some(server.socket_path().to_path_buf())));
+    let supervisor = Arc::new(Supervisor::new(None, Some(socket_path.clone())));
     let engine = Arc::new(PipelineEngine::new(supervisor.clone()));
     let worker_handle = engine.clone().start_worker(event_rx);
 
@@ -25,6 +24,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // no adapters registered, so deliveries fail explicitly with `UnknownPlatform` rather than
     // disappearing silently.
     let dispatcher_handle = engine.clone().start_outbound_dispatcher();
+
+    let service = CoreApiService::new(event_tx)
+        .with_supervisor(supervisor.clone())
+        .with_outbound_sender(engine.outbound_sender());
+    let server = CoreIpcServer::new(socket_path, service);
 
     server
         .run(async {

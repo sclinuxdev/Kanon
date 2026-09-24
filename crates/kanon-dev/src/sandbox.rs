@@ -5,6 +5,7 @@
 //! testing of commands, pre-filters, and LLM Tool Calling.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 use thiserror::Error;
@@ -151,9 +152,12 @@ pub async fn run_sandbox(path: &Path, opts: SandboxOptions) -> Result<(), Sandbo
     let run_dir = temp_dir.path().to_path_buf();
     let core_sock = run_dir.join("core.sock");
 
-    // 2. Start Core IPC Server
+    // 2. Initialize Supervisor with the isolated runtime directory
+    let supervisor = Arc::new(Supervisor::new(Some(run_dir.clone()), Some(core_sock.clone())));
+
+    // 3. Start Core IPC Server wired with Supervisor
     let (event_tx, _event_rx) = mpsc::channel(DEFAULT_INGEST_QUEUE_CAPACITY);
-    let core_api = CoreApiService::new(event_tx);
+    let core_api = CoreApiService::new(event_tx).with_supervisor(supervisor.clone());
     let core_server = CoreIpcServer::new(&core_sock, core_api);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -166,9 +170,6 @@ pub async fn run_sandbox(path: &Path, opts: SandboxOptions) -> Result<(), Sandbo
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // 3. Initialize Supervisor with the isolated runtime directory
-    let supervisor = Supervisor::new(Some(run_dir.clone()), Some(core_sock.clone()));
 
     println!("Spawning plugin host process and completing handshake...");
     let host = supervisor

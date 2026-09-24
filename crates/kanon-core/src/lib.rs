@@ -15,7 +15,7 @@ pub use adapter::{
     AdapterDescriptor, AdapterError, AdapterKind, AdapterRegistry, EventIngress, IngestError,
     PlatformAdapter,
 };
-pub use ipc::{CoreApiService, CoreIpcServer, HostRegistration};
+pub use ipc::{CoreApiService, CoreIpcServer};
 pub use manifest::{AdapterSection, PluginManifest, PluginSection, ToolDefinitionEntry};
 pub use pipeline::{
     CommandRouter, DeliveryOutcome, MatchedCommand, PipelineEngine, PipelineObserver,

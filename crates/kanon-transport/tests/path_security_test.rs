@@ -8,28 +8,66 @@ use kanon_transport::path::{
     host_socket_path,
 };
 
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard to safely set or remove an environment variable and guarantee restoration on drop.
+struct EnvVarGuard {
+    var_name: &'static str,
+    original_value: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(var_name: &'static str, val: &str) -> Self {
+        let original_value = std::env::var(var_name).ok();
+        unsafe {
+            std::env::set_var(var_name, val);
+        }
+        Self {
+            var_name,
+            original_value,
+        }
+    }
+
+    fn remove(var_name: &'static str) -> Self {
+        let original_value = std::env::var(var_name).ok();
+        unsafe {
+            std::env::remove_var(var_name);
+        }
+        Self {
+            var_name,
+            original_value,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(ref val) = self.original_value {
+                std::env::set_var(self.var_name, val);
+            } else {
+                std::env::remove_var(self.var_name);
+            }
+        }
+    }
+}
+
 #[test]
 fn default_run_dir_prefers_kanon_run_dir_env() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
     let custom = "/tmp/test-kanon-custom-run-dir";
-    unsafe {
-        std::env::set_var("KANON_RUN_DIR", custom);
-    }
+    let _env = EnvVarGuard::set("KANON_RUN_DIR", custom);
 
     let dir = default_run_dir();
     assert_eq!(dir, PathBuf::from(custom));
-
-    unsafe {
-        std::env::remove_var("KANON_RUN_DIR");
-    }
 }
 
 #[test]
 #[cfg(unix)]
 fn default_run_dir_falls_back_to_uid_isolated_tmp_when_xdg_empty() {
-    unsafe {
-        std::env::remove_var("KANON_RUN_DIR");
-        std::env::remove_var("XDG_RUNTIME_DIR");
-    }
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _env1 = EnvVarGuard::remove("KANON_RUN_DIR");
+    let _env2 = EnvVarGuard::remove("XDG_RUNTIME_DIR");
 
     let dir = default_run_dir();
     let uid = unsafe { libc::getuid() };
@@ -39,18 +77,13 @@ fn default_run_dir_falls_back_to_uid_isolated_tmp_when_xdg_empty() {
 #[test]
 #[cfg(unix)]
 fn default_run_dir_uses_xdg_runtime_dir_when_present() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _env1 = EnvVarGuard::remove("KANON_RUN_DIR");
     let xdg = "/tmp/fake-xdg-runtime-1000";
-    unsafe {
-        std::env::remove_var("KANON_RUN_DIR");
-        std::env::set_var("XDG_RUNTIME_DIR", xdg);
-    }
+    let _env2 = EnvVarGuard::set("XDG_RUNTIME_DIR", xdg);
 
     let dir = default_run_dir();
     assert_eq!(dir, PathBuf::from(xdg).join("kanon").join("run"));
-
-    unsafe {
-        std::env::remove_var("XDG_RUNTIME_DIR");
-    }
 }
 
 #[test]

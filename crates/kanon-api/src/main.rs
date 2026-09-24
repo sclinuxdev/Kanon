@@ -56,12 +56,12 @@ async fn main() -> StartupResult<()> {
     // --- Core microkernel -------------------------------------------------------------
     let (event_tx, event_rx) = mpsc::channel(DEFAULT_INGEST_QUEUE_CAPACITY);
     let ingress = EventIngress::new(event_tx);
-    let service = CoreApiService::new(ingress.clone());
-    let ipc_server = CoreIpcServer::with_default_path(service);
+    let default_ipc = CoreIpcServer::with_default_path(CoreApiService::new(ingress.clone()));
+    let socket_path = default_ipc.socket_path().to_path_buf();
 
     let supervisor = Arc::new(Supervisor::new(
         None,
-        Some(ipc_server.socket_path().to_path_buf()),
+        Some(socket_path.clone()),
     ));
 
     // The pipeline never awaits platform I/O: replies are queued and an independent dispatcher
@@ -71,6 +71,11 @@ async fn main() -> StartupResult<()> {
     );
     let pipeline_worker = engine.clone().start_worker(event_rx);
     let outbound_dispatcher = engine.clone().start_outbound_dispatcher();
+
+    let service = CoreApiService::new(ingress.clone())
+        .with_supervisor(supervisor.clone())
+        .with_outbound_sender(engine.outbound_sender());
+    let ipc_server = CoreIpcServer::new(socket_path, service);
 
     // --- Platform adapters ------------------------------------------------------------
     register_webhook_adapter(&supervisor).await?;

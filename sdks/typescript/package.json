@@ -1,8 +1,9 @@
 {
   "name": "@kanon/sdk-and-host",
   "version": "0.1.0",
-  "description": "Kanon TypeScript SDK and Host process skeleton",
-  "main": "dist/index.js",
+  "description": "Kanon TypeScript SDK and Host process for out-of-process plugins and platform adapters",
+  "main": "dist/src/sdk/index.js",
+  "types": "dist/src/sdk/index.d.ts",
   "scripts": {
     "build": "tsc"
   },

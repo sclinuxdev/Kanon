@@ -8,34 +8,67 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as grpc from "@grpc/grpc-js";
-import * as protoLoader from "@grpc/proto-loader";
-import { Plugin, PluginContext, PluginMeta } from "../sdk/index.js";
+import {
+  CoreHandle,
+  Plugin,
+  PluginContext,
+  loadKanonProto,
+} from "../sdk/index.js";
 
-/** Locates the canonical proto IDL file across workspaces. */
-function findProtoPath(): string {
-  if (process.env.KANON_PROTO_PATH && fs.existsSync(process.env.KANON_PROTO_PATH)) {
-    return process.env.KANON_PROTO_PATH;
+/** Startup budget for the Core endpoint to become reachable before standalone mode. */
+const CORE_READY_TIMEOUT_MS = 2000;
+
+/**
+ * Builds the Core handle that this host process hands to its plugin.
+ *
+ * Returns `undefined` — standalone mode — when `KANON_CORE_SOCK` is unset or the
+ * endpoint never becomes ready within {@link CORE_READY_TIMEOUT_MS}. Handing a plugin
+ * a handle to a dead endpoint would turn every later inbound message into a failure,
+ * so the host probes reachability up front and logs the standalone decision
+ * explicitly instead of fabricating a working context.
+ */
+async function connectCore(
+  coreSockPath: string | undefined,
+): Promise<CoreHandle | undefined> {
+  if (!coreSockPath) {
+    console.warn(
+      "KANON_CORE_SOCK is not set: starting in standalone mode, ctx.core will be undefined",
+    );
+    return undefined;
   }
 
-  let current = __dirname;
-  for (let i = 0; i < 6; i++) {
-    const candidate = path.join(current, "proto/kanon/v1/plugin.proto");
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-    current = path.dirname(current);
+  const handle = new CoreHandle(coreSockPath);
+  if (!(await handle.waitForReady(CORE_READY_TIMEOUT_MS))) {
+    console.warn(
+      `Core endpoint '${coreSockPath}' is unreachable: starting in standalone mode, ctx.core will be undefined`,
+    );
+    // The channel never became ready, so release its resources right away.
+    handle.close();
+    return undefined;
   }
 
-  current = process.cwd();
-  for (let i = 0; i < 6; i++) {
-    const candidate = path.join(current, "proto/kanon/v1/plugin.proto");
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-    current = path.dirname(current);
-  }
+  console.log(`Connected to Core endpoint ${coreSockPath}`);
+  return handle;
+}
 
-  throw new Error("Cannot locate proto/kanon/v1/plugin.proto");
+/** Binds the host gRPC server, resolving once the IPC endpoint accepts connections. */
+function bindHostServer(server: grpc.Server, bindAddress: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    server.bindAsync(
+      bindAddress,
+      // Local IPC (UDS, or loopback TCP) needs no transport security: on Unix the
+      // run directory is created with 0700 permissions, so only the Core's user can
+      // reach this socket. This mirrors the client credentials CoreHandle defaults to.
+      grpc.ServerCredentials.createInsecure(),
+      (err: Error | null) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve();
+      },
+    );
+  });
 }
 
 /** Parses entrypoint from plugin.toml or direct script path. */
@@ -141,15 +174,27 @@ async function main(): Promise<void> {
   const coreSockPath = process.env.KANON_CORE_SOCK;
   const hostId = process.env.KANON_HOST_ID || "host_ts";
 
-  // 2. Load and initialize plugin
+  // 2. Load the plugin and assemble its context together with the Core client.
+  //
+  //    The context is built here, before `onLoad`, because the Core handle is
+  //    process-wide state: the host owns exactly one channel to the Core, hands the
+  //    same handle to the plugin for its whole lifetime, and closes it on shutdown.
+  //    A plugin cannot create this handle later by itself without hand-rolling gRPC,
+  //    which is precisely what the SDK exists to prevent. Building both objects in
+  //    one place also keeps the standalone decision honest: when the Core socket is
+  //    absent or dead, `ctx.core` is left undefined and the plugin is told so by the
+  //    log, rather than receiving a client that can only fail on first use.
   const plugin = await loadPlugin(pluginPath);
   const meta = plugin.meta();
 
   const dataDir = path.resolve(`./data/plugins/${meta.id}`);
   fs.mkdirSync(dataDir, { recursive: true });
+
+  const coreHandle = await connectCore(coreSockPath);
   const ctx: PluginContext = {
     dataDir,
     config: {},
+    core: coreHandle,
   };
   await plugin.onLoad(ctx);
 
@@ -161,19 +206,10 @@ async function main(): Promise<void> {
     } catch (_) {}
   }
 
-  // 4. Load gRPC IDL definitions
-  const protoFile = findProtoPath();
-  const packageDefinition = protoLoader.loadSync(protoFile, {
-    keepCase: true,
-    longs: String,
-    enums: String,
-    defaults: true,
-    oneofs: true,
-    includeDirs: [path.dirname(path.dirname(path.dirname(protoFile)))],
-  });
-
-  const protoDescriptor = grpc.loadPackageDefinition(packageDefinition);
-  const kanonV1 = (protoDescriptor as any).kanon.plugin.v1;
+  // 4. Load gRPC IDL definitions. The descriptor is memoized in the SDK and also
+  //    backs the CoreHandle client, so host server and Core client always agree on
+  //    the IDL and its field naming.
+  const kanonV1 = (loadKanonProto() as any).kanon.plugin.v1;
 
   // 5. Initialize gRPC server and register services
   const server = new grpc.Server();
@@ -258,25 +294,37 @@ async function main(): Promise<void> {
 
   // 6. Bind to IPC endpoint
   const bindAddress = `unix:${socketPath}`;
-  server.bindAsync(
-    bindAddress,
-    grpc.ServerCredentials.createInsecure(),
-    (err: Error | null, port: number) => {
-      if (err) {
-        console.error(`Failed to bind socket ${bindAddress}:`, err);
-        process.exit(1);
-      }
-      console.log(`Kanon TypeScript Host running on ${socketPath}`);
-    },
-  );
+  try {
+    await bindHostServer(server, bindAddress);
+    console.log(`Kanon TypeScript Host running on ${socketPath}`);
+  } catch (err) {
+    console.error(`Failed to bind socket ${bindAddress}:`, err);
+    process.exit(1);
+  }
 
-  // 7. Handle graceful shutdown
+  // 7. Announce this host to the Core, now that the endpoint is actually serving:
+  //    the Core may connect back to `socketPath` as soon as it learns about it, so
+  //    registering before the bind would advertise an endpoint that refuses calls.
+  //    A failure here is not fatal for ingestion — the channel was verified READY in
+  //    step 2 and stays usable — so it is logged rather than escalated.
+  if (coreHandle) {
+    try {
+      await coreHandle.registerHost(hostId, socketPath, [meta.id]);
+      console.log(`Registered with Core as host '${hostId}'`);
+    } catch (err: any) {
+      console.warn(`Failed to register with Core: ${err?.message || err}`);
+    }
+  }
+
+  // 8. Handle graceful shutdown
   const shutdown = async () => {
     try {
       await plugin.onUnload();
     } catch (_) {}
 
     server.tryShutdown(() => {
+      // The host owns the shared channel, so it is closed here and nowhere else.
+      coreHandle?.close();
       if (fs.existsSync(socketPath)) {
         try {
           fs.unlinkSync(socketPath);

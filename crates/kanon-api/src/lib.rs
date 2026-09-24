@@ -1,7 +1,47 @@
-//! Kanon API Module (Skeleton)
+//! # Kanon API Module
 //!
-//! Provides decoupled RESTful endpoints and real-time WebSocket streams
-//! for independent WebUI dashboards and management clients.
+//! Headless management gateway for the Kanon microkernel: a decoupled control plane exposing
+//! RESTful endpoints and real-time WebSocket channels for external WebUI consoles and
+//! management clients.
+//!
+//! ## Endpoints
+//! - `GET  /api/v1/health` — liveness, uptime and memory footprint;
+//! - `GET  /api/v1/metrics` — Prometheus text exposition;
+//! - `GET  /api/v1/plugins` — supervised hosts and plugin catalog;
+//! - `GET  /api/v1/plugins/:id/config` — current values plus declaration schema;
+//! - `PUT  /api/v1/plugins/:id/config` — validate, hot reload, persist;
+//! - `POST /api/v1/plugins/:id/restart` — restart the owning host process;
+//! - `GET  /api/v1/sessions` — paginated session metadata;
+//! - `POST /api/v1/sessions/:id/reset` — clear history, keep persona and variables;
+//! - `POST /api/v1/sessions/:id/persona` — hot-swap the session persona;
+//! - `GET  /api/v1/personas` — persona catalog;
+//! - `POST /api/v1/chat/completions` — sandbox chat, JSON or `text/event-stream`;
+//! - `GET  /ws/v1/logs` — structured log broadcast with level / plugin filters;
+//! - `GET  /ws/v1/events` — end-to-end message lifecycle trace bus.
+//!
+//! ## Composition
+//! The gateway never owns business state: it composes owners that already exist in the
+//! microkernel — [`kanon_core::Supervisor`] for plugin processes, [`kanon_llm::SessionManager`]
+//! and [`kanon_llm::PersonaRegistry`] for conversations, and the [`kanon_llm::Agent`] for
+//! reasoning. [`state::ApiState::builder`] wires them together and, when a model provider is
+//! supplied, attaches the trace event bus as an agent hook so LLM and tool-calling stages join
+//! the same timeline as pipeline stages.
 
+pub mod error;
+pub mod metrics;
+pub mod observability;
+pub mod plugin_config;
 pub mod routes;
+pub mod server;
+pub mod state;
+pub mod system;
 pub mod ws;
+
+pub use error::ApiError;
+pub use metrics::{MetricsRegistry, RuntimeGauges};
+pub use observability::{
+    LogLevel, LogRecord, Observability, TraceEvent, TraceEventBus, TraceRecord,
+};
+pub use plugin_config::PluginConfigStore;
+pub use server::{ApiServer, app};
+pub use state::{ApiState, ApiStateBuilder, default_agent_config};

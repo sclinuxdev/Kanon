@@ -4,11 +4,32 @@ version = "0.1.0"
 edition = "2024"
 description = "Decoupled RESTful API and WebSocket gateway for Kanon"
 
+[[bin]]
+name = "kanon-api"
+path = "src/main.rs"
+
 [dependencies]
 kanon-core = { path = "../kanon-core" }
+kanon-llm = { path = "../kanon-llm" }
+kanon-proto = { path = "../kanon-proto" }
+kanon-storage = { path = "../kanon-storage" }
 tokio = { version = "1.40", features = ["full"] }
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+async-trait = "0.1"
+thiserror = "1.0"
+tonic = "0.12"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio-tungstenite = "0.24"
+tempfile = "3.12"
+toml = "0.8"

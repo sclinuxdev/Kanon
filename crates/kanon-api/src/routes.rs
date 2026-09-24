@@ -1,1 +1,0 @@
-//! RESTful route definitions skeleton

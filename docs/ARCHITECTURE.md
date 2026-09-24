@@ -515,20 +515,52 @@ sequenceDiagram
 
 ### 9.2 核心 RESTful 端点定义
 
+> 全部端点由 `crates/kanon-api` 实现（Axum Router，路径参数采用 Axum 0.7 `:id` 语法，文档统一写作 `{id}`）。
+> 统一错误信封：`{"error": {"code": "...", "message": "..."}}`，状态码语义为
+> `400` 契约违规 / `404` 资源不存在 / `409` 当前状态下不可执行 / `503` 依赖未配置 / `502` 插件宿主机或模型网关失败。
+
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `GET` | `/api/v1/health` | 核心健康状态与基础运行指标 (Memory, Uptime) |
+| `GET` | `/api/v1/health` | 核心健康状态与基础运行指标 (Memory, Uptime, 插件与会话计数) |
 | `GET` | `/api/v1/plugins` | 查询所有已发现插件清单、运行状态与静态元数据 |
-| `GET` | `/api/v1/plugins/{id}/config` | 获取指定插件的配置项当前值与 JSON Schema |
-| `PUT` | `/api/v1/plugins/{id}/config` | 更新插件配置项并触发热重载 |
-| `POST` | `/api/v1/plugins/{id}/restart` | 重启指定插件所在的宿主进程 |
-| `GET` | `/api/v1/adapters` | 查询已注册的平台适配器及其连接存活状态 |
+| `GET` | `/api/v1/plugins/{id}/config` | 获取指定插件的配置项当前值与 JSON Schema（含 Schema 默认值合并） |
+| `PUT` | `/api/v1/plugins/{id}/config` | 校验配置 → 触发跨进程热重载 → 原子持久化（宿主拒绝则不落盘） |
+| `POST` | `/api/v1/plugins/{id}/restart` | 重启指定插件所在的宿主进程（依赖 Supervisor 记录的启动配方） |
+| `GET` | `/api/v1/sessions` | 分页查询会话元数据（Turn 计数、Token 消耗、活跃时间、Persona、作用域） |
+| `POST` | `/api/v1/sessions/{id}/reset` | 安全重置会话历史，保留配置变量与人设 |
+| `POST` | `/api/v1/sessions/{id}/persona` | 动态热切换指定会话的生效人设 |
+| `GET` | `/api/v1/personas` | 查询系统预设及动态注册人设列表 |
 | `GET` | `/api/v1/metrics` | 导出 Prometheus 格式的系统与消息吞吐指标 |
+| `POST` | `/api/v1/chat/completions` | 在线沙盒对话调试，支持标准 JSON 与 `text/event-stream` 流式输出 |
+| `GET` | `/api/v1/adapters` | 查询已注册的平台适配器及其连接存活状态（待适配器注册表落地后实现） |
 
 ### 9.3 实时数据流 (WebSocket)
 
 - **实时日志流**：`ws://host:port/ws/v1/logs` —— 采用结构化 JSON 实时回传主核心及各子进程的标准输出日志（支持按 log level、plugin_id 过滤）。
 - **事件追踪总线**：`ws://host:port/ws/v1/events` —— 用于控制台实时可视化展示消息到达、PreFilter 状态、LLM Tool Calling 过程及最终出站全链路追踪。
+- **过滤协商**：两条信道均支持查询参数（`level` / `plugin_id` / `session_id` / `kind`）与运行时 `{"type":"filter",...}` 控制帧；
+  连接建立后先回送 `ready` 帧回显生效过滤器，订阅端滞后于广播缓冲时显式推送 `{"type":"lagged","skipped":N}`，绝不静默丢弃。
+- **事件分层**：流水线事件以 `kind="pipeline"` 承载，并附带细粒度 `stage` 字段
+  （`ingested` → `pre_filter_started` → `pre_filter_passed` / `pre_filter_blocked` → `command_matched` → `llm_replied` → `outbound_queued`），
+  控制台既可订阅 `kind=pipeline` 观察全链路，也可按 `kind=ingested` 等单阶段精确过滤；LLM 与 Tool Calling 阶段由 `EventBus` 本身作为
+  `AgentHook` 注入 Agent，与流水线阶段共用同一条有序事件流。
+
+### 9.4 无头节点运行形态 (`kanon-api` 二进制)
+
+`crates/kanon-api` 同时提供 `kanon-api` 可执行文件，作为无头节点的组合根：同一进程内启动
+`core.sock` IPC 服务、流水线工作循环、Supervisor 与 Axum 管理网关，并将可观测性中心同时接入 `tracing` 与控制台广播信道。
+
+| 环境变量 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `KANON_API_ADDR` | `127.0.0.1:8080` | 管理网关监听地址（默认仅回环，避免误暴露） |
+| `KANON_LLM_BASE_URL` | 未设置 | 模型网关基址；未设置时聊天调试端点显式返回 `503`，绝不以假 Provider 掩盖缺失配置 |
+| `KANON_LLM_API_KEY` | 未设置 | 模型服务凭证 |
+| `KANON_LLM_MODEL` | `gpt-4o-mini` | 默认模型标识 |
+| `KANON_LLM_PROTOCOL` | `openai` | `openai` / `openai_responses` / `anthropic`，未知取值在启动期直接报错 |
+| `RUST_LOG` | `info` | 标准 `tracing` 过滤指令 |
+
+插件配置持久化位置遵循数据隔离规范：`./data/plugins/<plugin_id>/config.json`，采用「临时文件 + `rename`」原子提交，
+写入顺序为 **校验 → 宿主热重载确认 → 落盘**，宿主拒绝时不会留下半更新配置。
 
 ---
 

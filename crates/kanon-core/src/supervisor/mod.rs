@@ -216,13 +216,6 @@ impl ManagedHost {
             .as_ref()
             .filter(|manifest| manifest.adapter.is_some())
             .map(|manifest| manifest.plugin.id.clone())
-            .or_else(|| {
-                // A host spawned as a raw executable may still serve an adapter reported by the
-                // live process; fall back to the first declared plugin so routing keeps working.
-                self.adapter_platforms()
-                    .first()
-                    .and_then(|_| self.meta.first().map(|meta| meta.id.clone()))
-            })
     }
 }
 

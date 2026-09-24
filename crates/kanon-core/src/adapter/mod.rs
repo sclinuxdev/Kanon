@@ -105,7 +105,7 @@ impl EventIngress {
 
     /// Configured high-watermark of the ingest queue, useful for diagnostics.
     pub fn capacity(&self) -> usize {
-        self.sender.capacity()
+        self.sender.max_capacity()
     }
 
     /// Returns `true` when the pipeline worker has stopped consuming events.

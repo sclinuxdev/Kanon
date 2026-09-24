@@ -7,6 +7,10 @@
 //!
 //! # Environment
 //! - `KANON_API_ADDR` — management gateway bind address (default `127.0.0.1:8080`).
+//! - `KANON_WEBHOOK_PLATFORM` — platform id served by the bundled webhook adapter (default
+//!   `webhook`); inbound messages POST to `/api/v1/adapters/<platform>/ingest`.
+//! - `KANON_WEBHOOK_CALLBACK_URL` — outbound callback URL; when unset the adapter stays
+//!   inbound-only and reports `connected: false` instead of pretending to deliver.
 //! - `KANON_LLM_BASE_URL` — model provider base URL; when unset, chat debugging is disabled and
 //!   `/api/v1/chat/completions` answers `503` instead of inventing a fake provider.
 //! - `KANON_LLM_API_KEY` — provider credential.
@@ -17,7 +21,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use kanon_api::{ApiServer, ApiState, Observability, default_agent_config};
+use kanon_api::{ApiServer, ApiState, Observability, WebhookAdapter, default_agent_config};
+use kanon_core::EventIngress;
 use kanon_core::ipc::{CoreApiService, CoreIpcServer, DEFAULT_INGEST_QUEUE_CAPACITY};
 use kanon_core::pipeline::PipelineEngine;
 use kanon_core::supervisor::Supervisor;
@@ -32,8 +37,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// Default management gateway bind address (loopback only, never exposed by accident).
 const DEFAULT_API_ADDR: &str = "127.0.0.1:8080";
 
-/// Capacity of the outbound reply channel feeding platform adapters.
-const OUTBOUND_QUEUE_CAPACITY: usize = 1024;
+/// Default platform identifier served by the bundled webhook adapter.
+const DEFAULT_WEBHOOK_PLATFORM: &str = "webhook";
 
 /// Fallible startup result type shared by the binary entrypoint helpers.
 type StartupResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -50,7 +55,8 @@ async fn main() -> StartupResult<()> {
 
     // --- Core microkernel -------------------------------------------------------------
     let (event_tx, event_rx) = mpsc::channel(DEFAULT_INGEST_QUEUE_CAPACITY);
-    let service = CoreApiService::new(event_tx);
+    let ingress = EventIngress::new(event_tx);
+    let service = CoreApiService::new(ingress.clone());
     let ipc_server = CoreIpcServer::with_default_path(service);
 
     let supervisor = Arc::new(Supervisor::new(
@@ -58,28 +64,24 @@ async fn main() -> StartupResult<()> {
         Some(ipc_server.socket_path().to_path_buf()),
     ));
 
-    // Outbound replies are drained by a task until a platform adapter subscribes; dropping them
-    // silently would hide pipeline bugs, so each drop is logged with its routing key.
-    let (outbound_tx, mut outbound_rx) = mpsc::channel(OUTBOUND_QUEUE_CAPACITY);
+    // The pipeline never awaits platform I/O: replies are queued and an independent dispatcher
+    // resolves the destination platform to a built-in adapter or a plugin host.
     let engine = Arc::new(
-        PipelineEngine::new(supervisor.clone(), Some(outbound_tx))
-            .with_observer(observability.events.clone()),
+        PipelineEngine::new(supervisor.clone()).with_observer(observability.events.clone()),
     );
-    let pipeline_worker = engine.start_worker(event_rx);
-    let outbound_drain = tokio::spawn(async move {
-        while let Some(request) = outbound_rx.recv().await {
-            tracing::warn!(
-                platform = %request.platform,
-                channel_id = %request.channel_id,
-                segments = request.segments.len(),
-                "No platform adapter registered; outbound message dropped"
-            );
-        }
-    });
+    let pipeline_worker = engine.clone().start_worker(event_rx);
+    let outbound_dispatcher = engine.clone().start_outbound_dispatcher();
+
+    // --- Platform adapters ------------------------------------------------------------
+    register_webhook_adapter(&supervisor).await?;
+    for (platform, error) in supervisor.adapters().start_all(ingress.clone()).await {
+        tracing::error!(platform = %platform, error = %error, "Adapter failed to start");
+    }
 
     // --- Management gateway -----------------------------------------------------------
-    let mut builder =
-        ApiState::builder(supervisor.clone()).with_observability(observability.clone());
+    let mut builder = ApiState::builder(supervisor.clone())
+        .with_observability(observability.clone())
+        .with_ingress(ingress.clone());
     if let Some((provider, model)) = provider_from_env()? {
         tracing::info!(model = %model, "LLM provider configured for sandbox chat");
         builder = builder.with_llm_provider("kanon-core", provider, default_agent_config(model));
@@ -128,10 +130,45 @@ async fn main() -> StartupResult<()> {
     }
 
     pipeline_worker.abort();
-    outbound_drain.abort();
+    if let Some(handle) = outbound_dispatcher {
+        handle.abort();
+    }
+    for (platform, error) in supervisor.adapters().stop_all().await {
+        tracing::warn!(platform = %platform, error = %error, "Adapter failed to stop cleanly");
+    }
     supervisor.stop_all().await?;
 
     tracing::info!("Kanon node shut down gracefully");
+    Ok(())
+}
+
+/// Registers the bundled webhook adapter from environment configuration.
+///
+/// The adapter is always registered: inbound ingress works out of the box (a fresh node can be
+/// driven by `curl`), while outbound delivery stays explicitly disabled until a callback URL is
+/// provided, which the console reports as `connected: false`.
+async fn register_webhook_adapter(supervisor: &Arc<Supervisor>) -> StartupResult<()> {
+    let platform =
+        std::env::var("KANON_WEBHOOK_PLATFORM").unwrap_or_else(|_| DEFAULT_WEBHOOK_PLATFORM.to_string());
+    let callback_url = std::env::var("KANON_WEBHOOK_CALLBACK_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty());
+
+    let adapter = WebhookAdapter::new(platform.clone(), None, callback_url.clone())?;
+    supervisor
+        .adapters()
+        .register(Arc::new(adapter))
+        .await?;
+
+    if callback_url.is_some() {
+        tracing::info!(platform = %platform, "Webhook adapter registered with outbound callback");
+    } else {
+        tracing::info!(
+            platform = %platform,
+            "Webhook adapter registered inbound-only (KANON_WEBHOOK_CALLBACK_URL is unset)"
+        );
+    }
+
     Ok(())
 }
 

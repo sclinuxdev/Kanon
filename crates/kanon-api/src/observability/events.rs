@@ -239,6 +239,12 @@ impl EventBus {
                 PipelineStage::OutboundQueued { segment_count, .. } => {
                     MetricsRegistry::add(&self.metrics.outbound_messages, *segment_count as u64);
                 }
+                PipelineStage::OutboundDelivered { .. } => {
+                    MetricsRegistry::incr(&self.metrics.outbound_delivered);
+                }
+                PipelineStage::OutboundFailed { .. } => {
+                    MetricsRegistry::incr(&self.metrics.outbound_failed);
+                }
                 PipelineStage::PreFilterStarted { .. } => {}
             },
             TraceEvent::LlmRequest { .. } => {

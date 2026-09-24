@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kanon_core::Supervisor;
+use kanon_core::{EventIngress, Supervisor};
 use kanon_llm::{
     Agent, AgentConfig, LlmProvider, Memory, PersonaRegistry, SessionManager, SlidingWindowMemory,
 };
@@ -48,6 +48,8 @@ struct ApiStateInner {
     config_store: Arc<PluginConfigStore>,
     /// Real-time log and trace channels plus the metrics registry.
     observability: Arc<Observability>,
+    /// Fast-ACK ingest handle driving the inbound data plane, absent when no pipeline is attached.
+    ingress: Option<EventIngress>,
 }
 
 impl ApiState {
@@ -105,6 +107,11 @@ impl ApiState {
     pub fn observability(&self) -> &Arc<Observability> {
         &self.inner.observability
     }
+
+    /// Inbound ingest handle used by the adapter data plane.
+    pub fn ingress(&self) -> Option<&EventIngress> {
+        self.inner.ingress.as_ref()
+    }
 }
 
 /// Fluent builder assembling [`ApiState`].
@@ -118,6 +125,7 @@ pub struct ApiStateBuilder {
     pending_llm: Option<PendingLlm>,
     config_base_dir: Option<PathBuf>,
     observability: Option<Arc<Observability>>,
+    ingress: Option<EventIngress>,
 }
 
 /// Model provider awaiting agent construction at build time.
@@ -140,6 +148,7 @@ impl ApiStateBuilder {
             pending_llm: None,
             config_base_dir: None,
             observability: None,
+            ingress: None,
         }
     }
 
@@ -207,6 +216,15 @@ impl ApiStateBuilder {
         self
     }
 
+    /// Injects the Fast-ACK ingest handle that connects the adapter data plane to the pipeline.
+    ///
+    /// Without it the ingest endpoint answers `503`: the gateway refuses to accept messages it
+    /// cannot hand to a running pipeline.
+    pub fn with_ingress(mut self, ingress: EventIngress) -> Self {
+        self.ingress = Some(ingress);
+        self
+    }
+
     /// Finalizes the state graph.
     pub fn build(self) -> ApiState {
         let observability = self
@@ -265,6 +283,7 @@ impl ApiStateBuilder {
                 agent,
                 config_store,
                 observability,
+                ingress: self.ingress,
             }),
         }
     }

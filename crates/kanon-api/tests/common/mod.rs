@@ -10,9 +10,11 @@ use std::sync::Arc;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
+use async_trait::async_trait;
 use kanon_api::{ApiState, default_agent_config};
-use kanon_core::PluginManifest;
 use kanon_core::supervisor::Supervisor;
+use kanon_core::{AdapterError, EventIngress, PlatformAdapter, PluginManifest};
+use kanon_proto::v1::{DeliverMessageRequest, DeliverMessageResponse, IngestEventRequest};
 use kanon_llm::{ChatRequest, ChatResponse, GatewayError, LlmProvider, TokenUsage};
 use kanon_proto::v1::{CommandMeta, PluginMeta, ToolMeta};
 use serde_json::Value;
@@ -66,6 +68,10 @@ description = "Fixture plugin used by API integration tests"
 runtime = "rust"
 entrypoint = "target/debug/fixture"
 priority = 120
+
+[adapter]
+platform = "fixture_platform"
+display_name = "Fixture Platform"
 
 [config_schema]
 type = "object"
@@ -267,4 +273,90 @@ pub fn error_code(body: &Value) -> &str {
         .and_then(|error| error.get("code"))
         .and_then(Value::as_str)
         .unwrap_or_default()
+}
+
+/// Platform identifier of the built-in adapter registered by [`adapter_state`].
+pub const BUILTIN_PLATFORM: &str = "builtin_platform";
+
+/// Platform identifier declared by the fixture plugin manifest.
+pub const PLUGIN_PLATFORM: &str = "fixture_platform";
+
+/// Built-in adapter that records every delivered message in memory.
+#[derive(Default)]
+pub struct RecordingAdapter {
+    deliveries: std::sync::Mutex<Vec<DeliverMessageRequest>>,
+}
+
+impl RecordingAdapter {
+    /// Creates an empty recording adapter.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns a snapshot of the messages delivered so far.
+    pub fn deliveries(&self) -> Vec<DeliverMessageRequest> {
+        self.deliveries.lock().expect("delivery lock").clone()
+    }
+}
+
+#[async_trait]
+impl PlatformAdapter for RecordingAdapter {
+    fn platform(&self) -> &str {
+        BUILTIN_PLATFORM
+    }
+
+    fn display_name(&self) -> &str {
+        "Built-in fixture adapter"
+    }
+
+    async fn deliver(
+        &self,
+        request: DeliverMessageRequest,
+    ) -> Result<DeliverMessageResponse, AdapterError> {
+        let message_id = format!("builtin-{}", request.channel_id);
+        self.deliveries
+            .lock()
+            .expect("delivery lock")
+            .push(request);
+
+        Ok(DeliverMessageResponse {
+            success: true,
+            message_id,
+            error_message: String::new(),
+        })
+    }
+}
+
+/// Builds gateway state with both adapter routes available and an ingest queue the test can drain.
+///
+/// Returns the state, the receiving end of the ingest channel (so tests can assert what the
+/// gateway actually enqueued), and the built-in adapter (so tests can assert what it delivered).
+pub async fn adapter_state(
+    config_dir: PathBuf,
+    capacity: usize,
+) -> (
+    ApiState,
+    tokio::sync::mpsc::Receiver<IngestEventRequest>,
+    Arc<RecordingAdapter>,
+) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let supervisor = Arc::new(Supervisor::new(Some(temp.path().to_path_buf()), None));
+    std::mem::forget(temp);
+
+    register_fixture_host(&supervisor).await;
+
+    let adapter = Arc::new(RecordingAdapter::new());
+    supervisor
+        .adapters()
+        .register(adapter.clone())
+        .await
+        .expect("built-in adapter registers");
+
+    let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(capacity);
+    let state = ApiState::builder(supervisor)
+        .with_config_dir(config_dir)
+        .with_ingress(EventIngress::new(ingest_tx))
+        .build();
+
+    (state, ingest_rx, adapter)
 }

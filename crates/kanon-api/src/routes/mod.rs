@@ -10,6 +10,8 @@
 //! | :--- | :--- | :--- |
 //! | `GET` | `/api/v1/health` | Liveness, uptime, memory footprint |
 //! | `GET` | `/api/v1/metrics` | Prometheus text exposition |
+//! | `GET` | `/api/v1/adapters` | Platform adapter catalog (built-in and plugin) |
+//! | `POST` | `/api/v1/adapters/:platform/ingest` | Fast-ACK inbound message ingress |
 //! | `GET` | `/api/v1/plugins` | Plugin and host catalog |
 //! | `GET` | `/api/v1/plugins/:id/config` | Current values plus declaration schema |
 //! | `PUT` | `/api/v1/plugins/:id/config` | Validate, hot reload, then persist |
@@ -20,6 +22,7 @@
 //! | `GET` | `/api/v1/personas` | Persona catalog |
 //! | `POST` | `/api/v1/chat/completions` | Sandbox chat with JSON or SSE responses |
 
+pub mod adapters;
 pub mod chat;
 pub mod health;
 pub mod metrics;
@@ -37,6 +40,7 @@ pub fn api_router() -> Router<ApiState> {
     Router::new()
         .merge(health::routes())
         .merge(metrics::routes())
+        .merge(adapters::routes())
         .merge(plugins::routes())
         .merge(sessions::routes())
         .merge(personas::routes())

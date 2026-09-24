@@ -26,6 +26,10 @@ pub struct MetricsRegistry {
     pub llm_replies: AtomicU64,
     /// Outbound messages enqueued towards platform adapters.
     pub outbound_messages: AtomicU64,
+    /// Outbound messages accepted by the platform adapter responsible for them.
+    pub outbound_delivered: AtomicU64,
+    /// Outbound messages that no adapter could deliver.
+    pub outbound_failed: AtomicU64,
     /// LLM requests issued by the agent runtime (including tool-calling rounds).
     pub llm_requests: AtomicU64,
     /// Tool calls dispatched by the agent runtime.
@@ -223,6 +227,18 @@ impl MetricsRegistry {
             "kanon_outbound_messages_total",
             "Outbound messages enqueued towards platform adapters.",
             Self::get(&self.outbound_messages),
+        );
+        counter_metric(
+            &mut out,
+            "kanon_outbound_delivered_total",
+            "Outbound messages accepted by a platform adapter.",
+            Self::get(&self.outbound_delivered),
+        );
+        counter_metric(
+            &mut out,
+            "kanon_outbound_failed_total",
+            "Outbound messages that could not be delivered by any adapter.",
+            Self::get(&self.outbound_failed),
         );
         counter_metric(
             &mut out,

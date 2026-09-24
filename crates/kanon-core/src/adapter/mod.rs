@@ -55,6 +55,14 @@ pub enum AdapterError {
     /// A platform identifier was declared twice, which would make routing ambiguous.
     #[error("platform '{0}' is already served by another adapter")]
     DuplicatePlatform(String),
+    /// Inbound payload verification (e.g. HMAC signature or bearer token) failed.
+    #[error("adapter '{platform}' authentication failed: {reason}")]
+    Authentication {
+        /// Platform identifier where authentication failed.
+        platform: String,
+        /// Underlying reason reported by the verification logic.
+        reason: String,
+    },
 }
 
 /// Outcome of an inbound ingest attempt.
@@ -174,6 +182,15 @@ pub trait PlatformAdapter: Send + Sync {
         &self,
         request: DeliverMessageRequest,
     ) -> Result<DeliverMessageResponse, AdapterError>;
+
+    /// Verifies the authenticity of an inbound payload (e.g. HMAC signature or webhook token).
+    ///
+    /// The default implementation accepts all payloads (`Ok(())`). Adapters that enforce cryptographic
+    /// signatures (such as Webhook HMAC-SHA256) override this to reject forged payloads before
+    /// they enter the core pipeline.
+    fn verify_inbound(&self, _signature: Option<&str>, _payload: &[u8]) -> Result<(), AdapterError> {
+        Ok(())
+    }
 
     /// Starts the adapter's inbound loop for push-less platforms (long polling, sockets).
     ///

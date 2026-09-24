@@ -33,6 +33,12 @@ use crate::supervisor::{AdapterRoute, Supervisor};
 /// worst-case memory bounded.
 pub const DEFAULT_OUTBOUND_QUEUE_CAPACITY: usize = 1024;
 
+/// Default depth of the dedicated outbound delivery queue for each platform partition.
+///
+/// Preserves sequential FIFO delivery per platform while providing strict cross-platform
+/// concurrency isolation so one slow platform never starves others.
+pub const DEFAULT_PLATFORM_QUEUE_CAPACITY: usize = 64;
+
 /// Result produced after processing an event through the pipeline engine.
 #[derive(Debug, Clone)]
 pub enum PipelineResult {
@@ -194,52 +200,143 @@ impl PipelineEngine {
         }
     }
 
-    /// Drains the outbound queue, delivering each message and emitting a trace stage per attempt.
+    /// Delivers a single outbound message and publishes the resulting observation stage.
+    pub async fn dispatch_outbound_request(&self, request: DeliverMessageRequest) {
+        let platform = request.platform.clone();
+        let channel_id = request.channel_id.clone();
+        let segment_count = request.segments.len();
+
+        match self.deliver_outbound(request).await {
+            Ok(outcome) => {
+                tracing::debug!(
+                    platform = %outcome.platform,
+                    channel_id = %channel_id,
+                    message_id = %outcome.message_id,
+                    "Outbound message delivered"
+                );
+                self.observe(PipelineStage::OutboundDelivered {
+                    platform: outcome.platform,
+                    channel_id,
+                    segment_count,
+                    target: outcome.kind,
+                    message_id: outcome.message_id,
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    platform = %platform,
+                    channel_id = %channel_id,
+                    error = %err,
+                    "Outbound delivery failed"
+                );
+                self.observe(PipelineStage::OutboundFailed {
+                    platform,
+                    channel_id,
+                    reason: err.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Spawns a dedicated sequential worker task for a single platform partition.
+    fn spawn_platform_worker(
+        self: &Arc<Self>,
+        platform: String,
+        mut rx: mpsc::Receiver<DeliverMessageRequest>,
+    ) {
+        let engine = Arc::clone(self);
+        tokio::spawn(async move {
+            tracing::debug!(platform = %platform, "Platform outbound worker spawned");
+            loop {
+                // Workers retire after 30 seconds of inactivity to reclaim resources.
+                match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
+                    Ok(Some(req)) => {
+                        engine.dispatch_outbound_request(req).await;
+                    }
+                    Ok(None) => {
+                        // All channel senders dropped (shutting down).
+                        break;
+                    }
+                    Err(_) => {
+                        // Idle timeout reached; retire this worker.
+                        tracing::debug!(platform = %platform, "Platform outbound worker idle timeout; retiring");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Reports an outbound drop when a specific platform's worker queue is saturated.
+    fn report_outbound_queue_full(&self, dropped: DeliverMessageRequest) {
+        tracing::warn!(
+            platform = %dropped.platform,
+            channel_id = %dropped.channel_id,
+            "Platform outbound queue saturated; dropping message to prevent cross-platform backpressure"
+        );
+        self.observe(PipelineStage::OutboundFailed {
+            platform: dropped.platform,
+            channel_id: dropped.channel_id,
+            reason: "platform outbound queue full".to_string(),
+        });
+    }
+
+    /// Drains the global outbound queue and partitions requests into per-platform sequential workers.
     ///
-    /// Delivery is sequential on purpose: it preserves per-platform message ordering and bounds
-    /// concurrency to one in-flight request per queue, which external platform APIs generally
-    /// require.
-    pub async fn run_outbound_loop(&self, mut receiver: mpsc::Receiver<DeliverMessageRequest>) {
-        tracing::info!("Outbound adapter dispatcher started");
+    /// # Concurrency & Ordering Guarantee
+    /// - **Per-platform FIFO ordering**: Each platform has an independent sequential worker. Messages
+    ///   for platform `A` are processed strictly in arrival order.
+    /// - **Cross-platform isolation**: Platform `A` being slow, stalled, or failing never blocks
+    ///   outbound deliveries to platform `B`.
+    /// - **Bounded queue protection**: If platform `A`'s queue reaches capacity, overflow messages
+    ///   are dropped and emit [`PipelineStage::OutboundFailed`], without stalling the global dispatcher.
+    pub async fn run_outbound_loop(
+        self: Arc<Self>,
+        mut receiver: mpsc::Receiver<DeliverMessageRequest>,
+    ) {
+        tracing::info!("Partitioned outbound adapter dispatcher started");
+        let mut workers: std::collections::HashMap<String, mpsc::Sender<DeliverMessageRequest>> =
+            std::collections::HashMap::new();
 
         while let Some(request) = receiver.recv().await {
             let platform = request.platform.clone();
-            let channel_id = request.channel_id.clone();
-            let segment_count = request.segments.len();
 
-            match self.deliver_outbound(request).await {
-                Ok(outcome) => {
-                    tracing::debug!(
-                        platform = %outcome.platform,
-                        channel_id = %channel_id,
-                        message_id = %outcome.message_id,
-                        "Outbound message delivered"
-                    );
-                    self.observe(PipelineStage::OutboundDelivered {
-                        platform: outcome.platform,
-                        channel_id,
-                        segment_count,
-                        target: outcome.kind,
-                        message_id: outcome.message_id,
-                    });
+            // Periodic cleanup of dead channels to avoid memory buildup when platforms are dynamic
+            if workers.len() > 128 {
+                workers.retain(|_, tx| !tx.is_closed());
+            }
+
+            let tx = match workers.get(&platform) {
+                Some(tx) if !tx.is_closed() => tx.clone(),
+                _ => {
+                    let (new_tx, rx) = mpsc::channel(DEFAULT_PLATFORM_QUEUE_CAPACITY);
+                    self.spawn_platform_worker(platform.clone(), rx);
+                    workers.insert(platform.clone(), new_tx.clone());
+                    new_tx
                 }
-                Err(err) => {
-                    tracing::warn!(
-                        platform = %platform,
-                        channel_id = %channel_id,
-                        error = %err,
-                        "Outbound delivery failed"
-                    );
-                    self.observe(PipelineStage::OutboundFailed {
-                        platform,
-                        channel_id,
-                        reason: err.to_string(),
-                    });
+            };
+
+            match tx.try_send(request) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Closed(req)) => {
+                    // The worker timed out immediately before the send; respawn and retry once
+                    let (new_tx, rx) = mpsc::channel(DEFAULT_PLATFORM_QUEUE_CAPACITY);
+                    self.spawn_platform_worker(platform.clone(), rx);
+                    workers.insert(platform, new_tx.clone());
+                    if let Err(mpsc::error::TrySendError::Full(dropped)) = new_tx.try_send(req) {
+                        self.report_outbound_queue_full(dropped);
+                    }
+                }
+                Err(mpsc::error::TrySendError::Full(dropped)) => {
+                    self.report_outbound_queue_full(dropped);
                 }
             }
         }
 
-        tracing::info!("Outbound adapter dispatcher terminated");
+        // Dropping `workers` closes all platform channel senders, allowing active workers to drain
+        // their remaining queues before terminating.
+        drop(workers);
+        tracing::info!("Partitioned outbound adapter dispatcher terminated");
     }
 
     /// Spawns the outbound dispatcher task.

@@ -424,3 +424,190 @@ async fn ingest_handle_reports_backpressure_and_closure() {
     assert_eq!(ingress.try_ingest(event("evt-4")), Err(IngestError::Closed));
     assert_eq!(ingress.ingest(event("evt-5")).await, Err(IngestError::Closed));
 }
+
+/// Helper adapter to verify partitioned dispatch concurrency and sequencing.
+struct InstrumentedAdapter {
+    platform: String,
+    delay: Duration,
+    delivered_order: Arc<Mutex<Vec<String>>>,
+}
+
+#[tonic::async_trait]
+impl kanon_core::PlatformAdapter for InstrumentedAdapter {
+    fn platform(&self) -> &str {
+        &self.platform
+    }
+
+    async fn deliver(
+        &self,
+        request: DeliverMessageRequest,
+    ) -> Result<DeliverMessageResponse, AdapterError> {
+        if !self.delay.is_zero() {
+            tokio::time::sleep(self.delay).await;
+        }
+        self.delivered_order
+            .lock()
+            .await
+            .push(format!("{}:{}", self.platform, request.channel_id));
+        Ok(DeliverMessageResponse {
+            success: true,
+            message_id: format!("msg-{}", request.channel_id),
+            error_message: String::new(),
+        })
+    }
+}
+
+/// Outbound dispatch is partitioned per platform: a stalled platform never blocks deliveries to
+/// other platforms, while intra-platform FIFO delivery order is strictly preserved.
+#[tokio::test]
+async fn test_partitioned_outbound_dispatch_cross_platform_isolation_and_fifo_order() {
+    let supervisor = Arc::new(Supervisor::new(None, None));
+    let engine = Arc::new(PipelineEngine::new(supervisor.clone()));
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+
+    // "slow" platform takes 80ms per delivery; "fast" platform delivers immediately (0ms).
+    let slow_adapter = Arc::new(InstrumentedAdapter {
+        platform: "slow_plat".to_string(),
+        delay: Duration::from_millis(80),
+        delivered_order: delivered.clone(),
+    });
+    let fast_adapter = Arc::new(InstrumentedAdapter {
+        platform: "fast_plat".to_string(),
+        delay: Duration::ZERO,
+        delivered_order: delivered.clone(),
+    });
+
+    supervisor
+        .adapters()
+        .register(slow_adapter)
+        .await
+        .expect("register slow adapter");
+    supervisor
+        .adapters()
+        .register(fast_adapter)
+        .await
+        .expect("register fast adapter");
+
+    let _dispatcher = engine.clone().start_outbound_dispatcher();
+    let sender = engine.outbound_sender();
+
+    let make_req = |plat: &str, chan: &str| DeliverMessageRequest {
+        platform: plat.to_string(),
+        channel_id: chan.to_string(),
+        recipient_id: "user1".to_string(),
+        segments: vec![],
+    };
+
+    // Send 1 to slow, then 2 and 3 to fast
+    sender
+        .send(make_req("slow_plat", "c1"))
+        .await
+        .expect("send slow 1");
+    sender
+        .send(make_req("fast_plat", "f1"))
+        .await
+        .expect("send fast 1");
+    sender
+        .send(make_req("fast_plat", "f2"))
+        .await
+        .expect("send fast 2");
+
+    // After 25ms, "fast" platform should have already delivered both f1 and f2 in FIFO order,
+    // while "slow" platform is still sleeping on its 80ms delay!
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    {
+        let log = delivered.lock().await;
+        assert_eq!(
+            *log,
+            vec!["fast_plat:f1".to_string(), "fast_plat:f2".to_string()],
+            "fast platform messages must be delivered concurrently without waiting for slow platform"
+        );
+    }
+
+    // After 100ms, the slow message finishes too
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    {
+        let log = delivered.lock().await;
+        assert_eq!(
+            *log,
+            vec![
+                "fast_plat:f1".to_string(),
+                "fast_plat:f2".to_string(),
+                "slow_plat:c1".to_string()
+            ],
+            "all messages delivered, maintaining per-platform FIFO order and cross-platform concurrency"
+        );
+    }
+}
+
+/// Helper observer that captures outbound failure stages.
+struct FailureObserver {
+    failures: Arc<Mutex<Vec<String>>>,
+}
+
+impl kanon_core::PipelineObserver for FailureObserver {
+    fn on_stage(&self, stage: &kanon_core::PipelineStage) {
+        if let kanon_core::PipelineStage::OutboundFailed { platform, reason, .. } = stage {
+            let mut list = self.failures.try_lock().expect("lock failure list");
+            list.push(format!("{platform}:{reason}"));
+        }
+    }
+}
+
+/// Saturated platform queue drops excess messages and emits OutboundFailed without blocking.
+#[tokio::test]
+async fn test_partitioned_outbound_dispatch_queue_saturation_drop() {
+    let supervisor = Arc::new(Supervisor::new(None, None));
+    let failures = Arc::new(Mutex::new(Vec::new()));
+    let observer = Arc::new(FailureObserver {
+        failures: failures.clone(),
+    });
+
+    let engine = Arc::new(PipelineEngine::new(supervisor.clone()).with_observer(observer));
+    let delivered = Arc::new(Mutex::new(Vec::new()));
+
+    // Platform blocks for 500ms so its 64-capacity queue will overflow quickly
+    let blocked_adapter = Arc::new(InstrumentedAdapter {
+        platform: "blocked_plat".to_string(),
+        delay: Duration::from_millis(500),
+        delivered_order: delivered.clone(),
+    });
+
+    supervisor
+        .adapters()
+        .register(blocked_adapter)
+        .await
+        .expect("register blocked adapter");
+
+    let _dispatcher = engine.clone().start_outbound_dispatcher();
+    let sender = engine.outbound_sender();
+
+    // Send 80 messages: 1 is in-flight, 64 fit into the queue, and remaining ~15 must drop
+    for i in 0..80 {
+        sender
+            .send(DeliverMessageRequest {
+                platform: "blocked_plat".to_string(),
+                channel_id: format!("c-{i}"),
+                recipient_id: "u1".to_string(),
+                segments: vec![],
+            })
+            .await
+            .expect("send to global outbound queue");
+    }
+
+    // Wait a brief moment for the dispatcher to drain into the platform worker
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let drops = failures.lock().await;
+    assert!(
+        !drops.is_empty(),
+        "excess messages beyond platform queue capacity must be dropped"
+    );
+    assert!(
+        drops[0].contains("platform outbound queue full"),
+        "failure stage reason must indicate platform queue saturation: {}",
+        drops[0]
+    );
+}

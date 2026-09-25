@@ -15,9 +15,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (event_tx, event_rx) = mpsc::channel(DEFAULT_INGEST_QUEUE_CAPACITY);
     let socket_path = kanon_transport::core_socket_path(None);
 
-    // Initialize process supervisor and start the central pipeline worker loop.
+    // Initialize process supervisor and pipeline engine.
     let supervisor = Arc::new(Supervisor::new(None, Some(socket_path.clone())));
-    let engine = Arc::new(PipelineEngine::new(supervisor.clone()));
+    let mut engine_builder = PipelineEngine::new(supervisor.clone());
+    let mut gateway_opt = None;
+
+    match kanon_llm::provider_from_env() {
+        Ok(Some((provider, model))) => {
+            tracing::info!(model = %model, "LLM provider configured for core pipeline");
+            let memory = Arc::new(kanon_llm::SlidingWindowMemory::new(40));
+            let agent = Arc::new(
+                kanon_llm::Agent::builder("kanon-core", provider.clone())
+                    .memory(memory)
+                    .model(model.clone())
+                    .build(),
+            );
+            let tool_router = Arc::new(kanon_llm::ToolRouter::from_arc(agent));
+            engine_builder = engine_builder.with_tool_router(tool_router);
+            gateway_opt = Some(Arc::new(kanon_llm::LlmGateway::new(provider, model)));
+        }
+        Ok(None) => {
+            tracing::info!(
+                "KANON_LLM_BASE_URL is unset; conversational LLM routing is disabled"
+            );
+        }
+        Err(e) => {
+            return Err(format!("Failed to initialize LLM provider: {e}").into());
+        }
+    }
+
+    let engine = Arc::new(engine_builder);
     let worker_handle = engine.clone().start_worker(event_rx);
 
     // Outbound replies are routed through the platform adapter registry. A bare microkernel has
@@ -25,9 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // disappearing silently.
     let dispatcher_handle = engine.clone().start_outbound_dispatcher();
 
-    let service = CoreApiService::new(event_tx)
+    let mut service = CoreApiService::new(event_tx)
         .with_supervisor(supervisor.clone())
         .with_outbound_sender(engine.outbound_sender());
+    if let Some(gw) = gateway_opt {
+        service = service.with_gateway(gw);
+    }
     let server = CoreIpcServer::new(socket_path, service);
 
     server

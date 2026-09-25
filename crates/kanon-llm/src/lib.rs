@@ -32,7 +32,7 @@ pub use gateway::providers::{
 };
 pub use gateway::{
     ChatChunk, ChatChunkStream, ChatMessage, ChatRequest, ChatResponse, LlmGateway, LlmProvider,
-    Role, TokenUsage, ToolCall, ToolDefinition,
+    ProviderSetup, Role, TokenUsage, ToolCall, ToolDefinition, provider_from_env,
 };
 pub use memory::{ConversationManager, Memory, SessionMemory, SlidingWindowMemory};
 pub use prompt::{

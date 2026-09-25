@@ -129,8 +129,9 @@ pub fn aggregate_tools<H: ToolHost>(hosts: &[Arc<H>]) -> Vec<ToolDefinition> {
 /// Central Tool Calling state machine router and execution loop.
 ///
 /// Serves as a specialized adapter around the core [`Agent`] engine for pipeline integration.
+#[derive(Clone)]
 pub struct ToolRouter {
-    agent: Agent,
+    agent: Arc<Agent>,
 }
 
 impl ToolRouter {
@@ -148,16 +149,51 @@ impl ToolRouter {
             .model(default_model)
             .max_iterations(Self::DEFAULT_MAX_ITERATIONS)
             .build();
+        Self {
+            agent: Arc::new(agent),
+        }
+    }
+
+    /// Creates a `ToolRouter` wrapping an existing shared [`Agent`].
+    pub fn from_arc(agent: Arc<Agent>) -> Self {
         Self { agent }
+    }
+
+    /// Creates a `ToolRouter` wrapping an existing [`Agent`].
+    pub fn from_agent(agent: Agent) -> Self {
+        Self {
+            agent: Arc::new(agent),
+        }
     }
 
     /// Overrides the maximum tool execution loop iterations.
     pub fn with_max_iterations(mut self, max: usize) -> Self {
-        self.agent = Agent::builder(self.agent.name(), self.agent.provider().clone())
+        let mut builder = Agent::builder(self.agent.name(), self.agent.provider().clone())
             .memory(self.agent.memory().clone())
             .model(&self.agent.config().default_model)
             .max_iterations(max)
-            .build();
+            .stop_on_tool_failure(self.agent.config().stop_on_tool_failure);
+
+        if let Some(sm) = self.agent.session_manager() {
+            builder = builder.session_manager(sm.clone());
+        }
+        if let Some(pr) = self.agent.persona_registry() {
+            builder = builder.persona_registry(pr.clone());
+        }
+        if let Some(temp) = self.agent.config().temperature {
+            builder = builder.temperature(temp);
+        }
+        if let Some(tokens) = self.agent.config().max_tokens {
+            builder = builder.max_tokens(tokens);
+        }
+        for hook in self.agent.hooks() {
+            builder = builder.hook_arc(hook.clone());
+        }
+        for tool in self.agent.tools() {
+            builder = builder.tool_arc(tool.clone());
+        }
+
+        self.agent = Arc::new(builder.build());
         self
     }
 
@@ -169,6 +205,11 @@ impl ToolRouter {
     /// Access to the underlying [`Agent`] engine.
     pub fn agent(&self) -> &Agent {
         &self.agent
+    }
+
+    /// Returns a cloned `Arc` of the underlying [`Agent`] engine.
+    pub fn agent_arc(&self) -> Arc<Agent> {
+        Arc::clone(&self.agent)
     }
 
     /// Executes the tool calling loop for an incoming conversational message.

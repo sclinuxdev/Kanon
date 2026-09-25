@@ -26,9 +26,6 @@ use kanon_core::EventIngress;
 use kanon_core::ipc::{CoreApiService, CoreIpcServer, DEFAULT_INGEST_QUEUE_CAPACITY};
 use kanon_core::pipeline::PipelineEngine;
 use kanon_core::supervisor::Supervisor;
-use kanon_llm::{
-    AnthropicMessagesProvider, LlmProvider, OpenAiChatProvider, OpenAiResponsesProvider,
-};
 use tokio::sync::{mpsc, oneshot};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -43,9 +40,6 @@ const DEFAULT_WEBHOOK_PLATFORM: &str = "webhook";
 /// Fallible startup result type shared by the binary entrypoint helpers.
 type StartupResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Configured model provider and the model identifier it should default to.
-type ProviderSetup = (Arc<dyn LlmProvider>, String);
-
 #[tokio::main]
 async fn main() -> StartupResult<()> {
     let observability = Arc::new(Observability::new());
@@ -53,7 +47,7 @@ async fn main() -> StartupResult<()> {
 
     let api_addr = resolve_api_addr()?;
 
-    // --- Core microkernel -------------------------------------------------------------
+    // --- Core microkernel & supervisor ------------------------------------------------
     let (event_tx, event_rx) = mpsc::channel(DEFAULT_INGEST_QUEUE_CAPACITY);
     let ingress = EventIngress::new(event_tx);
     let default_ipc = CoreIpcServer::with_default_path(CoreApiService::new(ingress.clone()));
@@ -64,38 +58,49 @@ async fn main() -> StartupResult<()> {
         Some(socket_path.clone()),
     ));
 
-    // The pipeline never awaits platform I/O: replies are queued and an independent dispatcher
-    // resolves the destination platform to a built-in adapter or a plugin host.
-    let engine = Arc::new(
-        PipelineEngine::new(supervisor.clone()).with_observer(observability.events.clone()),
-    );
-    let pipeline_worker = engine.clone().start_worker(event_rx);
-    let outbound_dispatcher = engine.clone().start_outbound_dispatcher();
-
-    let service = CoreApiService::new(ingress.clone())
-        .with_supervisor(supervisor.clone())
-        .with_outbound_sender(engine.outbound_sender());
-    let ipc_server = CoreIpcServer::new(socket_path, service);
-
     // --- Platform adapters ------------------------------------------------------------
     register_webhook_adapter(&supervisor).await?;
     for (platform, error) in supervisor.adapters().start_all(ingress.clone()).await {
         tracing::error!(platform = %platform, error = %error, "Adapter failed to start");
     }
 
-    // --- Management gateway -----------------------------------------------------------
+    // --- Management gateway state & agent engine --------------------------------------
     let mut builder = ApiState::builder(supervisor.clone())
         .with_observability(observability.clone())
         .with_ingress(ingress.clone());
-    if let Some((provider, model)) = provider_from_env()? {
-        tracing::info!(model = %model, "LLM provider configured for sandbox chat");
+    if let Some((provider, model)) = kanon_llm::provider_from_env()? {
+        tracing::info!(model = %model, "LLM provider configured for conversational pipeline and sandbox chat");
         builder = builder.with_llm_provider("kanon-core", provider, default_agent_config(model));
     } else {
         tracing::warn!(
-            "KANON_LLM_BASE_URL is unset; chat completions are disabled on the management gateway"
+            "KANON_LLM_BASE_URL is unset; chat completions and conversational LLM routing are disabled"
         );
     }
     let state = builder.build();
+
+    // The pipeline never awaits platform I/O: replies are queued and an independent dispatcher
+    // resolves the destination platform to a built-in adapter or a plugin host.
+    let mut engine_builder = PipelineEngine::new(supervisor.clone())
+        .with_observer(observability.events.clone());
+    if let Some(agent) = state.agent() {
+        let tool_router = Arc::new(kanon_llm::ToolRouter::from_arc(agent.clone()));
+        engine_builder = engine_builder.with_tool_router(tool_router);
+    }
+    let engine = Arc::new(engine_builder);
+    let pipeline_worker = engine.clone().start_worker(event_rx);
+    let outbound_dispatcher = engine.clone().start_outbound_dispatcher();
+
+    let mut service = CoreApiService::new(ingress.clone())
+        .with_supervisor(supervisor.clone())
+        .with_outbound_sender(engine.outbound_sender());
+    if let Some(agent) = state.agent() {
+        let gateway = Arc::new(kanon_llm::LlmGateway::new(
+            agent.provider().clone(),
+            agent.config().default_model.clone(),
+        ));
+        service = service.with_gateway(gateway);
+    }
+    let ipc_server = CoreIpcServer::new(socket_path, service);
 
     let api_server = ApiServer::bind(api_addr, state).await?;
     let bound_addr = api_server.local_addr();
@@ -204,40 +209,4 @@ fn resolve_api_addr() -> StartupResult<SocketAddr> {
     let raw = std::env::var("KANON_API_ADDR").unwrap_or_else(|_| DEFAULT_API_ADDR.to_string());
     raw.parse::<SocketAddr>()
         .map_err(|err| format!("Invalid KANON_API_ADDR '{raw}': {err}").into())
-}
-
-/// Builds a model provider from environment configuration.
-///
-/// Returns `Ok(None)` when no provider is configured; misconfiguration (unknown protocol) is an
-/// explicit startup error rather than a silently disabled feature.
-fn provider_from_env() -> StartupResult<Option<ProviderSetup>> {
-    let Ok(base_url) = std::env::var("KANON_LLM_BASE_URL") else {
-        return Ok(None);
-    };
-
-    let model = std::env::var("KANON_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-    let api_key = std::env::var("KANON_LLM_API_KEY").ok();
-    let protocol = std::env::var("KANON_LLM_PROTOCOL").unwrap_or_else(|_| "openai".to_string());
-
-    let provider: Arc<dyn LlmProvider> = match protocol.as_str() {
-        "openai" | "openai_chat" => {
-            Arc::new(OpenAiChatProvider::new(base_url, api_key, model.clone()))
-        }
-        "openai_responses" => Arc::new(
-            OpenAiResponsesProvider::new(api_key.unwrap_or_default()).with_base_url(base_url),
-        ),
-        "anthropic" => Arc::new(AnthropicMessagesProvider::new(
-            base_url,
-            api_key,
-            model.clone(),
-        )),
-        other => {
-            return Err(format!(
-                "Unsupported KANON_LLM_PROTOCOL '{other}'; expected openai, openai_responses or anthropic"
-            )
-            .into());
-        }
-    };
-
-    Ok(Some((provider, model)))
 }

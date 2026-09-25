@@ -615,3 +615,93 @@ async fn test_webhook_outbound_signing_header() {
     let sig = captured_header.lock().await.clone().expect("signature header captured");
     assert!(sig.starts_with("sha256="), "expected sha256 prefix: {sig}");
 }
+
+/// Conversational messages ingested via adapter route through the LLM pipeline and deliver to the adapter.
+#[tokio::test]
+async fn pipeline_llm_conversational_turn_routes_to_outbound_delivery() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let supervisor = Arc::new(kanon_core::supervisor::Supervisor::new(
+        Some(PathBuf::from(dir.path())),
+        None,
+    ));
+
+    let adapter = Arc::new(RecordingAdapter::new());
+    supervisor
+        .adapters()
+        .register(adapter.clone())
+        .await
+        .expect("built-in adapter registers");
+
+    let (ingest_tx, ingest_rx) = tokio::sync::mpsc::channel(16);
+    let mock_reply = "LLM conversational reply from kanon-core";
+    let mock_provider = Arc::new(common::MockProvider::new(mock_reply));
+
+    let state = kanon_api::ApiState::builder(supervisor.clone())
+        .with_config_dir(PathBuf::from(dir.path()))
+        .with_ingress(kanon_core::EventIngress::new(ingest_tx))
+        .with_llm_provider(
+            "kanon-core",
+            mock_provider,
+            kanon_api::default_agent_config("mock-model"),
+        )
+        .build();
+
+    let agent = state.agent().expect("agent configured").clone();
+    let engine = Arc::new(
+        kanon_core::pipeline::PipelineEngine::new(supervisor.clone())
+            .with_tool_router(Arc::new(kanon_llm::ToolRouter::from_arc(agent))),
+    );
+    let worker_handle = engine.clone().start_worker(ingest_rx);
+    let dispatcher_handle = engine
+        .clone()
+        .start_outbound_dispatcher()
+        .expect("dispatcher starts");
+
+    let app: Router = app(state);
+
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/adapters/{BUILTIN_PLATFORM}/ingest"),
+        Some(json!({
+            "channel_id": "chan-llm-1",
+            "sender_id": "user-42",
+            "text": "Hello, how are you?",
+            "event_id": "evt-llm-1",
+        })),
+    )
+    .await;
+
+    assert_eq!(status, 202);
+    assert_eq!(body["accepted"], true);
+    assert_eq!(body["event_id"], "evt-llm-1");
+
+    // Wait for the pipeline worker to process the turn and dispatch the reply to the adapter
+    let start = std::time::Instant::now();
+    let mut deliveries = Vec::new();
+    while start.elapsed() < Duration::from_secs(3) {
+        deliveries = adapter.deliveries();
+        if !deliveries.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(deliveries.len(), 1, "expected 1 outbound delivery to adapter");
+    let delivery = &deliveries[0];
+    assert_eq!(delivery.platform, BUILTIN_PLATFORM);
+    assert_eq!(delivery.channel_id, "chan-llm-1");
+    assert_eq!(delivery.recipient_id, "user-42");
+    assert_eq!(delivery.event_id, "evt-llm-1");
+    assert_eq!(delivery.segments.len(), 1);
+
+    match &delivery.segments[0].segment {
+        Some(Segment::Text(TextSegment { content })) => {
+            assert_eq!(content, mock_reply);
+        }
+        other => panic!("expected Text segment, got {other:?}"),
+    }
+
+    worker_handle.abort();
+    dispatcher_handle.abort();
+}

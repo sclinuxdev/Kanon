@@ -628,7 +628,17 @@ impl PipelineEngine {
         if let Some(ref router) = self.tool_router
             && !text_candidate.is_empty()
         {
-            let session_id = format!("{}:{}", filtered_event.channel_id, filtered_event.sender_id);
+            let session_id = if filtered_event.channel_id.trim().is_empty() {
+                if filtered_event.sender_id.trim().is_empty() {
+                    "default".to_string()
+                } else {
+                    filtered_event.sender_id.clone()
+                }
+            } else if filtered_event.sender_id.trim().is_empty() {
+                filtered_event.channel_id.clone()
+            } else {
+                format!("{}:{}", filtered_event.channel_id, filtered_event.sender_id)
+            };
             // Filter hosts whose circuit breaker is Open to fast-skip them and protect LLM throughput
             let mut active_hosts = Vec::new();
             for host in &hosts {

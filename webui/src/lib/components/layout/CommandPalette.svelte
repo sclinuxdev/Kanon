@@ -1,0 +1,157 @@
+<script lang="ts">
+import {
+  Activity,
+  Blocks,
+  Bot,
+  Moon,
+  RefreshCw,
+  Search,
+  Sun,
+  Terminal,
+  Trash2,
+  Users,
+} from 'lucide-svelte';
+import { logStore } from '../../stores/logs.svelte';
+import { nodeStore } from '../../stores/node.svelte';
+import { theme } from '../../stores/theme.svelte';
+
+let { isOpen = $bindable(false), onSelectTab = (_tab: string) => {} } = $props<{
+  isOpen: boolean;
+  onSelectTab?: (tab: string) => void;
+}>();
+
+let query = $state('');
+
+const commands = [
+  {
+    id: 'overview',
+    title: 'Go to Overview',
+    category: 'Navigation',
+    icon: Activity,
+    action: () => onSelectTab('overview'),
+  },
+  {
+    id: 'pipeline',
+    title: 'Go to Pipeline & Logs',
+    category: 'Navigation',
+    icon: Terminal,
+    action: () => onSelectTab('pipeline'),
+  },
+  {
+    id: 'plugins',
+    title: 'Go to Plugins & Adapters',
+    category: 'Navigation',
+    icon: Blocks,
+    action: () => onSelectTab('plugins'),
+  },
+  {
+    id: 'sessions',
+    title: 'Go to Sessions & Personas',
+    category: 'Navigation',
+    icon: Users,
+    action: () => onSelectTab('sessions'),
+  },
+  {
+    id: 'playground',
+    title: 'Go to AI Playground',
+    category: 'Navigation',
+    icon: Bot,
+    action: () => onSelectTab('playground'),
+  },
+  {
+    id: 'clear_logs',
+    title: 'Clear WebSocket Log Buffer',
+    category: 'Action',
+    icon: Trash2,
+    action: () => logStore.clear(),
+  },
+  {
+    id: 'refresh',
+    title: 'Refresh Node Status',
+    category: 'Action',
+    icon: RefreshCw,
+    action: () => nodeStore.refresh(),
+  },
+  {
+    id: 'toggle_theme',
+    title: 'Toggle Light / Dark Theme',
+    category: 'Action',
+    icon: theme.dark ? Sun : Moon,
+    action: () => theme.toggle(),
+  },
+];
+
+let filtered = $derived(
+  commands.filter(
+    (c) =>
+      c.title.toLowerCase().includes(query.toLowerCase()) ||
+      c.category.toLowerCase().includes(query.toLowerCase()),
+  ),
+);
+
+function execute(cmd: (typeof commands)[0]) {
+  cmd.action();
+  isOpen = false;
+  query = '';
+}
+
+function handleKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    isOpen = false;
+  }
+}
+</script>
+
+{#if isOpen}
+  <!-- Backdrop -->
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div
+    class="fixed inset-0 bg-black/40 backdrop-blur-xs z-50 flex items-start justify-center pt-24 px-4"
+    onclick={() => (isOpen = false)}
+    role="button"
+    tabindex="-1"
+  >
+    <!-- Modal -->
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <div
+      class="w-full max-w-lg bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl shadow-2xl overflow-hidden flex flex-col"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={handleKeydown}
+      role="dialog"
+      tabindex="-1"
+    >
+      <div class="flex items-center gap-2.5 px-3.5 py-2.5 border-b border-zinc-200 dark:border-zinc-800">
+        <Search class="w-4 h-4 text-zinc-400" />
+        <!-- svelte-ignore a11y_autofocus -->
+        <input
+          type="text"
+          bind:value={query}
+          placeholder="Type a command or jump to page..."
+          class="w-full bg-transparent text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-hidden"
+          autofocus
+        />
+        <kbd class="px-1.5 py-0.5 text-[10px] font-mono bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded text-zinc-400">ESC</kbd>
+      </div>
+
+      <div class="max-h-72 overflow-y-auto p-1.5 space-y-0.5">
+        {#if filtered.length === 0}
+          <div class="px-3 py-6 text-center text-xs text-zinc-400">No matching commands found</div>
+        {:else}
+          {#each filtered as item}
+            {@const Icon = item.icon}
+            <button
+              onclick={() => execute(item)}
+              class="w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100 transition cursor-pointer text-left"
+            >
+              <div class="flex items-center gap-2.5">
+                <Icon class="w-3.5 h-3.5 text-zinc-400" />
+                <span class="font-medium">{item.title}</span>
+              </div>
+              <span class="text-[10px] font-mono text-zinc-400">{item.category}</span>
+            </button>
+          {/each}
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}

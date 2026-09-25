@@ -9,6 +9,7 @@ import {
   Users,
 } from 'lucide-svelte';
 import { api } from '../../api/client';
+import { t } from '../../stores/i18n.svelte';
 import type { PersonaItem, SessionSummary } from '../../types';
 
 let sessions = $state<SessionSummary[]>([]);
@@ -71,20 +72,20 @@ $effect(() => {
   <!-- Top bar -->
   <div class="flex items-center justify-between">
     <div>
-      <h3 class="text-base font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">Sessions & Personas</h3>
-      <p class="text-xs text-zinc-500">Inspect active conversation memory, token budget usage, and persona prompt catalogs</p>
+      <h3 class="text-base font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">{t('title.sessions')}</h3>
+      <p class="text-xs text-zinc-500">{t('subtitle.sessions')}</p>
     </div>
     <button
       onclick={loadData}
       class="px-2.5 py-1.5 text-xs font-medium rounded-md bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700 transition cursor-pointer flex items-center gap-1.5 shadow-2xs"
     >
       <RefreshCw class="w-3.5 h-3.5" />
-      <span>Reload</span>
+      <span>{t('common.refresh')}</span>
     </button>
   </div>
 
   {#if loading}
-    <div class="p-12 text-center text-xs text-zinc-400">Loading conversation sessions...</div>
+    <div class="p-12 text-center text-xs text-zinc-400">{t('common.loading')}</div>
   {:else if error}
     <div class="p-4 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 text-xs">
       {error}
@@ -94,12 +95,12 @@ $effect(() => {
       <!-- Left 2 Cols: Sessions List -->
       <div class="lg:col-span-2 space-y-3">
         <h4 class="text-xs font-semibold text-zinc-700 dark:text-zinc-300 uppercase tracking-wider font-mono">
-          Active Sessions ({sessions.length})
+          {t('sessions.active_sessions')} ({sessions.length})
         </h4>
 
         {#if sessions.length === 0}
           <div class="p-8 rounded-xl border border-dashed border-zinc-300 dark:border-zinc-800 text-center text-zinc-400 text-xs">
-            No active conversation sessions in memory yet. Initiate a chat turn in the Playground or via adapter ingress.
+            {t('sessions.no_sessions')}
           </div>
         {:else}
           <div class="space-y-2">
@@ -117,8 +118,8 @@ $effect(() => {
                     {/if}
                   </div>
                   <div class="flex items-center gap-3 text-[11px] text-zinc-500 font-mono">
-                    <span>Turns: <b class="text-zinc-800 dark:text-zinc-200 font-semibold">{session.turn_count}</b></span>
-                    <span>Tokens: <b class="text-zinc-800 dark:text-zinc-200 font-semibold">{session.total_tokens_used}</b></span>
+                    <span>{t('sessions.turns')}: <b class="text-zinc-800 dark:text-zinc-200 font-semibold">{session.turn_count}</b></span>
+                    <span>{t('sessions.tokens')}: <b class="text-zinc-800 dark:text-zinc-200 font-semibold">{session.total_tokens_used}</b></span>
                   </div>
                 </div>
 
@@ -130,12 +131,12 @@ $effect(() => {
                     }}
                     class="px-2 py-1 text-xs text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 border border-zinc-200 dark:border-zinc-700 rounded hover:bg-zinc-50 dark:hover:bg-zinc-800 transition cursor-pointer"
                   >
-                    Persona
+                    {t('sessions.persona')}
                   </button>
                   <button
                     onclick={() => handleResetSession(session.session_id)}
                     class="p-1 text-zinc-400 hover:text-rose-500 transition cursor-pointer"
-                    title="Reset Session History"
+                    title={t('sessions.reset')}
                   >
                     <Trash2 class="w-3.5 h-3.5" />
                   </button>
@@ -149,7 +150,7 @@ $effect(() => {
       <!-- Right 1 Col: Personas Catalog -->
       <div class="space-y-3">
         <h4 class="text-xs font-semibold text-zinc-700 dark:text-zinc-300 uppercase tracking-wider font-mono">
-          Persona Catalog ({personas.length})
+          {t('sessions.persona_catalog')} ({personas.length})
         </h4>
 
         <div class="space-y-2">

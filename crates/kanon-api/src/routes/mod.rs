@@ -28,7 +28,9 @@ pub mod health;
 pub mod metrics;
 pub mod personas;
 pub mod plugins;
+pub mod providers;
 pub mod sessions;
+pub mod system;
 
 use axum::Router;
 
@@ -45,6 +47,8 @@ pub fn api_router() -> Router<ApiState> {
         .merge(sessions::routes())
         .merge(personas::routes())
         .merge(chat::routes())
+        .merge(system::routes())
+        .merge(providers::routes())
 }
 
 /// Fallback handler returning a structured `404` for unknown paths.

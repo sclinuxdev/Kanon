@@ -8,39 +8,13 @@ import PipelineLogsView from './lib/components/views/PipelineLogsView.svelte';
 import PlaygroundView from './lib/components/views/PlaygroundView.svelte';
 import PluginsAdaptersView from './lib/components/views/PluginsAdaptersView.svelte';
 import SessionsPersonasView from './lib/components/views/SessionsPersonasView.svelte';
+import SystemProvidersView from './lib/components/views/SystemProvidersView.svelte';
 
+import { t } from './lib/stores/i18n.svelte';
 import { nodeStore } from './lib/stores/node.svelte';
 
 let currentTab = $state('overview');
 let isCommandOpen = $state(false);
-
-const tabTitles: Record<string, { title: string; subtitle: string }> = {
-  overview: {
-    title: 'Node Overview & Health',
-    subtitle:
-      'Microkernel node runtime, process supervisor, and Prometheus exposition',
-  },
-  pipeline: {
-    title: 'Pipeline Tracing & Log Console',
-    subtitle:
-      'Real-time WebSocket streaming for pipeline lifecycle transitions and server logs',
-  },
-  plugins: {
-    title: 'Plugins & Platform Adapters',
-    subtitle:
-      'Out-of-process gRPC plugin hosts, dynamic JSON schemas, and platform adapters',
-  },
-  sessions: {
-    title: 'Sessions & Persona Catalogs',
-    subtitle:
-      'Conversation context memory, token consumption counters, and persona prompts',
-  },
-  playground: {
-    title: 'AI Playground Sandbox',
-    subtitle:
-      'Interactive streaming chat with multi-turn reasoning and tool calling inspection',
-  },
-};
 
 function handleKeydown(e: KeyboardEvent) {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
@@ -64,8 +38,8 @@ function handleKeydown(e: KeyboardEvent) {
   <main class="flex-1 flex flex-col h-full min-w-0 overflow-hidden">
     <!-- Top Header -->
     <Header
-      title={tabTitles[currentTab]?.title ?? 'Kanon Node'}
-      subtitle={tabTitles[currentTab]?.subtitle ?? ''}
+      title={t(`title.${currentTab}`)}
+      subtitle={t(`subtitle.${currentTab}`)}
     />
 
     <!-- Offline Notification Banner if node unreachable -->
@@ -76,7 +50,7 @@ function handleKeydown(e: KeyboardEvent) {
           onclick={() => nodeStore.refresh()}
           class="underline hover:text-rose-700 dark:hover:text-rose-300 cursor-pointer"
         >
-          Retry now
+          {t('common.retry')}
         </button>
       </div>
     {/if}
@@ -93,6 +67,8 @@ function handleKeydown(e: KeyboardEvent) {
         <SessionsPersonasView />
       {:else if currentTab === 'playground'}
         <PlaygroundView />
+      {:else if currentTab === 'providers'}
+        <SystemProvidersView />
       {/if}
     </div>
   </main>

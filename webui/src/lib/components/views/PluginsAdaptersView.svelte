@@ -13,6 +13,7 @@ import {
   XCircle,
 } from 'lucide-svelte';
 import { api } from '../../api/client';
+import { t } from '../../stores/i18n.svelte';
 import type {
   AdapterItem,
   PluginConfigResponse,
@@ -134,20 +135,20 @@ $effect(() => {
   <!-- Top bar -->
   <div class="flex items-center justify-between">
     <div>
-      <h3 class="text-base font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">Active Plugin Hosts</h3>
-      <p class="text-xs text-zinc-500">Out-of-process gRPC plugin hosts and platform adapters</p>
+      <h3 class="text-base font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">{t('plugins.hosts_title')}</h3>
+      <p class="text-xs text-zinc-500">{t('subtitle.plugins')}</p>
     </div>
     <button
       onclick={loadData}
       class="px-2.5 py-1.5 text-xs font-medium rounded-md bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700 transition cursor-pointer flex items-center gap-1.5 shadow-2xs"
     >
       <RefreshCw class="w-3.5 h-3.5" />
-      <span>Reload</span>
+      <span>{t('common.refresh')}</span>
     </button>
   </div>
 
   {#if loading}
-    <div class="p-12 text-center text-xs text-zinc-400">Loading plugins and adapters...</div>
+    <div class="p-12 text-center text-xs text-zinc-400">{t('common.loading')}</div>
   {:else if error}
     <div class="p-4 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 text-xs">
       {error}
@@ -157,7 +158,7 @@ $effect(() => {
     <div class="grid grid-cols-1 gap-4">
       {#if hosts.length === 0}
         <div class="p-8 rounded-xl border border-dashed border-zinc-300 dark:border-zinc-800 text-center text-zinc-400 text-xs">
-          No plugin hosts registered yet. Hosts register automatically via gRPC IPC during initialization.
+          {t('plugins.no_hosts')}
         </div>
       {:else}
         {#each hosts as host}
@@ -175,7 +176,7 @@ $effect(() => {
                   onclick={() => restartHost(host.host_id)}
                   class="px-2 py-1 text-xs text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 border border-zinc-200 dark:border-zinc-700 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 transition cursor-pointer"
                 >
-                  Restart Host
+                  {t('plugins.restart')}
                 </button>
               </div>
             </div>
@@ -194,7 +195,7 @@ $effect(() => {
                       class="px-2 py-1 text-[11px] font-medium text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 rounded transition cursor-pointer flex items-center gap-1"
                     >
                       <Settings class="w-3 h-3" />
-                      <span>Configure</span>
+                      <span>{t('plugins.config')}</span>
                     </button>
                   </div>
 
@@ -225,7 +226,7 @@ $effect(() => {
       <div class="p-4 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-2xs space-y-3">
         <div class="flex items-center gap-2">
           <Radio class="w-4 h-4 text-zinc-500" />
-          <h4 class="text-xs font-semibold text-zinc-900 dark:text-zinc-100">Platform Adapters ({adapters.length})</h4>
+          <h4 class="text-xs font-semibold text-zinc-900 dark:text-zinc-100">{t('plugins.adapters_title')} ({adapters.length})</h4>
         </div>
         <div class="space-y-2">
           {#each adapters as adapter}
@@ -330,7 +331,7 @@ $effect(() => {
           onclick={() => (selectedPluginId = null)}
           class="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 text-xs font-mono cursor-pointer"
         >
-          Close
+          {t('common.close')}
         </button>
       </div>
 
@@ -355,7 +356,7 @@ $effect(() => {
           onclick={() => (selectedPluginId = null)}
           class="px-3 py-1.5 text-xs text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded transition cursor-pointer"
         >
-          Cancel
+          {t('common.cancel')}
         </button>
         <button
           onclick={saveConfig}
@@ -363,7 +364,7 @@ $effect(() => {
           class="px-3 py-1.5 text-xs bg-indigo-600 hover:bg-indigo-500 text-white rounded font-medium transition cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
         >
           <Save class="w-3.5 h-3.5" />
-          <span>{configSaving ? 'Enforcing CAS...' : 'Save Configuration'}</span>
+          <span>{configSaving ? 'Enforcing CAS...' : t('common.save')}</span>
         </button>
       </div>
     </div>

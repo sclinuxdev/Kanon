@@ -13,6 +13,7 @@ import {
   Trash2,
   Zap,
 } from 'lucide-svelte';
+import { t } from '../../stores/i18n.svelte';
 import { logStore } from '../../stores/logs.svelte';
 import { pipelineStore } from '../../stores/pipeline.svelte';
 import type { LogLevel } from '../../types';
@@ -74,14 +75,14 @@ function getStageColor(stage: string): string {
     <div class="p-3 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between shrink-0 bg-white dark:bg-zinc-900">
       <div class="flex items-center gap-2">
         <Layers class="w-4 h-4 text-zinc-500" />
-        <span class="text-xs font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">Pipeline Lifecycle Events</span>
+        <span class="text-xs font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">{t('pipeline.live_events')}</span>
       </div>
       <div class="flex items-center gap-2">
         <span class="text-[10px] font-mono text-zinc-400">({pipelineStore.records.length} events)</span>
         <button
           onclick={() => pipelineStore.clear()}
           class="p-1 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition cursor-pointer"
-          title="Clear events"
+          title={t('common.clear')}
         >
           <Trash2 class="w-3.5 h-3.5" />
         </button>
@@ -132,7 +133,7 @@ function getStageColor(stage: string): string {
     <div class="flex-1 overflow-y-auto p-3 space-y-2 font-mono text-xs">
       {#if pipelineStore.filteredRecords.length === 0}
         <div class="p-8 text-center text-zinc-400 text-xs font-sans">
-          No pipeline events recorded yet. Send an event or use the sandbox to observe events.
+          {t('pipeline.empty_events')}
         </div>
       {:else}
         {#each pipelineStore.filteredRecords.slice().reverse() as record (record.seq)}
@@ -204,7 +205,7 @@ function getStageColor(stage: string): string {
           <input
             type="text"
             bind:value={logStore.searchQuery}
-            placeholder="Search logs..."
+            placeholder={t('common.search')}
             class="w-36 sm:w-48 px-2 py-1 pl-6 text-[11px] bg-zinc-950 border border-zinc-800 rounded text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:border-zinc-700"
           />
           <Search class="w-3 h-3 text-zinc-500 absolute left-2 top-2" />
@@ -223,7 +224,7 @@ function getStageColor(stage: string): string {
         <button
           onclick={() => logStore.clear()}
           class="p-1 text-zinc-400 hover:text-rose-400 transition cursor-pointer"
-          title="Clear console buffer"
+          title={t('common.clear')}
         >
           <Trash2 class="w-3.5 h-3.5" />
         </button>
@@ -237,7 +238,7 @@ function getStageColor(stage: string): string {
     >
       {#if logStore.filteredRecords.length === 0}
         <div class="text-zinc-600 p-8 text-center font-sans">
-          No logs captured. Connected to /ws/v1/logs.
+          {t('pipeline.empty_logs')}
         </div>
       {:else}
         {#each logStore.filteredRecords as record (record.seq)}

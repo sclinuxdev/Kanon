@@ -1,0 +1,343 @@
+export type Locale = 'zh' | 'en';
+
+export const dictionaries = {
+  en: {
+    // Navigation
+    'nav.overview': 'Overview',
+    'nav.pipeline': 'Pipeline & Logs',
+    'nav.plugins': 'Plugins & Adapters',
+    'nav.sessions': 'Sessions & Personas',
+    'nav.playground': 'AI Playground',
+    'nav.providers': 'System & Models',
+
+    // Titles & Subtitles
+    'title.overview': 'Node Overview & Health',
+    'subtitle.overview':
+      'Microkernel node runtime, process supervisor, and Prometheus exposition',
+    'title.pipeline': 'Pipeline Tracing & Log Console',
+    'subtitle.pipeline':
+      'Real-time WebSocket streaming for pipeline lifecycle transitions and server logs',
+    'title.plugins': 'Plugins & Platform Adapters',
+    'subtitle.plugins':
+      'Out-of-process gRPC plugin hosts, dynamic JSON schemas, and platform adapters',
+    'title.sessions': 'Sessions & Persona Catalogs',
+    'subtitle.sessions':
+      'Conversation context memory, token consumption counters, and persona prompts',
+    'title.playground': 'AI Playground Sandbox',
+    'subtitle.playground':
+      'Interactive streaming chat with multi-turn reasoning and tool calling inspection',
+    'title.providers': 'Model Providers & System Configuration',
+    'subtitle.providers':
+      'LLM gateway backends, connectivity testing, provider presets, and node runtime parameters',
+
+    // General & Status
+    'status.healthy': 'Healthy',
+    'status.connecting': 'Connecting',
+    'status.offline': 'Offline',
+    'status.connected': 'Connected',
+    'status.disconnected': 'Disconnected',
+    'status.reconnecting': 'Reconnecting',
+    'common.retry': 'Retry now',
+    'common.refresh': 'Refresh',
+    'common.search': 'Search...',
+    'common.clear': 'Clear',
+    'common.save': 'Save Changes',
+    'common.cancel': 'Cancel',
+    'common.close': 'Close',
+    'common.loading': 'Loading...',
+    'common.error': 'Error',
+    'common.success': 'Success',
+    'common.appearance': 'Appearance',
+    'common.language': 'Language',
+    'common.command_menu': 'Command Menu',
+    'common.events': 'Events',
+    'common.logs': 'Logs',
+    'common.version': 'Version',
+    'common.uptime': 'Uptime',
+    'common.latency': 'Latency',
+
+    // Overview Cards
+    'overview.node_status': 'Node Status',
+    'overview.resident_memory': 'Resident Memory (RSS)',
+    'overview.virtual_memory': 'Virtual Memory',
+    'overview.llm_engine': 'LLM Gateway Engine',
+    'overview.llm_ready': 'Configured & Ready',
+    'overview.llm_disabled': 'Disabled (Unset)',
+    'overview.plugin_hosts': 'Active Plugin Hosts',
+    'overview.plugins_loaded': 'Plugins Loaded',
+    'overview.sessions_total': 'Total Sessions',
+    'overview.sessions_active': 'Active Sessions',
+    'overview.ws_connections': 'Active WebSockets',
+    'overview.event_listeners': 'Event Listeners',
+    'overview.log_listeners': 'Log Listeners',
+    'overview.quick_actions': 'Quick Navigation',
+
+    // Pipeline & Logs
+    'pipeline.live_events': 'Pipeline Event Stream',
+    'pipeline.server_logs': 'Structured Server Logs',
+    'pipeline.autoscroll': 'Auto-scroll',
+    'pipeline.filter_stage': 'Filter Stage',
+    'pipeline.filter_level': 'Log Level',
+    'pipeline.empty_events':
+      'No pipeline events recorded yet. Send a message to see lifecycle stages.',
+    'pipeline.empty_logs': 'No log records received yet.',
+
+    // Plugins & Adapters
+    'plugins.hosts_title': 'Supervised Plugin Hosts',
+    'plugins.adapters_title': 'Platform Adapters',
+    'plugins.host_id': 'Host ID',
+    'plugins.runtime': 'Runtime',
+    'plugins.pid': 'PID',
+    'plugins.restart': 'Restart Process',
+    'plugins.config': 'Configure',
+    'plugins.commands': 'Commands',
+    'plugins.tools': 'Tools',
+    'plugins.no_hosts': 'No out-of-process plugin hosts running.',
+    'plugins.no_adapters': 'No platform adapters registered.',
+    'plugins.config_modal_title': 'Plugin Configuration',
+    'plugins.cas_version': 'CAS Version',
+
+    // Sessions & Personas
+    'sessions.active_sessions': 'Tracked Sessions',
+    'sessions.session_id': 'Session ID',
+    'sessions.turns': 'Turns',
+    'sessions.tokens': 'Tokens Used',
+    'sessions.persona': 'Active Persona',
+    'sessions.reset': 'Reset History',
+    'sessions.persona_catalog': 'Persona Catalog',
+    'sessions.system_prompt': 'System Prompt',
+    'sessions.no_sessions': 'No conversation sessions recorded yet.',
+
+    // Playground
+    'playground.model': 'Model',
+    'playground.persona_override': 'Persona Override',
+    'playground.enable_tools': 'Enable Tool Calling',
+    'playground.send': 'Send',
+    'playground.placeholder':
+      'Type a prompt to test conversational reasoning or tool dispatch...',
+    'playground.tools_executed': 'Executed Tools',
+    'playground.empty_chat':
+      'Start a sandbox chat turn to test the active LLM provider and tool calling.',
+
+    // Providers & System
+    'providers.active_provider': 'Active Model Provider',
+    'providers.protocol': 'Protocol',
+    'providers.model_name': 'Default Model',
+    'providers.base_url': 'Base URL',
+    'providers.api_key': 'API Key',
+    'providers.api_key_set': 'Configured (Masked)',
+    'providers.api_key_unset': 'Not Configured',
+    'providers.temperature': 'Temperature',
+    'providers.max_tokens': 'Max Tokens',
+    'providers.test_connectivity': 'Test Connectivity & Latency',
+    'providers.testing': 'Testing connection...',
+    'providers.test_prompt': 'Test Prompt',
+    'providers.test_result': 'Test Result',
+    'providers.latency_ms': 'Round-trip Latency',
+    'providers.response_preview': 'Response Preview',
+    'providers.presets_title': 'Supported Provider Presets',
+    'providers.use_preset': 'Use Preset',
+    'providers.system_config_title': 'System & Node Configuration',
+    'providers.ipc_socket': 'Core IPC Socket',
+    'providers.run_dir': 'Run Directory',
+    'providers.data_dir': 'Data Directory',
+    'providers.memory_window': 'Memory Sliding Window',
+    'providers.webhook_adapter': 'Platform Webhook',
+    'providers.signature_verify': 'HMAC Signature Verification',
+    'providers.env_title': 'Runtime Environment',
+    'providers.os_arch': 'OS & Architecture',
+    'providers.rust_edition': 'Rust Edition',
+  },
+  zh: {
+    // 导航项
+    'nav.overview': '节点概览',
+    'nav.pipeline': '流水线与日志',
+    'nav.plugins': '插件与适配器',
+    'nav.sessions': '会话与人设',
+    'nav.playground': 'AI 沙箱调试',
+    'nav.providers': '模型与系统配置',
+
+    // 标题与副标题
+    'title.overview': '微内核概览与健康状态',
+    'subtitle.overview':
+      '微内核运行时、进程监管 Supervisor 与 Prometheus 指标导出',
+    'title.pipeline': '流水线追踪与日志控制台',
+    'subtitle.pipeline':
+      '基于 WebSocket 的流水线生命周期状态转移与服务器日志实时流',
+    'title.plugins': '插件宿主与平台适配器',
+    'subtitle.plugins':
+      '物理隔离的跨进程 gRPC 插件宿主、动态 JSON Schema 配置与平台适配器',
+    'title.sessions': '会话上下文与人设库',
+    'subtitle.sessions': '对话上下文滑动窗口记忆、Token 消耗统计与人设提示词库',
+    'title.playground': 'AI 对话沙箱',
+    'subtitle.playground':
+      '支持多轮推理与动态 Tool Calling 工具调用的实时交互测试',
+    'title.providers': '模型 Providers 与系统配置',
+    'subtitle.providers':
+      'LLM 网关后端、连通性与延迟测速、主流服务商预设以及节点系统参数',
+
+    // 通用与状态
+    'status.healthy': '运行正常',
+    'status.connecting': '正在连接',
+    'status.offline': '离线',
+    'status.connected': '已连接',
+    'status.disconnected': '已断开',
+    'status.reconnecting': '重连中',
+    'common.retry': '立即重试',
+    'common.refresh': '刷新状态',
+    'common.search': '搜索...',
+    'common.clear': '清除',
+    'common.save': '保存修改',
+    'common.cancel': '取消',
+    'common.close': '关闭',
+    'common.loading': '加载中...',
+    'common.error': '错误',
+    'common.success': '成功',
+    'common.appearance': '外观主题',
+    'common.language': '界面语言',
+    'common.command_menu': '快捷指令菜单',
+    'common.events': '事件流',
+    'common.logs': '日志流',
+    'common.version': '版本号',
+    'common.uptime': '运行时间',
+    'common.latency': '往返延迟',
+
+    // 概览卡片
+    'overview.node_status': '节点运行状态',
+    'overview.resident_memory': '常驻物理内存 (RSS)',
+    'overview.virtual_memory': '虚拟地址空间',
+    'overview.llm_engine': '大模型网关引擎',
+    'overview.llm_ready': '已配置就绪',
+    'overview.llm_disabled': '未配置 (已停用)',
+    'overview.plugin_hosts': '监管中的插件宿主进程',
+    'overview.plugins_loaded': '已加载插件实例',
+    'overview.sessions_total': '会话总数',
+    'overview.sessions_active': '活跃会话',
+    'overview.ws_connections': 'WebSocket 连接数',
+    'overview.event_listeners': '生命周期监听者',
+    'overview.log_listeners': '日志监听者',
+    'overview.quick_actions': '快捷导航',
+
+    // 流水线与日志
+    'pipeline.live_events': '流水线实时事件流',
+    'pipeline.server_logs': '结构化服务器日志',
+    'pipeline.autoscroll': '自动滚动',
+    'pipeline.filter_stage': '按阶段筛选',
+    'pipeline.filter_level': '日志级别',
+    'pipeline.empty_events':
+      '暂无流水线事件记录。向 Bot 发送消息即可观察生命周期阶段。',
+    'pipeline.empty_logs': '暂无日志输出。',
+
+    // 插件与适配器
+    'plugins.hosts_title': '进程监管中的插件宿主',
+    'plugins.adapters_title': '平台适配器',
+    'plugins.host_id': '宿主 ID',
+    'plugins.runtime': '运行时环境',
+    'plugins.pid': '进程 PID',
+    'plugins.restart': '重启宿主进程',
+    'plugins.config': '配置参数',
+    'plugins.commands': '指令声明',
+    'plugins.tools': '工具声明',
+    'plugins.no_hosts': '暂无运行中的独立插件子进程。',
+    'plugins.no_adapters': '暂无注册的平台适配器。',
+    'plugins.config_modal_title': '插件配置管理',
+    'plugins.cas_version': 'CAS 版本号',
+
+    // 会话与人设
+    'sessions.active_sessions': '追踪中的会话列表',
+    'sessions.session_id': '会话 ID',
+    'sessions.turns': '交互轮数',
+    'sessions.tokens': 'Token 消耗总量',
+    'sessions.persona': '当前人设',
+    'sessions.reset': '清空历史记忆',
+    'sessions.persona_catalog': '人设预设库',
+    'sessions.system_prompt': '系统提示词 (System Prompt)',
+    'sessions.no_sessions': '暂无会话记录。',
+
+    // 沙箱
+    'playground.model': '指定模型',
+    'playground.persona_override': '临时切换人设',
+    'playground.enable_tools': '允许调用插件工具 (Tool Calling)',
+    'playground.send': '发送测试',
+    'playground.placeholder': '输入测试提示词，验证多轮对话推理或工具调度...',
+    'playground.tools_executed': '实际执行的工具调用',
+    'playground.empty_chat':
+      '发起一轮对话测试当前配置的 LLM Provider 与工具调用。',
+
+    // 模型与系统配置
+    'providers.active_provider': '当前启用的 LLM Provider',
+    'providers.protocol': '协议格式',
+    'providers.model_name': '默认模型标识',
+    'providers.base_url': '接口 Base URL',
+    'providers.api_key': '凭证密钥',
+    'providers.api_key_set': '已配置 (受保护隐藏)',
+    'providers.api_key_unset': '未设置',
+    'providers.temperature': '采样温度',
+    'providers.max_tokens': '单次最大 Token 限制',
+    'providers.test_connectivity': '连通性与测速测试',
+    'providers.testing': '正在连接测试...',
+    'providers.test_prompt': '测试提示词',
+    'providers.test_result': '测试结果',
+    'providers.latency_ms': '网络往返延迟',
+    'providers.response_preview': '模型回复预览',
+    'providers.presets_title': '主流服务商配置预设',
+    'providers.use_preset': '应用预设',
+    'providers.system_config_title': '微内核系统与运行时参数',
+    'providers.ipc_socket': 'Core IPC Socket 路径',
+    'providers.run_dir': '运行时目录 (Run Dir)',
+    'providers.data_dir': '持久化数据目录 (Data Dir)',
+    'providers.memory_window': '会话记忆滑动窗口大小',
+    'providers.webhook_adapter': '内置 Webhook 适配器',
+    'providers.signature_verify': 'HMAC-SHA256 签名校验',
+    'providers.env_title': '系统环境参数',
+    'providers.os_arch': '操作系统与架构',
+    'providers.rust_edition': 'Rust 版本规范',
+  },
+};
+
+class I18nStore {
+  locale = $state<Locale>('zh');
+
+  constructor() {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('kanon-locale') as Locale | null;
+      if (saved === 'en' || saved === 'zh') {
+        this.locale = saved;
+      } else {
+        const navLang = navigator.language.toLowerCase();
+        this.locale = navLang.startsWith('zh') ? 'zh' : 'en';
+      }
+      document.documentElement.lang = this.locale === 'zh' ? 'zh-CN' : 'en';
+    }
+  }
+
+  setLocale(l: Locale) {
+    this.locale = l;
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('kanon-locale', l);
+      document.documentElement.lang = l === 'zh' ? 'zh-CN' : 'en';
+    }
+  }
+
+  toggle() {
+    this.setLocale(this.locale === 'zh' ? 'en' : 'zh');
+  }
+
+  t(key: string, params?: Record<string, string | number>): string {
+    const dict = dictionaries[this.locale] || dictionaries.en;
+    let text =
+      (dict as Record<string, string>)[key] ??
+      (dictionaries.en as Record<string, string>)[key] ??
+      key;
+    if (params) {
+      for (const [k, v] of Object.entries(params)) {
+        text = text.replace(new RegExp(`{${k}}`, 'g'), String(v));
+      }
+    }
+    return text;
+  }
+}
+
+export const i18n = new I18nStore();
+export const t = (key: string, params?: Record<string, string | number>) =>
+  i18n.t(key, params);

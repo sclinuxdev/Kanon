@@ -6,7 +6,11 @@ import type {
   PersonasResponse,
   PluginConfigResponse,
   PluginsResponse,
+  ProvidersCatalog,
   SessionsResponse,
+  SystemConfig,
+  TestProviderRequest,
+  TestProviderResponse,
 } from '../types';
 
 export class ApiError extends Error {
@@ -34,8 +38,10 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     let message = `HTTP ${res.status}: ${res.statusText}`;
     try {
       const errJson = await res.json();
-      if (errJson.code) code = errJson.code;
-      if (errJson.message) message = errJson.message;
+      if (errJson.error?.code) code = errJson.error.code;
+      else if (errJson.code) code = errJson.code;
+      if (errJson.error?.message) message = errJson.error.message;
+      else if (errJson.message) message = errJson.message;
     } catch {
       // ignore json parse error
     }
@@ -46,11 +52,19 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  getHealth: () => request<NodeHealth>('/health'),
+  getHealth: () => request<NodeHealth>('/api/v1/health'),
   getMetrics: async () => {
-    const res = await fetch('/metrics');
+    const res = await fetch('/api/v1/metrics');
     return res.text();
   },
+
+  getSystemConfig: () => request<SystemConfig>('/api/v1/system/config'),
+  getProviders: () => request<ProvidersCatalog>('/api/v1/providers'),
+  testProvider: (req?: TestProviderRequest) =>
+    request<TestProviderResponse>('/api/v1/providers/test', {
+      method: 'POST',
+      body: JSON.stringify(req ?? {}),
+    }),
 
   getPlugins: () => request<PluginsResponse>('/api/v1/plugins'),
   getPluginConfig: (pluginId: string) =>
@@ -103,7 +117,7 @@ export const api = {
     request<{ success: boolean }>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/persona`,
       {
-        method: 'PUT',
+        method: 'POST',
         body: JSON.stringify({ persona }),
       },
     ),

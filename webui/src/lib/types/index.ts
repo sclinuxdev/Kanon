@@ -1,15 +1,118 @@
 // Node health & metrics types
+export interface MemorySection {
+  resident_bytes: number | null;
+  virtual_bytes: number | null;
+}
+
+export interface PluginSection {
+  hosts: number;
+  loaded: number;
+}
+
+export interface SessionSection {
+  total: number;
+  active: number;
+}
+
+export interface RealtimeSection {
+  websocket_connections: number;
+  log_subscribers: number;
+  event_subscribers: number;
+}
+
 export interface NodeHealth {
   status: string;
   version: string;
-  uptime_secs: number;
-  chat_enabled: boolean;
-  default_model?: string;
-  supervisor: {
-    managed_hosts: number;
-    total_plugins: number;
-    adapters: number;
-  };
+  uptime_seconds: number;
+  llm_configured: boolean;
+  memory: MemorySection;
+  plugins: PluginSection;
+  sessions: SessionSection;
+  realtime: RealtimeSection;
+}
+
+// System configuration types
+export interface WebhookConfig {
+  platform: string;
+  callback_configured: boolean;
+  callback_url: string | null;
+  signature_verification: boolean;
+}
+
+export interface LlmConfig {
+  configured: boolean;
+  protocol: string;
+  model: string;
+  base_url: string | null;
+  api_key_configured: boolean;
+  max_iterations: number;
+  temperature: number | null;
+  max_tokens: number | null;
+}
+
+export interface EnvironmentConfig {
+  os: string;
+  arch: string;
+  rust_edition: string;
+}
+
+export interface SystemConfig {
+  version: string;
+  uptime_seconds: number;
+  ipc_socket_path: string;
+  run_dir: string;
+  data_dir: string;
+  memory_window: number;
+  webhook: WebhookConfig;
+  llm: LlmConfig;
+  environment: EnvironmentConfig;
+}
+
+// Provider & Models types
+export interface ActiveProviderInfo {
+  configured: boolean;
+  protocol: string;
+  model: string;
+  base_url: string | null;
+  api_key_configured: boolean;
+  temperature: number | null;
+  max_tokens: number | null;
+}
+
+export interface ProtocolDescriptor {
+  id: string;
+  name: string;
+  default_base_url: string;
+}
+
+export interface ProviderPreset {
+  id: string;
+  name: string;
+  protocol: string;
+  base_url: string;
+  default_model: string;
+}
+
+export interface ProvidersCatalog {
+  active: ActiveProviderInfo;
+  available_protocols: ProtocolDescriptor[];
+  presets: ProviderPreset[];
+}
+
+export interface TestProviderRequest {
+  protocol?: string;
+  base_url?: string;
+  api_key?: string;
+  model?: string;
+  prompt?: string;
+}
+
+export interface TestProviderResponse {
+  status: 'ok' | 'error';
+  latency_ms: number;
+  model: string;
+  reply: string | null;
+  error: string | null;
 }
 
 // Plugin & Supervisor types

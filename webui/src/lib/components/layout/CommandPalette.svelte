@@ -3,6 +3,8 @@ import {
   Activity,
   Blocks,
   Bot,
+  Cpu,
+  Languages,
   Moon,
   RefreshCw,
   Search,
@@ -11,6 +13,7 @@ import {
   Trash2,
   Users,
 } from 'lucide-svelte';
+import { i18n, t } from '../../stores/i18n.svelte';
 import { logStore } from '../../stores/logs.svelte';
 import { nodeStore } from '../../stores/node.svelte';
 import { theme } from '../../stores/theme.svelte';
@@ -22,41 +25,48 @@ let { isOpen = $bindable(false), onSelectTab = (_tab: string) => {} } = $props<{
 
 let query = $state('');
 
-const commands = [
+const commands = $derived([
   {
     id: 'overview',
-    title: 'Go to Overview',
+    title: `${t('nav.overview')} (Overview)`,
     category: 'Navigation',
     icon: Activity,
     action: () => onSelectTab('overview'),
   },
   {
     id: 'pipeline',
-    title: 'Go to Pipeline & Logs',
+    title: `${t('nav.pipeline')} (Pipeline & Logs)`,
     category: 'Navigation',
     icon: Terminal,
     action: () => onSelectTab('pipeline'),
   },
   {
     id: 'plugins',
-    title: 'Go to Plugins & Adapters',
+    title: `${t('nav.plugins')} (Plugins & Adapters)`,
     category: 'Navigation',
     icon: Blocks,
     action: () => onSelectTab('plugins'),
   },
   {
     id: 'sessions',
-    title: 'Go to Sessions & Personas',
+    title: `${t('nav.sessions')} (Sessions & Personas)`,
     category: 'Navigation',
     icon: Users,
     action: () => onSelectTab('sessions'),
   },
   {
     id: 'playground',
-    title: 'Go to AI Playground',
+    title: `${t('nav.playground')} (AI Playground)`,
     category: 'Navigation',
     icon: Bot,
     action: () => onSelectTab('playground'),
+  },
+  {
+    id: 'providers',
+    title: `${t('nav.providers')} (System & Models)`,
+    category: 'Navigation',
+    icon: Cpu,
+    action: () => onSelectTab('providers'),
   },
   {
     id: 'clear_logs',
@@ -67,10 +77,17 @@ const commands = [
   },
   {
     id: 'refresh',
-    title: 'Refresh Node Status',
+    title: t('common.refresh'),
     category: 'Action',
     icon: RefreshCw,
     action: () => nodeStore.refresh(),
+  },
+  {
+    id: 'toggle_lang',
+    title: `Switch Language: ${i18n.locale === 'zh' ? 'English' : '简体中文'}`,
+    category: 'Action',
+    icon: Languages,
+    action: () => i18n.toggle(),
   },
   {
     id: 'toggle_theme',
@@ -79,7 +96,7 @@ const commands = [
     icon: theme.dark ? Sun : Moon,
     action: () => theme.toggle(),
   },
-];
+]);
 
 let filtered = $derived(
   commands.filter(

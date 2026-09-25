@@ -3,6 +3,8 @@ import {
   Activity,
   Blocks,
   Bot,
+  Cpu,
+  Languages,
   Laptop,
   Moon,
   Radio,
@@ -10,6 +12,7 @@ import {
   Terminal,
   Users,
 } from 'lucide-svelte';
+import { i18n, t } from '../../stores/i18n.svelte';
 import { nodeStore } from '../../stores/node.svelte';
 import { theme } from '../../stores/theme.svelte';
 
@@ -24,11 +27,12 @@ let {
 }>();
 
 const navItems = [
-  { id: 'overview', label: 'Overview', icon: Activity },
-  { id: 'pipeline', label: 'Pipeline & Logs', icon: Terminal },
-  { id: 'plugins', label: 'Plugins & Adapters', icon: Blocks },
-  { id: 'sessions', label: 'Sessions & Personas', icon: Users },
-  { id: 'playground', label: 'Playground', icon: Bot },
+  { id: 'overview', key: 'nav.overview', icon: Activity },
+  { id: 'pipeline', key: 'nav.pipeline', icon: Terminal },
+  { id: 'plugins', key: 'nav.plugins', icon: Blocks },
+  { id: 'sessions', key: 'nav.sessions', icon: Users },
+  { id: 'playground', key: 'nav.playground', icon: Bot },
+  { id: 'providers', key: 'nav.providers', icon: Cpu },
 ];
 </script>
 
@@ -46,9 +50,9 @@ const navItems = [
         </div>
       </div>
       <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium font-mono uppercase tracking-wider
-        {nodeStore.health?.status === 'healthy' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20' : 'bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20'}">
-        <span class="w-1.5 h-1.5 rounded-full mr-1 {nodeStore.health?.status === 'healthy' ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}"></span>
-        {nodeStore.health?.status ?? 'connecting'}
+        {nodeStore.health?.status === 'ok' || nodeStore.health?.status === 'healthy' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20' : 'bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20'}">
+        <span class="w-1.5 h-1.5 rounded-full mr-1 {nodeStore.health?.status === 'ok' || nodeStore.health?.status === 'healthy' ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}"></span>
+        {nodeStore.health?.status ? (t(`status.${nodeStore.health.status}`) !== `status.${nodeStore.health.status}` ? t(`status.${nodeStore.health.status}`) : nodeStore.health.status) : t('status.connecting')}
       </span>
     </div>
 
@@ -59,7 +63,7 @@ const navItems = [
     >
       <span class="flex items-center gap-1.5">
         <Radio class="w-3.5 h-3.5 text-zinc-400" />
-        <span>Command Menu</span>
+        <span>{t('common.command_menu')}</span>
       </span>
       <kbd class="px-1.5 py-0.5 text-[10px] font-mono bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded text-zinc-500">⌘K</kbd>
     </button>
@@ -77,15 +81,40 @@ const navItems = [
             : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 hover:bg-zinc-200/50 dark:hover:bg-zinc-900/60'}"
       >
         <Icon class="w-4 h-4 shrink-0" />
-        <span>{item.label}</span>
+        <span>{t(item.key)}</span>
       </button>
     {/each}
   </nav>
 
-  <!-- Bottom toolbar: theme & runtime summary -->
+  <!-- Bottom toolbar: language & theme -->
   <div class="p-3 border-t border-zinc-200/80 dark:border-zinc-800/80 space-y-2">
+    <!-- Language toggle -->
     <div class="flex items-center justify-between px-1">
-      <span class="text-[11px] text-zinc-500 font-mono">Appearance</span>
+      <span class="text-[11px] text-zinc-500 font-mono flex items-center gap-1">
+        <Languages class="w-3 h-3 text-zinc-400" />
+        <span>{t('common.language')}</span>
+      </span>
+      <div class="flex items-center gap-1 bg-zinc-200/60 dark:bg-zinc-900 p-0.5 rounded-md border border-zinc-200 dark:border-zinc-800">
+        <button
+          onclick={() => i18n.setLocale('zh')}
+          class="px-1.5 py-0.5 rounded text-[11px] font-mono transition cursor-pointer {i18n.locale === 'zh' ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 shadow-2xs font-bold' : 'text-zinc-400 hover:text-zinc-600'}"
+          title="简体中文"
+        >
+          中文
+        </button>
+        <button
+          onclick={() => i18n.setLocale('en')}
+          class="px-1.5 py-0.5 rounded text-[11px] font-mono transition cursor-pointer {i18n.locale === 'en' ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 shadow-2xs font-bold' : 'text-zinc-400 hover:text-zinc-600'}"
+          title="English"
+        >
+          EN
+        </button>
+      </div>
+    </div>
+
+    <!-- Theme toggle -->
+    <div class="flex items-center justify-between px-1">
+      <span class="text-[11px] text-zinc-500 font-mono">{t('common.appearance')}</span>
       <div class="flex items-center gap-1 bg-zinc-200/60 dark:bg-zinc-900 p-0.5 rounded-md border border-zinc-200 dark:border-zinc-800">
         <button
           onclick={() => theme.setMode('light')}

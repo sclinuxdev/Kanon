@@ -1,5 +1,6 @@
 <script lang="ts">
 import { Radio, RefreshCw } from 'lucide-svelte';
+import { t } from '../../stores/i18n.svelte';
 import { logStore } from '../../stores/logs.svelte';
 import { nodeStore } from '../../stores/node.svelte';
 import { pipelineStore } from '../../stores/pipeline.svelte';
@@ -33,12 +34,12 @@ async function handleRefresh() {
     <div class="hidden sm:flex items-center gap-2 text-[11px] font-mono text-zinc-500 dark:text-zinc-400 bg-zinc-100 dark:bg-zinc-900 px-2.5 py-1 rounded-md border border-zinc-200 dark:border-zinc-800">
       <span class="flex items-center gap-1">
         <Radio class="w-3 h-3 {pipelineStore.status === 'connected' ? 'text-emerald-500' : 'text-amber-500'}" />
-        <span>Events</span>
+        <span>{t('common.events')}</span>
       </span>
       <span class="text-zinc-300 dark:text-zinc-700">|</span>
       <span class="flex items-center gap-1">
         <Radio class="w-3 h-3 {logStore.status === 'connected' ? 'text-emerald-500' : 'text-amber-500'}" />
-        <span>Logs</span>
+        <span>{t('common.logs')}</span>
       </span>
     </div>
 
@@ -46,7 +47,7 @@ async function handleRefresh() {
     <button
       onclick={handleRefresh}
       class="p-1.5 text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-900 transition border border-transparent hover:border-zinc-200 dark:hover:border-zinc-800 cursor-pointer"
-      title="Refresh node status"
+      title={t('common.refresh')}
     >
       <RefreshCw class="w-3.5 h-3.5 {isRefreshing ? 'animate-spin text-zinc-900 dark:text-zinc-100' : ''}" />
     </button>

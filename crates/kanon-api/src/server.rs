@@ -13,10 +13,66 @@ use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+use axum::http::Uri;
+use axum::response::{IntoResponse, Response};
+use rust_embed::RustEmbed;
+
 use crate::error::ApiError;
 use crate::routes;
 use crate::state::ApiState;
 use crate::ws;
+
+/// Static web assets embedded into the microkernel binary.
+#[derive(RustEmbed)]
+#[folder = "../../webui/dist/"]
+struct WebUiAssets;
+
+/// Fallback route handler that serves embedded static WebUI assets with SPA fallback,
+/// while guaranteeing structured JSON 404 responses for unmatched `/api/` and `/ws/` paths.
+async fn static_or_not_found(uri: Uri) -> Response {
+    let path = uri.path();
+
+    // Preserve JSON 404 envelope for any unmatched API or WebSocket routes
+    if path.starts_with("/api/") || path.starts_with("/ws/") {
+        return routes::not_found().await.into_response();
+    }
+
+    let trimmed = path.trim_start_matches('/');
+    let target = if trimmed.is_empty() { "index.html" } else { trimmed };
+
+    if let Some(asset) = WebUiAssets::get(target) {
+        let mime = mime_guess::from_path(target).first_or_octet_stream();
+        let cache_control = if target.starts_with("assets/") {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
+
+        return (
+            [
+                (axum::http::header::CONTENT_TYPE, mime.as_ref()),
+                (axum::http::header::CACHE_CONTROL, cache_control),
+            ],
+            asset.data,
+        )
+            .into_response();
+    }
+
+    // SPA fallback: client-side routing routes (e.g. /overview, /plugins, /settings)
+    // resolve to index.html with 200 OK.
+    if let Some(index) = WebUiAssets::get("index.html") {
+        return (
+            [
+                (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (axum::http::header::CACHE_CONTROL, "no-cache"),
+            ],
+            index.data,
+        )
+            .into_response();
+    }
+
+    routes::not_found().await.into_response()
+}
 
 /// Builds the complete management gateway router.
 ///
@@ -28,7 +84,7 @@ pub fn app(state: ApiState) -> Router {
     Router::new()
         .merge(routes::api_router())
         .merge(ws::routes())
-        .fallback(routes::not_found)
+        .fallback(static_or_not_found)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state)

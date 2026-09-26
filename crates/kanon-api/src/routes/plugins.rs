@@ -17,7 +17,7 @@ use axum::Router;
 use axum::extract::{FromRequest, Path as AxumPath, State};
 use axum::routing::{get, post};
 use kanon_core::{ManagedHost, PluginManifest, PluginScanner, SupervisorError};
-use kanon_llm::tool_router::prost_struct_to_json;
+use kanon_llm::tool_router::{json_to_prost_struct, prost_struct_to_json};
 use kanon_proto::v1::PluginMeta;
 use kanon_storage::PluginId;
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,10 @@ pub fn routes() -> Router<ApiState> {
             get(get_config).put(put_config),
         )
         .route("/api/v1/plugins/:id/restart", post(restart_plugin))
+        .route(
+            "/api/v1/plugins/:id/tools/:tool_name",
+            post(call_plugin_tool),
+        )
 }
 
 /// Request body for installing a plugin from a local directory path.
@@ -382,6 +386,83 @@ async fn restart_plugin(
     Ok(Json(RestartResponse {
         host_id,
         plugins: plugin_views_for(&restarted),
+    }))
+}
+
+/// Request body for invoking a plugin tool.
+#[derive(Debug, Deserialize, Default)]
+pub struct CallPluginToolRequest {
+    /// Arguments payload passed to the tool.
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+/// Response returned after executing a plugin tool.
+#[derive(Debug, Serialize)]
+pub struct CallPluginToolResponse {
+    /// Whether the tool execution reported success.
+    pub success: bool,
+    /// Tool result payload.
+    pub result: Value,
+    /// Error message when tool execution failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Invokes a declared tool on a plugin over gRPC IPC.
+async fn call_plugin_tool(
+    State(state): State<ApiState>,
+    AxumPath((plugin_id, tool_name)): AxumPath<(String, String)>,
+    Json(body): Json<CallPluginToolRequest>,
+) -> Result<Json<CallPluginToolResponse>, ApiError> {
+    let host = state
+        .supervisor()
+        .find_host_for_plugin(&plugin_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "Plugin '{plugin_id}' is not loaded by any active host"
+            ))
+        })?;
+
+    let args_struct = json_to_prost_struct(&body.arguments).unwrap_or_default();
+    let call_id = format!(
+        "call-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+
+    let req = kanon_proto::v1::ToolCallRequest {
+        call_id,
+        tool_name,
+        session_id: "api-tool-call".to_string(),
+        payload: Some(kanon_proto::v1::tool_call_request::Payload::StructuredArgs(
+            args_struct,
+        )),
+    };
+
+    let response = host
+        .on_call_tool(req)
+        .await
+        .map_err(|status| ApiError::Internal(format!("Tool execution failed: {}", status.message())))?;
+
+    let result = match response.payload {
+        Some(kanon_proto::v1::tool_call_response::Payload::StructuredResult(res)) => {
+            prost_struct_to_json(res)
+        }
+        _ => Value::Null,
+    };
+
+    Ok(Json(CallPluginToolResponse {
+        success: response.success,
+        result,
+        error: if response.error_message.is_empty() {
+            None
+        } else {
+            Some(response.error_message)
+        },
     }))
 }
 

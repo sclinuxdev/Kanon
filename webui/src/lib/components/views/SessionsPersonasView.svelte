@@ -30,8 +30,13 @@ async function loadData() {
       api.getSessions(),
       api.getPersonas(),
     ]);
-    sessions = sessRes.sessions;
-    personas = persRes.personas;
+    const rawSessions = sessRes.items ?? sessRes.sessions ?? [];
+    sessions = rawSessions.map((s) => ({
+      ...s,
+      session_id: s.session_id ?? s.session_key ?? '',
+      active_persona: s.active_persona ?? s.persona_id ?? undefined,
+    }));
+    personas = persRes.personas ?? [];
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
   } finally {
@@ -95,10 +100,10 @@ $effect(() => {
       <!-- Left 2 Cols: Sessions List -->
       <div class="lg:col-span-2 space-y-3">
         <h4 class="text-xs sm:text-sm font-semibold text-zinc-700 dark:text-zinc-300 uppercase tracking-wider font-mono">
-          {t('sessions.active_sessions')} ({sessions.length})
+          {t('sessions.active_sessions')} ({sessions?.length ?? 0})
         </h4>
 
-        {#if sessions.length === 0}
+        {#if !sessions || sessions.length === 0}
           <div class="p-8 rounded-xl border border-dashed border-zinc-300 dark:border-zinc-800 text-center text-zinc-400 text-sm">
             {t('sessions.no_sessions')}
           </div>

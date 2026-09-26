@@ -122,6 +122,10 @@ class Plugin:
         """Lifecycle hook invoked prior to plugin shutdown and process termination."""
         pass
 
+    async def on_config_reload(self, config: Dict[str, Any]) -> None:
+        """Lifecycle hook invoked when plugin configuration is updated and hot-reloaded."""
+        pass
+
     async def on_pre_filter(
         self,
         req: pb.PipelineEventRequest,

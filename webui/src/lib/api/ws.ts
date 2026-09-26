@@ -18,7 +18,6 @@ export class WsRingBuffer<T> {
   private url: string;
   private status: WsStatus = 'disconnected';
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 20;
   private reconnectTimer: number | null = null;
   private isDestroyed = false;
 
@@ -106,7 +105,10 @@ export class WsRingBuffer<T> {
     if (this.isDestroyed || this.reconnectTimer !== null) return;
 
     // Use exponential backoff capped at 5 seconds; never permanently abandon
-    const delay = Math.min(1000 * 1.5 ** Math.min(this.reconnectAttempts, 8), 5000);
+    const delay = Math.min(
+      1000 * 1.5 ** Math.min(this.reconnectAttempts, 8),
+      5000,
+    );
     this.reconnectAttempts++;
 
     this.reconnectTimer = window.setTimeout(() => {

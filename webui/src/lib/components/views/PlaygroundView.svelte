@@ -129,7 +129,9 @@ async function sendMessage() {
             return {
               ...m,
               content: m.content + (delta || ''),
-              reasoning: reasoning ? (m.reasoning || '') + reasoning : m.reasoning,
+              reasoning: reasoning
+                ? (m.reasoning || '') + reasoning
+                : m.reasoning,
             };
           });
         },
@@ -141,7 +143,9 @@ async function sendMessage() {
             if (m.id !== assistantId) return m;
             return {
               ...m,
-              content: m.content ? m.content + `\n[错误: ${err.message}]` : `[错误: ${err.message}]`,
+              content: m.content
+                ? `${m.content}\n[错误: ${err.message}]`
+                : `[错误: ${err.message}]`,
             };
           });
           isStreaming = false;
@@ -154,7 +158,9 @@ async function sendMessage() {
       if (m.id !== assistantId) return m;
       return {
         ...m,
-        content: m.content ? m.content + `\n[发送请求失败: ${err}]` : `[发送请求失败: ${err}]`,
+        content: m.content
+          ? `${m.content}\n[发送请求失败: ${err}]`
+          : `[发送请求失败: ${err}]`,
       };
     });
     isStreaming = false;

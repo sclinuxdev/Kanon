@@ -187,15 +187,22 @@ export interface AdaptersResponse {
 // Sessions & Personas
 export interface SessionSummary {
   session_id: string;
+  session_key?: string;
   turn_count: number;
   total_tokens_used: number;
   active_persona?: string;
+  persona_id?: string | null;
   last_updated_at?: number;
+  last_active_at?: number;
 }
 
 export interface SessionsResponse {
   total: number;
-  sessions: SessionSummary[];
+  items?: SessionSummary[];
+  sessions?: SessionSummary[];
+  page?: number;
+  page_size?: number;
+  total_pages?: number;
 }
 
 export interface PersonaItem {
@@ -300,4 +307,27 @@ export interface FetchModelsRequest {
 
 export interface FetchModelsResponse {
   models: string[];
+}
+
+// QQ Official Adapter QR Login & Polling
+export interface QQOfficialQrLoginResponse {
+  task_id: string;
+  bind_key: string;
+  qrcode_url: string;
+  poll_interval_seconds: number;
+}
+
+export interface QQOfficialPollLoginResponse {
+  status: 'pending' | 'created' | 'expired' | 'error';
+  qr_status: number;
+  appid?: string;
+  secret?: string;
+  saved?: boolean;
+  message?: string;
+}
+
+export interface CallPluginToolResponse {
+  success: boolean;
+  result: unknown;
+  error?: string;
 }

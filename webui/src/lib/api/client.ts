@@ -1,5 +1,6 @@
 import type {
   AdaptersResponse,
+  CallPluginToolResponse,
   ChatCompletionRequest,
   ChatCompletionResponse,
   FetchModelsRequest,
@@ -10,6 +11,8 @@ import type {
   PluginConfigResponse,
   PluginsResponse,
   ProvidersCatalog,
+  QQOfficialPollLoginResponse,
+  QQOfficialQrLoginResponse,
   SessionsResponse,
   SystemConfig,
   TestProviderRequest,
@@ -127,6 +130,18 @@ export const api = {
       `/api/v1/plugins/${encodeURIComponent(pluginId)}/restart`,
       { method: 'POST' },
     ),
+  callPluginTool: (
+    pluginId: string,
+    toolName: string,
+    args: Record<string, unknown> = {},
+  ) =>
+    request<CallPluginToolResponse>(
+      `/api/v1/plugins/${encodeURIComponent(pluginId)}/tools/${encodeURIComponent(toolName)}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ arguments: args }),
+      },
+    ),
 
   getAdapters: () => request<AdaptersResponse>('/api/v1/adapters'),
   ingestEvent: (platform: string, payload: Record<string, unknown>) =>
@@ -135,6 +150,29 @@ export const api = {
       {
         method: 'POST',
         body: JSON.stringify(payload),
+      },
+    ),
+  requestQQOfficialLoginQr: (bindHost?: string) =>
+    request<QQOfficialQrLoginResponse>('/api/v1/adapters/qqofficial/login/qr', {
+      method: 'POST',
+      body: JSON.stringify({ bind_host: bindHost }),
+    }),
+  pollQQOfficialLogin: (
+    taskId: string,
+    bindKey: string,
+    bindHost?: string,
+    autoSave = true,
+  ) =>
+    request<QQOfficialPollLoginResponse>(
+      '/api/v1/adapters/qqofficial/login/poll',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          task_id: taskId,
+          bind_key: bindKey,
+          bind_host: bindHost,
+          auto_save: autoSave,
+        }),
       },
     ),
 

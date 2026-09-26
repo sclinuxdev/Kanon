@@ -54,6 +54,11 @@ class HostServiceImpl(pb_grpc.PluginHostServiceServicer):
                 applied_version=current_version,
             )
         self._config_version = request.version
+        if request.HasField("config"):
+            from google.protobuf.json_format import MessageToDict
+            new_config = MessageToDict(request.config)
+            if self.plugin.context is not None:
+                self.plugin.context.config = new_config
         return pb.ReloadPluginConfigResponse(
             success=True,
             error_message="",
@@ -279,7 +284,16 @@ async def main() -> None:
     # (plugin fully initialized before the first served RPC) is preserved, the
     # registration call is synchronous and 1s-bounded, and Core stores the endpoint
     # for on-demand dialing instead of connecting at registration time.
-    ctx = PluginContext(data_dir=data_dir, core=core_handle)
+    config: dict = {}
+    config_path = data_dir / "config.json"
+    if config_path.exists():
+        try:
+            import json
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[kanon-host] Failed to load config from {config_path}: {e}", file=sys.stderr, flush=True)
+
+    ctx = PluginContext(data_dir=data_dir, config=config, core=core_handle)
     await plugin.on_load(ctx)
 
     server = grpc.aio.server()

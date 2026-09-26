@@ -1,5 +1,4 @@
 <script lang="ts">
-import { onMount } from 'svelte';
 import {
   Activity,
   AlertCircle,
@@ -15,6 +14,7 @@ import {
   Trash2,
   Zap,
 } from 'lucide-svelte';
+import { onMount } from 'svelte';
 import { t } from '../../stores/i18n.svelte';
 import { logStore } from '../../stores/logs.svelte';
 import { pipelineStore } from '../../stores/pipeline.svelte';

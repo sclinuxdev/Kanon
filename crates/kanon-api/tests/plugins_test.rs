@@ -410,3 +410,40 @@ async fn plugin_config_cas_version_enforcement() {
     assert_eq!(status, 200);
     assert_eq!(body["version"], 1);
 }
+
+/// Invoking a tool on an unregistered plugin returns 404.
+#[tokio::test]
+async fn plugin_tool_call_unknown_plugin_returns_404() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let app: Router = app(fixture_state(PathBuf::from(dir.path()), false).await);
+
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        "/api/v1/plugins/unknown.plugin/tools/test_tool",
+        Some(json!({ "arguments": {} })),
+    )
+    .await;
+
+    assert_eq!(status, 404);
+    assert_eq!(error_code(&body), "not_found");
+}
+
+/// Invoking a tool when the host is dead surfaces an internal server error.
+#[tokio::test]
+async fn plugin_tool_call_reports_upstream_failure() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let app: Router = app(fixture_state(PathBuf::from(dir.path()), false).await);
+
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/plugins/{FIXTURE_PLUGIN_ID}/tools/fixture_tool"),
+        Some(json!({ "arguments": { "expr": "echo" } })),
+    )
+    .await;
+
+    assert_eq!(status, 500);
+    assert_eq!(error_code(&body), "internal_error");
+}
+

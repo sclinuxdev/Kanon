@@ -58,23 +58,6 @@ async fn main() -> StartupResult<()> {
         Some(socket_path.clone()),
     ));
 
-    // Ensure ./plugins and ./data/plugins directories exist
-    if let Err(err) = std::fs::create_dir_all("./plugins") {
-        tracing::warn!(error = %err, "Failed to ensure ./plugins directory exists");
-    }
-    if let Err(err) = std::fs::create_dir_all("./data/plugins") {
-        tracing::warn!(error = %err, "Failed to ensure ./data/plugins directory exists");
-    }
-
-    // Auto-discover and launch declared plugins from ./plugins directory
-    load_plugins_from_directory(&supervisor, "./plugins").await;
-
-    // --- Platform adapters ------------------------------------------------------------
-    register_webhook_adapter(&supervisor).await?;
-    for (platform, error) in supervisor.adapters().start_all(ingress.clone()).await {
-        tracing::error!(platform = %platform, error = %error, "Adapter failed to start");
-    }
-
     // --- Management gateway state & agent engine --------------------------------------
     let mut builder = ApiState::builder(supervisor.clone())
         .with_observability(observability.clone())
@@ -111,15 +94,13 @@ async fn main() -> StartupResult<()> {
         ));
         service = service.with_gateway(gateway);
     }
-    let ipc_server = CoreIpcServer::new(socket_path, service);
+    let ipc_server = CoreIpcServer::new(socket_path.clone(), service);
 
-    let api_server = ApiServer::bind(api_addr, state).await?;
-    let bound_addr = api_server.local_addr();
-
-    // --- Graceful shutdown ------------------------------------------------------------
+    // --- Graceful shutdown channels ---------------------------------------------------
     let (core_shutdown_tx, core_shutdown_rx) = oneshot::channel();
     let (api_shutdown_tx, api_shutdown_rx) = oneshot::channel();
 
+    // Start Core IPC server FIRST so that spawned plugin hosts can connect to core.sock immediately
     let core_task = tokio::spawn(async move {
         ipc_server
             .run(async move {
@@ -127,6 +108,35 @@ async fn main() -> StartupResult<()> {
             })
             .await
     });
+
+    // Wait briefly for Core socket to become active before spawning plugin processes
+    for _ in 0..50 {
+        if socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Ensure ./plugins and ./data/plugins directories exist
+    if let Err(err) = std::fs::create_dir_all("./plugins") {
+        tracing::warn!(error = %err, "Failed to ensure ./plugins directory exists");
+    }
+    if let Err(err) = std::fs::create_dir_all("./data/plugins") {
+        tracing::warn!(error = %err, "Failed to ensure ./data/plugins directory exists");
+    }
+
+    // Auto-discover and launch declared plugins from ./plugins directory
+    load_plugins_from_directory(&supervisor, "./plugins").await;
+
+    // --- Platform adapters ------------------------------------------------------------
+    register_webhook_adapter(&supervisor).await?;
+    for (platform, error) in supervisor.adapters().start_all(ingress.clone()).await {
+        tracing::error!(platform = %platform, error = %error, "Adapter failed to start");
+    }
+
+    let api_server = ApiServer::bind(api_addr, state).await?;
+    let bound_addr = api_server.local_addr();
+
     let api_task = tokio::spawn(async move {
         api_server
             .run(async move {

@@ -166,8 +166,32 @@ class QQOfficialAdapter(Plugin):
         scene: str = "",
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Pushes an inbound event into Core with Fast-ACK non-blocking guarantees."""
-        if not self.context or not self.context.core:
+        if not self.context:
+            print(f"[QQOfficial] Dropped message {msg_id}: no plugin context initialized", flush=True)
+            return
+
+        if not self.context.core:
+            # Lazily probe Core socket if it was not ready at initial startup
+            core_sock_str = os.environ.get("KANON_CORE_SOCK", "./run/core.sock")
+            core_sock = Path(core_sock_str).resolve()
+            if core_sock.exists():
+                try:
+                    import grpc
+                    from kanon_sdk.context import CoreHandle
+                    from kanon_sdk.proto import pb_grpc
+                    core_channel = grpc.aio.insecure_channel(f"unix:{core_sock}")
+                    core_stub = pb_grpc.BotApiServiceStub(core_channel)
+                    self.context.core = CoreHandle(core_stub)
+                    print(f"[QQOfficial] Lazily connected to Kanon Core at {core_sock}", flush=True)
+                except Exception as e:
+                    print(f"[QQOfficial] Lazy Core connection attempt failed: {e}", flush=True)
+
+        if not self.context.core:
+            print(
+                f"[QQOfficial] Dropped message {msg_id}: Kanon Core is offline or unreachable "
+                "(ctx.core is None; ensure Kanon Core backend is running)",
+                flush=True,
+            )
             return
 
         metadata: Dict[str, Any] = {"msg_id": msg_id}

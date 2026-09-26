@@ -141,7 +141,7 @@ class KanonHost:
             else (
                 Path(os.environ["KANON_CORE_SOCK"]).resolve()
                 if os.environ.get("KANON_CORE_SOCK")
-                else None
+                else (Path("./run/core.sock").resolve() if Path("./run/core.sock").exists() else None)
             )
         )
         self.host_id = host_id or os.environ.get("KANON_HOST_ID", f"host_{plugin.id.replace('.', '_')}")
@@ -169,6 +169,15 @@ class KanonHost:
 
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Start host gRPC server first so that Core can reach it during RegisterHost
+        server = grpc.aio.server()
+        pb_grpc.add_PluginHostServiceServicer_to_server(HostServiceImpl(self.plugin), server)
+        pb_grpc.add_MessagePipelineServiceServicer_to_server(PipelineServiceImpl(self.plugin), server)
+
+        server.add_insecure_port(f"unix:{self.socket_path}")
+        await server.start()
+        print(f"Kanon Python Host running on {self.socket_path}", flush=True)
+
         core_channel: Optional[grpc.aio.Channel] = None
         core_handle: Optional[CoreHandle] = None
 
@@ -183,7 +192,7 @@ class KanonHost:
                         endpoint=str(self.socket_path),
                         loaded_plugin_ids=[meta.id],
                     )
-                    await core_stub.RegisterHost(reg_req, timeout=1.0)
+                    await core_stub.RegisterHost(reg_req, timeout=3.0)
                     core_handle = CoreHandle(core_stub)
                 except Exception as exc:
                     if core_channel is not None:
@@ -224,14 +233,6 @@ class KanonHost:
 
         ctx = PluginContext(data_dir=self.data_dir, config=config, core=core_handle)
         await self.plugin.on_load(ctx)
-
-        server = grpc.aio.server()
-        pb_grpc.add_PluginHostServiceServicer_to_server(HostServiceImpl(self.plugin), server)
-        pb_grpc.add_MessagePipelineServiceServicer_to_server(PipelineServiceImpl(self.plugin), server)
-
-        server.add_insecure_port(f"unix:{self.socket_path}")
-        await server.start()
-        print(f"Kanon Python Host running on {self.socket_path}", flush=True)
 
         if shutdown_event is None:
             stop_event = asyncio.Event()

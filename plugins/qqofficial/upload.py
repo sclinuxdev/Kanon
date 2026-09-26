@@ -1,5 +1,11 @@
 """Chunked file uploads for QQ Official C2C and group messages.
 
+This is the only way to send a *local* file: the inline endpoint
+(``POST /v2/{groups,users}/.../files``) accepts a ``url`` that QQ's servers must fetch, and its
+``file_data`` field is still marked 「暂未支持」 in the official documentation. Passing a local
+path there fails with ``40093010 上传URL错误``, which is exactly the bug this module fixes for
+every size, not just files above some threshold.
+
 Handles hashing, multipart upload, 40093001 transient retry, and 40093002 quota detection.
 """
 
@@ -15,8 +21,6 @@ from typing import Any
 import aiohttp
 from botpy.http import BotHttp, Route
 from botpy.types.message import Media
-
-QQOFFICIAL_CHUNKED_UPLOAD_THRESHOLD = 10 * 1024 * 1024
 
 _MD5_10M_BYTES = 10_002_432
 _API_TIMEOUT_SECONDS = 300

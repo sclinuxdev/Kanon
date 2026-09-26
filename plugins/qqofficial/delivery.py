@@ -14,7 +14,6 @@ from botpy.types.message import MarkdownPayload, Media
 from kanon_sdk.proto import pb
 
 from upload import (
-    QQOFFICIAL_CHUNKED_UPLOAD_THRESHOLD,
     QQOfficialChunkedUploader,
 )
 
@@ -345,30 +344,41 @@ class QQDeliveryManager:
         file_type: int,
         is_group: bool,
     ) -> Media:
-        """Uploads media asset using chunked upload if > 10MB or standard upload API."""
+        """Resolves one media source into a QQ ``media`` payload.
+
+        A local file is always uploaded with the chunked protocol: the inline endpoint only accepts
+        a publicly reachable ``url`` (and its ``file_data`` mode is still unsupported upstream), so
+        handing it a path fails with ``40093010 上传URL错误``. An ``http(s)`` source is a real URL
+        and goes through the inline endpoint, which skips the extra round-trips.
+        """
         if not self.bot_client:
             raise RuntimeError("QQ client disconnected")
 
         path = Path(source)
         if path.is_file():
-            size = path.stat().st_size
-            if size > QQOFFICIAL_CHUNKED_UPLOAD_THRESHOLD and self.uploader:
-                if is_group:
-                    return await self.uploader.upload_group(
-                        file_path=path,
-                        file_type=file_type,
-                        file_name=path.name,
-                        group_openid=group_openid,
-                    )
-                else:
-                    return await self.uploader.upload_c2c(
-                        file_path=path,
-                        file_type=file_type,
-                        file_name=path.name,
-                        user_openid=group_openid,
-                    )
+            if self.uploader is None:
+                raise RuntimeError(
+                    f"QQ uploader unavailable; cannot send local file {path.name}"
+                )
+            if is_group:
+                return await self.uploader.upload_group(
+                    file_path=path,
+                    file_type=file_type,
+                    file_name=path.name,
+                    group_openid=group_openid,
+                )
+            return await self.uploader.upload_c2c(
+                file_path=path,
+                file_type=file_type,
+                file_name=path.name,
+                user_openid=group_openid,
+            )
 
-        # URL or standard size
+        if not source.startswith(("http://", "https://")):
+            raise RuntimeError(
+                f"Media source '{source}' is neither a readable file nor an http(s) URL"
+            )
+
         if is_group:
             return await self.bot_client.api.post_group_file(
                 group_openid=group_openid,
@@ -376,10 +386,9 @@ class QQDeliveryManager:
                 url=source,
                 srv_send_msg=False,
             )
-        else:
-            return await self.bot_client.api.post_c2c_file(
-                openid=group_openid,
-                file_type=file_type,
-                url=source,
-                srv_send_msg=False,
-            )
+        return await self.bot_client.api.post_c2c_file(
+            openid=group_openid,
+            file_type=file_type,
+            url=source,
+            srv_send_msg=False,
+        )

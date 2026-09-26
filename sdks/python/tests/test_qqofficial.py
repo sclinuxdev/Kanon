@@ -196,6 +196,115 @@ class TestQQOfficialAdapter(IsolatedAsyncioTestCase):
             msg_seq=1,
         )
 
+    async def test_local_image_is_chunk_uploaded_not_sent_as_a_url(self) -> None:
+        """A local path must never reach the inline endpoint, which only accepts a public URL.
+
+        QQ answers 40093010 上传URL错误 when it is handed a path, and the documented
+        ``file_data`` alternative is still "暂未支持", so the chunked protocol is the only way to
+        deliver a file the node generated itself.
+        """
+        import tempfile
+
+        mock_client = MagicMock()
+        mock_client.is_closed.return_value = False
+        mock_client.api.post_group_file = AsyncMock()
+        mock_client.api.post_group_message = AsyncMock(return_value={"id": "qq_resp_local"})
+        uploader = MagicMock()
+        uploader.upload_group = AsyncMock(return_value={"file_info": "info", "file_uuid": "uuid"})
+        self.adapter.bot_client = mock_client
+        self.adapter._uploader = uploader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "b50.png"
+            image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+
+            req = pb.DeliverMessageRequest(
+                platform="qqofficial",
+                channel_id="group:grp_local",
+                segments=[
+                    MessageSegment.text("这是你的 B50"),
+                    MessageSegment.image_file(str(image)),
+                ],
+                event_id="evt_reply_local",
+            )
+            resp = await self.adapter.on_deliver_message(req)
+
+        self.assertTrue(resp.success, resp.error_message)
+        uploader.upload_group.assert_awaited_once_with(
+            file_path=image,
+            file_type=1,
+            file_name="b50.png",
+            group_openid="grp_local",
+        )
+        mock_client.api.post_group_file.assert_not_awaited()
+
+        # The uploaded `file_info` must reach the message send as a rich-media payload; `Media` is
+        # a TypedDict, so the uploader's dict is exactly the shape the API expects.
+        _, kwargs = mock_client.api.post_group_message.await_args
+        self.assertEqual(kwargs["msg_type"], 7)
+        self.assertEqual(
+            kwargs["media"], {"file_info": "info", "file_uuid": "uuid"}
+        )
+        self.assertEqual(kwargs["content"], "这是你的 B50")
+
+    async def test_local_image_for_c2c_uses_the_user_upload_path(self) -> None:
+        """C2C uploads must go to /v2/users/{openid}, not the group endpoint."""
+        import tempfile
+
+        mock_client = MagicMock()
+        mock_client.is_closed.return_value = False
+        mock_client.api.post_c2c_file = AsyncMock()
+        mock_client.api.post_c2c_message = AsyncMock(return_value={"id": "qq_resp_c2c_local"})
+        uploader = MagicMock()
+        uploader.upload_c2c = AsyncMock(return_value={"file_info": "info", "file_uuid": "uuid"})
+        self.adapter.bot_client = mock_client
+        self.adapter._uploader = uploader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "chart.png"
+            image.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+
+            req = pb.DeliverMessageRequest(
+                platform="qqofficial",
+                channel_id="c2c:user_openid_1",
+                segments=[MessageSegment.image_file(str(image))],
+                event_id="evt_reply_c2c_local",
+            )
+            resp = await self.adapter.on_deliver_message(req)
+
+        self.assertTrue(resp.success, resp.error_message)
+        uploader.upload_c2c.assert_awaited_once_with(
+            file_path=image,
+            file_type=1,
+            file_name="chart.png",
+            user_openid="user_openid_1",
+        )
+        mock_client.api.post_c2c_file.assert_not_awaited()
+
+        _, kwargs = mock_client.api.post_c2c_message.await_args
+        self.assertEqual(kwargs["msg_type"], 7)
+        self.assertEqual(
+            kwargs["media"], {"file_info": "info", "file_uuid": "uuid"}
+        )
+
+    async def test_unreadable_media_source_is_reported(self) -> None:
+        """A source that is neither a file nor an http(s) URL fails loudly, never silently."""
+        mock_client = MagicMock()
+        mock_client.is_closed.return_value = False
+        mock_client.api.post_group_message = AsyncMock()
+        self.adapter.bot_client = mock_client
+
+        req = pb.DeliverMessageRequest(
+            platform="qqofficial",
+            channel_id="group:grp_bad",
+            segments=[MessageSegment.image_file("/nonexistent/path/pic.png")],
+            event_id="evt_reply_bad_media",
+        )
+        resp = await self.adapter.on_deliver_message(req)
+
+        self.assertFalse(resp.success)
+        self.assertIn("neither a readable file nor an http(s) URL", resp.error_message)
+
     async def test_deliver_c2c_message(self) -> None:
         """Verifies outbound delivery to direct c2c conversation."""
         mock_client = MagicMock()

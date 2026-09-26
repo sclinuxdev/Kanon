@@ -3,6 +3,17 @@ import type { TraceRecord } from '../types';
 
 class PipelineStore {
   records = $state<TraceRecord[]>([]);
+
+  /**
+   * Client-side render key.
+   *
+   * The server's `seq` comes from a bus counter that restarts with the process, while this store
+   * deliberately keeps records across socket reconnects. Reusing the server value as the keyed
+   * `{#each}` key therefore produced duplicate keys after a core restart, which throws during
+   * render and leaves the panel blank until a full page reload. A counter owned by the store is
+   * monotonic for the lifetime of the page and cannot collide.
+   */
+  private nextSeq = 0;
   status = $state<WsStatus>('disconnected');
   selectedStage = $state<string>('ALL');
   searchQuery = $state<string>('');
@@ -30,7 +41,8 @@ class PipelineStore {
           );
           const normalized: TraceRecord = {
             ...rec,
-            seq: rec.seq !== undefined ? rec.seq : this.records.length + 1,
+            server_seq: rec.seq,
+            seq: ++this.nextSeq,
             timestamp_ms: rec.timestamp_ms || Date.now(),
             event: {
               ...rec.event,

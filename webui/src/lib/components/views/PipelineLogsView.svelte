@@ -17,6 +17,7 @@ import {
 import { onMount } from 'svelte';
 import { t } from '../../stores/i18n.svelte';
 import { logStore } from '../../stores/logs.svelte';
+import { nodeStore } from '../../stores/node.svelte';
 import { pipelineStore } from '../../stores/pipeline.svelte';
 import type { LogLevel } from '../../types';
 
@@ -156,8 +157,27 @@ function getStageColor(stage: string): string {
     <!-- Event Timeline List -->
     <div class="flex-1 overflow-y-auto p-3 space-y-2.5 font-mono text-xs sm:text-sm">
       {#if pipelineStore.filteredRecords.length === 0}
-        <div class="p-8 text-center text-zinc-400 text-sm font-sans">
-          {t('pipeline.empty_events')}
+        <div class="p-8 text-center text-zinc-400 text-sm font-sans space-y-3">
+          {#if pipelineStore.status !== 'connected'}
+            <!-- An empty panel caused by a dead stream must say so, otherwise it looks
+                 like the node simply has nothing to report. -->
+            <p>{t('pipeline.offline')} <span class="font-mono">({pipelineStore.status})</span></p>
+            <button
+              onclick={() => pipelineStore.reconnect()}
+              class="px-3 py-1.5 rounded-lg border border-zinc-300 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 text-xs cursor-pointer hover:border-indigo-400"
+            >
+              {t('pipeline.reconnect')}
+            </button>
+          {:else}
+            <p>{t('pipeline.empty_events')}</p>
+            {#if (nodeStore.health?.instances?.enabled ?? 0) === 0}
+              <!-- The most common reason for a silent pipeline: nothing claims the adapter, so
+                   inbound messages are dropped before any stage is emitted. -->
+              <p class="text-amber-600 dark:text-amber-400 text-xs">
+                {t('pipeline.no_instance_hint')}
+              </p>
+            {/if}
+          {/if}
         </div>
       {:else}
         {#each pipelineStore.filteredRecords.slice().reverse() as record, i (record.seq ?? i)}
@@ -306,8 +326,24 @@ function getStageColor(stage: string): string {
       class="flex-1 p-3.5 overflow-y-auto space-y-1.5 font-mono text-xs sm:text-[13px] leading-relaxed select-text"
     >
       {#if logStore.filteredRecords.length === 0}
-        <div class="text-zinc-600 p-8 text-center font-sans text-sm">
-          {t('pipeline.empty_logs')}
+        <div class="text-zinc-600 p-8 text-center font-sans text-sm space-y-3">
+          {#if logStore.status !== 'connected'}
+            <p>{t('pipeline.offline')} <span class="font-mono">({logStore.status})</span></p>
+            <button
+              onclick={() => logStore.reconnect()}
+              class="px-3 py-1.5 rounded-lg border border-zinc-300 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 text-xs cursor-pointer hover:border-indigo-400"
+            >
+              {t('pipeline.reconnect')}
+            </button>
+          {:else}
+            <p>{t('pipeline.empty_logs')}</p>
+            {#if logStore.filterLevel !== 'ALL'}
+              <!-- An empty log panel is usually a level filter, not a dead node. -->
+              <p class="text-xs">
+                {t('pipeline.level_filter_hint').replace('{level}', logStore.filterLevel)}
+              </p>
+            {/if}
+          {/if}
         </div>
       {:else}
         {#each logStore.filteredRecords as record, i (`${record.timestamp_ms}_${i}`)}

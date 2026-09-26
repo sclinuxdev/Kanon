@@ -91,7 +91,23 @@ flowchart TB
 2. **轻量开发环境共享模式 (Shared Host for Dev)**：
    - 仅在 `kanon-dev dev` 本地调试或用户显式配置 `group = "shared"` 时，才允许多个受信任的轻量插件合部在同一个共享 Host 进程中以节约开发机内存。
 
-### 2.3 全模块化工程结构划分 (Modular Workspace Architecture)
+### 2.3 插件宿主进程完整生命周期 (Host Process Lifecycle)
+
+进程隔离只有在"宿主进程生命周期完整"时才成立：**没有看门狗的宿主在 Core 被杀后会变成幽灵进程，继续持有平台长连接**；一旦新 Core 启动，幽灵与新生宿主会同时服务同一平台，导致每条消息被处理两次（两次回复、两次模型调用）。因此所有语言的宿主必须实现同一套生命周期：
+
+| 阶段 | 行为 | 责任方 |
+| :--- | :--- | :--- |
+| 启动 | `Supervisor` 以 `KANON_HOST_ID` / `KANON_HOST_SOCK` / `KANON_CORE_SOCK` 注入环境并拉起子进程 | Core |
+| 注册 | 宿主先绑定专属 `host_<id>.sock`，再 `RegisterHost`（注册即连通性探针；失败则显式进入 standalone） | 宿主 |
+| 服务 | `MessagePipelineService`（事件/指令/工具/投递）+ `PluginHostService`（生命周期、配置热重载、管理动作） | 宿主 |
+| 存活 | 定时 `BotApiService.Ping` 探活 Core；**连续 3 次失败（默认 15s 间隔）即自行退出**，避免抢占平台连接 | 宿主（Python `CoreWatchdog` / Rust `watch_core` / TS `startCoreWatchdog`） |
+| 停止 | `SIGTERM`/`SIGINT` → 执行 `on_unload` → 关闭平台连接 → 卸载 socket | 宿主 |
+| 回收 | Core 关停时先 `SIGTERM`，超过 3s 宽限期仍未退出则 `SIGKILL`；未就绪的宿主直接强杀 | Core (`terminate_child`) |
+| 外部注册宿主 | 无子进程句柄不可杀；Core 仅将其移出注册表，宿主依靠自身看门狗退出 | Core + 宿主 |
+
+> 由此可保证：任何一次 Core 退出（含 `SIGKILL`、终端关闭）都不会留下仍在服务平台的宿主；重启后平台连接数恒为 1。
+
+### 2.4 全模块化工程结构划分 (Modular Workspace Architecture)
 
 全系统严格模块化，前后端完全物理分离，各 crate / package 职责单一：
 
@@ -115,7 +131,7 @@ kanon/
 └── webui/                          # 前后端完全独立的现代 Web 控制台 (Vue 3 / React SPA)
 ```
 
-### 2.4 运行时设计原则：零外部硬依赖与按需惰性激活 (Zero Hard Dependency Principle)
+### 2.5 运行时设计原则：零外部硬依赖与按需惰性激活 (Zero Hard Dependency Principle)
 
 > **核心哲学**：**Python 与 Node.js / Bun 并非运行 Kanon 微内核的必需品。**  
 > Kanon 核心与 Rust 原生插件是独立自包含的原生二进制程序，可以在没有任何外部脚本解释器的纯净操作系统上独立运转。
@@ -136,7 +152,7 @@ kanon/
    - **Python**：仅在激活 Python 插件时，优先检测极速工具 `uv`，免配复杂的全局环境。
    - **TypeScript**：仅在激活 TS 插件时，优先检测 `bun` 或 `node/tsx`。
 
-### 2.5 事件入站异步队列与防锁步机制 (Async Ingest Queue & Lockstep Prevention)
+### 2.6 事件入站异步队列与防锁步机制 (Async Ingest Queue & Lockstep Prevention)
 
 为防范 **“LLM 慢推理/插件慢 I/O 反向阻塞 IM 适配器心跳”** 的时序锁步风险，系统确立严格的异步解耦规则：
 
@@ -148,7 +164,7 @@ kanon/
    - 无论 LLM 生成耗时多久，反压均被内部有界队列隔离，绝不沿着 gRPC 链路逆向传导至适配器。
    - 最终出站响应通过独立的 `OnDeliverMessage` 单向调用适配器，适配器底层（WebSocket 心跳、长轮询）保持保活稳定性，大幅降低因业务阻塞导致的断连风险。
 
-### 2.6 Windows 本地 Loopback TCP 密码学鉴权规范 (Loopback Token Authentication)
+### 2.7 Windows 本地 Loopback TCP 密码学鉴权规范 (Loopback Token Authentication)
 
 在 Windows 环境下采用本地端口（`127.0.0.1:EphemeralPort`）通信时，为有效防范同机器上非特权进程伪造请求或注入数据，制定硬性安全约束：
 
@@ -159,7 +175,7 @@ kanon/
    - Host 连接 Core 或 Core 连接 Host 时，首帧必须携带 `x-kanon-auth-token`。
    - 接收端通过 `subtle::constant_time_eq` 恒定时间比对，校验失败立即切断连接。
 
-### 2.7 Linux/macOS Unix Domain Socket 目录隔离与权限加固规范 (POSIX Socket Security)
+### 2.8 Linux/macOS Unix Domain Socket 目录隔离与权限加固规范 (POSIX Socket Security)
 
 在 Unix/Linux 环境下采用 UDS（Unix Domain Socket）通信时，为有效防范本地非特权多租户环境下的符号链接劫持、套接字投毒与非法窃听，制定强制安全约束：
 
@@ -173,7 +189,7 @@ kanon/
    - 运行目录的所有者 UID 必须与当前进程所有者完全一致；
    - 无论是全新建立目录还是已存在的既有目录，统一调用 `Permissions::from_mode(0o700)`（`rwx------`）强制将目录权限收敛为仅当前用户可读写执行，剥夺同组及全局用户的读取与遍历权限。
 
-### 2.8 kanon-transport 架构落地形态与 Tower 鉴权中间件
+### 2.9 kanon-transport 架构落地形态与 Tower 鉴权中间件
 
 为消除 Tonic/Hyper 与操作系统底层的适配胶水代码，`kanon-transport` 提供统一抽象：
 
@@ -572,7 +588,13 @@ Rust 核心全权主导 LLM 的生命周期与推理编排，确保高并发下�
 - 因此出站路径（`PipelineEngine` 的 LLM 分支）在构造平台回复前必须调用 `kanon_llm::strip_reasoning_tags` 剥离推理块，只投递用户可见答案；推理块被截断（流式未闭合）时答案视为空，宁可不回复也不泄露思维链。
 - 该解码器与 provider 的编码器成对维护，禁止在适配器/插件内各自实现标签解析。
 
-### 8.3 Tool Calling 跨语言执行状态机闭环
+### 8.3 工具与"管理动作"的边界 (Tools vs. Management Actions)
+
+- **`tools`（LLM 可见）**：注册进 `ToolMeta` 的能力会被聚合后交给模型做 function calling。**适配器插件禁止声明任何 tool**——适配器的职责是平台收发，若其把"扫码绑定/凭证轮换"等运维能力注册为 tool，模型就会在闲聊中尝试调用它们。
+- **`actions`（仅控制台可见）**：运维操作通过 `PluginHostService.InvokeAction` 暴露（Python SDK 用 `@action(...)` 声明，不会出现在 `Plugin.meta()` 中）。控制台走 `POST /api/v1/plugins/{id}/actions/{action}`，核心内部流程（如 QQ 扫码绑定）同样走该 RPC，因此这类能力永远不会进入模型的函数列表。
+- 判定规则：**模型可以主动调用的 → tool；只能由人/控制台触发的 → action**。
+
+### 8.4 Tool Calling 跨语言执行状态机闭环
 
 ```mermaid
 sequenceDiagram
@@ -617,6 +639,7 @@ sequenceDiagram
 | `GET` | `/api/v1/plugins/{id}/config` | 获取指定插件的配置项当前值、JSON Schema 及当前单调递增版本号 `version` |
 | `PUT` | `/api/v1/plugins/{id}/config` | 校验配置 → 检查 CAS 乐观锁版本向量 → 触发跨进程热重载 → 原子持久化（版本冲突返回 409，宿主拒绝则不落盘） |
 | `POST` | `/api/v1/plugins/{id}/restart` | 重启指定插件所在的宿主进程（依赖 Supervisor 记录的启动配方） |
+| `POST` | `/api/v1/plugins/{id}/actions/{action}` | 触发插件的**管理动作**（运维操作，永不进入模型的函数列表；区别于 `tools`） |
 | `GET` | `/api/v1/sessions` | 分页查询会话元数据（Turn 计数、Token 消耗、活跃时间、Persona、作用域） |
 | `POST` | `/api/v1/sessions/{id}/reset` | 安全重置会话历史，保留配置变量与人设 |
 | `POST` | `/api/v1/sessions/{id}/persona` | 动态热切换指定会话的生效人设 |

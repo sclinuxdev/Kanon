@@ -166,7 +166,7 @@ $effect(() => {
                 <span>{persona.name}</span>
               </div>
               <p class="text-xs sm:text-[13px] text-zinc-500 dark:text-zinc-400 line-clamp-3 leading-relaxed font-mono">
-                {persona.system_prompt}
+                {persona.description}
               </p>
             </div>
           {/each}

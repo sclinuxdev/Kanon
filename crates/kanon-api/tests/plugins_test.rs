@@ -280,7 +280,8 @@ async fn plugin_config_cas_version_enforcement() {
     use kanon_proto::v1::plugin_host_service_server::{PluginHostService, PluginHostServiceServer};
     use kanon_proto::v1::{
         GetPluginMetaRequest, GetPluginMetaResponse, PingRequest, PingResponse,
-        ReloadPluginConfigRequest, ReloadPluginConfigResponse,
+        PluginActionRequest, PluginActionResponse, ReloadPluginConfigRequest,
+        ReloadPluginConfigResponse,
     };
     use tonic::{Request, Response, Status};
 
@@ -290,6 +291,14 @@ async fn plugin_config_cas_version_enforcement() {
 
     #[tonic::async_trait]
     impl PluginHostService for CasMockHost {
+        /// The CAS fixture declares no management actions.
+        async fn invoke_action(
+            &self,
+            _req: Request<PluginActionRequest>,
+        ) -> Result<Response<PluginActionResponse>, Status> {
+            Err(Status::unimplemented("cas fixture has no actions"))
+        }
+
         async fn ping(&self, req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
             Ok(Response::new(PingResponse {
                 timestamp: req.into_inner().timestamp,
@@ -447,3 +456,180 @@ async fn plugin_tool_call_reports_upstream_failure() {
     assert_eq!(error_code(&body), "internal_error");
 }
 
+
+/// An unknown plugin is a 404 for management actions too, not an internal error.
+#[tokio::test]
+async fn plugin_action_unknown_plugin_returns_404() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let app: Router = app(fixture_state(PathBuf::from(dir.path()), false).await);
+
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        "/api/v1/plugins/unknown.plugin/actions/anything",
+        Some(json!({ "arguments": {} })),
+    )
+    .await;
+
+    assert_eq!(status, 404);
+    assert_eq!(error_code(&body), "not_found");
+}
+
+/// A dead host surfaces as an upstream failure, exactly like a tool call would.
+#[tokio::test]
+async fn plugin_action_reports_upstream_failure() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let app: Router = app(fixture_state(PathBuf::from(dir.path()), false).await);
+
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/plugins/{FIXTURE_PLUGIN_ID}/actions/bind_credentials"),
+        Some(json!({ "arguments": { "mode": "qr" } })),
+    )
+    .await;
+
+    assert_eq!(status, 502, "unexpected body: {body}");
+}
+
+/// A live host answers management actions with its structured result.
+#[tokio::test]
+async fn plugin_action_returns_host_result() {
+    use std::sync::Arc;
+    use kanon_core::ManagedHost;
+    use kanon_proto::v1::plugin_host_service_server::{PluginHostService, PluginHostServiceServer};
+    use kanon_proto::v1::{
+        GetPluginMetaRequest, GetPluginMetaResponse, PingRequest, PingResponse,
+        PluginActionRequest, PluginActionResponse, ReloadPluginConfigRequest,
+        ReloadPluginConfigResponse,
+    };
+    use tonic::{Request, Response, Status};
+
+    struct ActionMockHost;
+
+    #[tonic::async_trait]
+    impl PluginHostService for ActionMockHost {
+        /// Only the declared action succeeds; anything else is an explicit failure.
+        async fn invoke_action(
+            &self,
+            req: Request<PluginActionRequest>,
+        ) -> Result<Response<PluginActionResponse>, Status> {
+            let req = req.into_inner();
+            if req.action != "bind_credentials" {
+                return Ok(Response::new(PluginActionResponse {
+                    success: false,
+                    error_message: format!("Unknown action '{}'", req.action),
+                    result: None,
+                }));
+            }
+
+            let result = kanon_llm::tool_router::json_to_prost_struct(&json!({
+                "task_id": "task-42",
+                "qrcode_url": "https://q.qq.com/connect?task_id=task-42"
+            }))
+            .expect("action result");
+
+            Ok(Response::new(PluginActionResponse {
+                success: true,
+                error_message: String::new(),
+                result: Some(result),
+            }))
+        }
+
+        async fn ping(
+            &self,
+            req: Request<PingRequest>,
+        ) -> Result<Response<PingResponse>, Status> {
+            Ok(Response::new(PingResponse {
+                timestamp: req.into_inner().timestamp,
+            }))
+        }
+
+        async fn reload_plugin_config(
+            &self,
+            _req: Request<ReloadPluginConfigRequest>,
+        ) -> Result<Response<ReloadPluginConfigResponse>, Status> {
+            Ok(Response::new(ReloadPluginConfigResponse {
+                success: true,
+                error_message: String::new(),
+                applied_version: 1,
+            }))
+        }
+
+        async fn get_plugin_meta(
+            &self,
+            _req: Request<GetPluginMetaRequest>,
+        ) -> Result<Response<GetPluginMetaResponse>, Status> {
+            Ok(Response::new(GetPluginMetaResponse { plugins: vec![] }))
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(PluginHostServiceServer::new(ActionMockHost))
+            .serve_with_incoming(incoming)
+            .await
+            .unwrap();
+    });
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config_dir = PathBuf::from(dir.path());
+    let supervisor = Arc::new(kanon_core::Supervisor::new(Some(config_dir.join("run")), None));
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+
+    let host = Arc::new(
+        ManagedHost::new(
+            "action_host".to_string(),
+            config_dir.join("action_host.sock"),
+            channel,
+            vec![common::fixture_meta()],
+            100,
+        )
+        .with_manifest(common::fixture_manifest()),
+    );
+    supervisor.register_managed_host(host).await;
+
+    let state = kanon_api::ApiState::builder(supervisor)
+        .with_config_dir(config_dir.clone())
+        .build();
+    let app: Router = app(state);
+
+    // 1. A declared action returns its structured payload.
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/plugins/{FIXTURE_PLUGIN_ID}/actions/bind_credentials"),
+        Some(json!({ "arguments": { "mode": "qr" } })),
+    )
+    .await;
+    assert_eq!(status, 200, "unexpected body: {body}");
+    assert_eq!(body["success"], json!(true));
+    assert_eq!(body["result"]["task_id"], json!("task-42"));
+
+    // 2. An undeclared action is an explicit failure, never a silent success.
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/plugins/{FIXTURE_PLUGIN_ID}/actions/not_declared"),
+        Some(json!({ "arguments": {} })),
+    )
+    .await;
+    assert_eq!(status, 200, "unexpected body: {body}");
+    assert_eq!(body["success"], json!(false));
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Unknown action"),
+        "unexpected body: {body}"
+    );
+}

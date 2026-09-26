@@ -9,6 +9,28 @@ service PluginHostService {
   rpc Ping (PingRequest) returns (PingResponse);
   rpc ReloadPluginConfig (ReloadPluginConfigRequest) returns (ReloadPluginConfigResponse);
   rpc GetPluginMeta (GetPluginMetaRequest) returns (GetPluginMetaResponse);
+  // Management action invoked by the control plane.
+  //
+  // Actions are the console counterpart of tools: credential binding, QR login and diagnostics
+  // are operations an operator triggers, not functions the model may call. Adapter plugins must
+  // expose such operations here so that their tool list stays empty — an adapter's tools would
+  // otherwise be offered to the LLM, which then tries to bind credentials mid-conversation.
+  rpc InvokeAction (PluginActionRequest) returns (PluginActionResponse);
+}
+
+// --- 控制台管理动作 ---
+
+message PluginActionRequest {
+  string plugin_id = 1;
+  // Action name declared by the plugin, e.g. "qq_request_login_qr".
+  string action = 2;
+  google.protobuf.Struct parameters = 3;
+}
+
+message PluginActionResponse {
+  bool success = 1;
+  string error_message = 2;
+  google.protobuf.Struct result = 3;
 }
 
 // 2. 消息与事件管道服务 (运行在 Host 端，Core 主动连接各 Host 端点发起调用)
@@ -28,6 +50,13 @@ service BotApiService {
   rpc RequestLLM (LLMRequest) returns (stream LLMChunk);
   rpc SetStorage (SetStorageRequest) returns (SetStorageResponse);
   rpc GetStorage (GetStorageRequest) returns (GetStorageResponse);
+  // Liveness probe answered by the core itself, without touching the pipeline.
+  //
+  // Hosts use it to notice that the core they registered with has exited: a host whose core is
+  // gone must stop, otherwise it keeps serving its platform (and, for adapters, keeps the
+  // platform's long-lived connection) while no bot instance can answer — which shows up as a
+  // ghost bot double-handling messages.
+  rpc Ping (PingRequest) returns (PingResponse);
 }
 
 // --- 握手与注册 ---

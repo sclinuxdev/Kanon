@@ -25,8 +25,11 @@ use kanon_api::llm_config::resolve_bootstrap;
 use kanon_api::{
     ApiServer, ApiState, LlmProviderConfig, Observability, SystemConfigStore, WebhookAdapter,
 };
-use kanon_core::EventIngress;
 use kanon_core::ipc::{CoreApiService, CoreIpcServer, DEFAULT_INGEST_QUEUE_CAPACITY};
+use kanon_core::{
+    EventIngress, InstanceRegistry, PluginStateStore, sync_instance_personas,
+    DEFAULT_INSTANCE_CATALOG, DEFAULT_PLUGIN_STATE, HOST_WATCHDOG_INTERVAL,
+};
 use kanon_core::pipeline::PipelineEngine;
 use kanon_core::supervisor::Supervisor;
 use tokio::sync::{mpsc, oneshot};
@@ -61,16 +64,50 @@ async fn main() -> StartupResult<()> {
         Some(socket_path.clone()),
     ));
 
+    // --- Bot instances ----------------------------------------------------------------
+    // Instances decide whether inbound platform traffic is answered at all: with no enabled
+    // instance claiming a platform the pipeline drops the event instead of feeding it to a model.
+    let instances = Arc::new(
+        InstanceRegistry::open(DEFAULT_INSTANCE_CATALOG)
+            .await
+            .map_err(|err| format!("Failed to load the bot instance catalog: {err}"))?,
+    );
+    let instance_count = instances.len().await;
+    if instance_count == 0 {
+        tracing::warn!(
+            "No bot instance is configured: platform messages will be dropped until an instance \
+             is created and enabled in the console"
+        );
+    } else {
+        tracing::info!(count = instance_count, "Bot instance catalog loaded");
+    }
+
+    // --- Plugin enable/disable state --------------------------------------------------
+    // Toggling a plugin must not rewrite files inside the user's plugin directory, so the state
+    // lives beside the node's other settings and is applied at startup and on every toggle.
+    let plugin_state = Arc::new(
+        PluginStateStore::open(DEFAULT_PLUGIN_STATE)
+            .await
+            .map_err(|err| format!("Failed to load the plugin state store: {err}"))?,
+    );
+    let disabled_plugins = plugin_state.disabled_ids().await;
+    if !disabled_plugins.is_empty() {
+        tracing::info!(plugins = ?disabled_plugins, "Plugins disabled by the operator");
+    }
+
     // --- Management gateway state & agent engine --------------------------------------
-    // One agent slot is shared by the management gateway, the pipeline worker and the IPC
-    // service, so a provider configured later through the console is observed by all three
-    // without a restart.
-    let agent_slot = Arc::new(kanon_llm::AgentSlot::new());
+    // The state owns one agent factory (and the provider slot inside it), shared with the
+    // pipeline worker and the IPC service, so a provider configured later through the console is
+    // observed by all three without a restart.
     let state = ApiState::builder(supervisor.clone())
         .with_observability(observability.clone())
         .with_ingress(ingress.clone())
-        .with_agent_slot(agent_slot.clone())
+        .with_instances(instances.clone())
+        .with_plugin_state(plugin_state.clone())
         .build();
+
+    // Publish instance prompts as personas before the first message can arrive.
+    sync_instance_personas(&instances.list().await, state.personas());
 
     // Bootstrap order: a provider saved by the console wins over the environment, because the
     // console is how an operator changes the node after it started. Installation goes through
@@ -103,7 +140,8 @@ async fn main() -> StartupResult<()> {
     let engine = Arc::new(
         PipelineEngine::new(supervisor.clone())
             .with_observer(observability.events.clone())
-            .with_agent_slot(agent_slot.clone()),
+            .with_agent_factory(state.agent_factory().clone())
+            .with_instances(instances.clone()),
     );
     let pipeline_worker = engine.clone().start_worker(event_rx);
     let outbound_dispatcher = engine.clone().start_outbound_dispatcher();
@@ -111,7 +149,7 @@ async fn main() -> StartupResult<()> {
     let service = CoreApiService::new(ingress.clone())
         .with_supervisor(supervisor.clone())
         .with_outbound_sender(engine.outbound_sender())
-        .with_agent_slot(agent_slot.clone());
+        .with_agent_slot(state.llm_slot().clone());
     let ipc_server = CoreIpcServer::new(socket_path.clone(), service);
 
     // --- Graceful shutdown channels ---------------------------------------------------
@@ -143,8 +181,17 @@ async fn main() -> StartupResult<()> {
         tracing::warn!(error = %err, "Failed to ensure ./data/plugins directory exists");
     }
 
-    // Auto-discover and launch declared plugins from ./plugins directory
-    load_plugins_from_directory(&supervisor, "./plugins").await;
+    // Auto-discover and launch declared plugins from ./plugins directory, skipping any the
+    // operator disabled.
+    load_plugins_from_directory(&supervisor, "./plugins", &plugin_state).await;
+
+    // A crashed host is otherwise invisible: the supervisor would keep advertising a dead process
+    // as healthy and route events into a closed socket. The watchdog prunes and restarts it.
+    let host_watchdog = supervisor.spawn_host_watchdog(plugin_state.clone(), HOST_WATCHDOG_INTERVAL);
+    tracing::info!(
+        interval_secs = HOST_WATCHDOG_INTERVAL.as_secs(),
+        "Plugin host watchdog started"
+    );
 
     // --- Platform adapters ------------------------------------------------------------
     register_webhook_adapter(&supervisor).await?;
@@ -185,6 +232,7 @@ async fn main() -> StartupResult<()> {
     for (platform, error) in supervisor.adapters().stop_all().await {
         tracing::warn!(platform = %platform, error = %error, "Adapter failed to stop cleanly");
     }
+    host_watchdog.abort();
     supervisor.stop_all().await?;
 
     tracing::info!("Kanon node shut down gracefully");
@@ -273,7 +321,11 @@ fn resolve_api_addr() -> StartupResult<SocketAddr> {
 ///
 /// Missing runtime environments (e.g. Python / TypeScript) or individual manifest errors
 /// degrade gracefully to ensure the core microkernel and API gateway remain operational.
-async fn load_plugins_from_directory(supervisor: &Arc<Supervisor>, dir: impl AsRef<std::path::Path>) {
+async fn load_plugins_from_directory(
+    supervisor: &Arc<Supervisor>,
+    dir: impl AsRef<std::path::Path>,
+    plugin_state: &Arc<PluginStateStore>,
+) {
     let plugins = match kanon_core::PluginScanner::scan(dir.as_ref()) {
         Ok(p) => p,
         Err(e) => {
@@ -287,6 +339,16 @@ async fn load_plugins_from_directory(supervisor: &Arc<Supervisor>, dir: impl AsR
     for discovered in plugins {
         let plugin_id = discovered.manifest.plugin.id.clone();
         let runtime = discovered.manifest.plugin.runtime.clone();
+
+        // A disabled plugin is not spawned at all: no host process, no routing, no adapter.
+        if !plugin_state.is_enabled(&plugin_id).await {
+            tracing::info!(
+                plugin_id = %plugin_id,
+                "Plugin is disabled by the operator; skipping launch"
+            );
+            continue;
+        }
+
         match supervisor.spawn_from_manifest(&discovered.manifest_path, None).await {
             Ok(host) => {
                 tracing::info!(

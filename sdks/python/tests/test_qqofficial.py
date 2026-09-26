@@ -14,6 +14,8 @@ for p in (str(_python_sdk_dir), str(_plugin_dir)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+from google.protobuf.json_format import MessageToDict
+
 from kanon_sdk.context import MessageSegment, PluginContext
 from kanon_sdk.proto import pb
 from main import KanonBotClient, QQOfficialAdapter
@@ -258,8 +260,22 @@ class TestQQOfficialAdapter(IsolatedAsyncioTestCase):
         self.assertFalse(resp.success)
         self.assertIn("Unsupported channel scheme", resp.error_message)
 
-    async def test_tool_request_login_qr(self) -> None:
-        """Verifies qq_request_login_qr tool execution."""
+    def test_adapter_exposes_no_llm_tools(self) -> None:
+        """Verifies the adapter declares no tools: binding is an operator action, not a tool.
+
+        A tool advertised by an adapter is offered to the model, which then tries to bind
+        credentials mid-conversation; the adapter must stay a transport, so the QR flows live in
+        the management-action registry instead.
+        """
+        meta = self.adapter.meta()
+        self.assertEqual([t.name for t in meta.tools], [])
+        self.assertEqual(
+            sorted(self.adapter._action_handlers),
+            ["qq_poll_login_result", "qq_request_login_qr"],
+        )
+
+    async def test_action_request_login_qr(self) -> None:
+        """Verifies the qq_request_login_qr management action."""
         from auth import QQOfficialLoginRegistration
 
         fake_reg = QQOfficialLoginRegistration(
@@ -269,14 +285,18 @@ class TestQQOfficialAdapter(IsolatedAsyncioTestCase):
             interval=2,
         )
         with patch("main.request_qqofficial_login_qr", AsyncMock(return_value=fake_reg)):
-            res = await self.adapter.handle_request_login_qr({})
+            resp = await self.adapter.on_invoke_action(
+                "org.kanon.adapter.qqofficial", "qq_request_login_qr", {}
+            )
+            self.assertTrue(resp.success, resp.error_message)
+            res = MessageToDict(resp.result)
             self.assertEqual(res["task_id"], "task_qr_123")
             self.assertEqual(res["bind_key"], "bind_key_456")
             self.assertEqual(res["qrcode_url"], "https://q.qq.com/connect?task_id=task_qr_123")
             self.assertEqual(res["poll_interval_seconds"], 2)
 
-    async def test_tool_poll_login_result(self) -> None:
-        """Verifies qq_poll_login_result tool execution and credential sync."""
+    async def test_action_poll_login_result(self) -> None:
+        """Verifies the qq_poll_login_result management action and credential sync."""
         from unittest.mock import patch
 
         fake_poll = {
@@ -287,7 +307,13 @@ class TestQQOfficialAdapter(IsolatedAsyncioTestCase):
         }
         self.adapter.context = PluginContext(data_dir=Path("/tmp"), config={})
         with patch("main.poll_qqofficial_login_once", AsyncMock(return_value=fake_poll)):
-            res = await self.adapter.handle_poll_login_result({"task_id": "t1", "bind_key": "k1"})
+            resp = await self.adapter.on_invoke_action(
+                "org.kanon.adapter.qqofficial",
+                "qq_poll_login_result",
+                {"task_id": "t1", "bind_key": "k1"},
+            )
+            self.assertTrue(resp.success, resp.error_message)
+            res = MessageToDict(resp.result)
             self.assertEqual(res["status"], "created")
             self.assertEqual(res["appid"], "102888123")
             self.assertEqual(res["secret"], "decrypted_secret_val")
@@ -363,3 +389,10 @@ class TestQQOfficialAdapter(IsolatedAsyncioTestCase):
         client._connection.state.robot.name = "TestRobot"
         await client.on_ready()
 
+    async def test_unknown_action_is_reported_not_raised(self) -> None:
+        """Verifies an unknown action answers a structured error instead of raising."""
+        resp = await self.adapter.on_invoke_action(
+            "org.kanon.adapter.qqofficial", "not_a_real_action", {}
+        )
+        self.assertFalse(resp.success)
+        self.assertIn("Unknown action", resp.error_message)

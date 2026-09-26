@@ -2,6 +2,9 @@ import type {
   ActivateProviderRequest,
   ActivateProviderResponse,
   AdaptersResponse,
+  InstanceMutationResponse,
+  InstanceRequest,
+  InstancesResponse,
   CallPluginToolResponse,
   ChatCompletionRequest,
   ChatCompletionResponse,
@@ -11,6 +14,7 @@ import type {
   NodeHealth,
   PersonasResponse,
   PluginConfigResponse,
+  PluginStateResponse,
   PluginsResponse,
   ProvidersCatalog,
   QQOfficialPollLoginResponse,
@@ -90,7 +94,31 @@ export const api = {
       body: JSON.stringify(req),
     }),
 
+  // Bot instances: the catalog that decides whether inbound platform traffic is answered.
+  getInstances: () => request<InstancesResponse>('/api/v1/instances'),
+  createInstance: (req: InstanceRequest) =>
+    request<InstanceMutationResponse>('/api/v1/instances', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+  updateInstance: (id: string, req: InstanceRequest) =>
+    request<InstanceMutationResponse>(`/api/v1/instances/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(req),
+    }),
+  deleteInstance: (id: string) =>
+    request<InstanceMutationResponse>(`/api/v1/instances/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
   getPlugins: () => request<PluginsResponse>('/api/v1/plugins'),
+  // Enabling spawns the plugin host; disabling stops it, so the plugin leaves routing entirely.
+  setPluginEnabled: (pluginId: string, enabled: boolean) =>
+    request<PluginStateResponse>(
+      `/api/v1/plugins/${encodeURIComponent(pluginId)}/enabled`,
+      { method: 'PUT', body: JSON.stringify({ enabled }) },
+    ),
+
   installPluginPath: (path: string) =>
     request<InstallPluginResponse>('/api/v1/plugins/install', {
       method: 'POST',

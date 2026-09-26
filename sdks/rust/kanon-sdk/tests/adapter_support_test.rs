@@ -12,13 +12,7 @@ use std::time::Duration;
 use kanon_proto::v1::bot_api_service_server::{BotApiService, BotApiServiceServer};
 use kanon_proto::v1::message_pipeline_service_client::MessagePipelineServiceClient;
 use kanon_proto::v1::message_segment::Segment;
-use kanon_proto::v1::{
-    CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse,
-    GetPluginMetaRequest, IngestEventRequest, IngestEventResponse, LlmChunk,
-    LlmRequest, PipelineEventRequest, PluginMeta, RegisterHostRequest, RegisterHostResponse,
-    SendMessageRequest, SendMessageResponse, SetStorageRequest, SetStorageResponse, TextSegment,
-    GetStorageRequest, GetStorageResponse,
-};
+use kanon_proto::v1::{CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse, GetPluginMetaRequest, GetStorageRequest, GetStorageResponse, IngestEventRequest, IngestEventResponse, LlmChunk, LlmRequest, PingRequest, PingResponse, PipelineEventRequest, PluginMeta, RegisterHostRequest, RegisterHostResponse, SendMessageRequest, SendMessageResponse, SetStorageRequest, SetStorageResponse, TextSegment};
 use kanon_sdk::context::{CoreHandle, PluginContext};
 use kanon_sdk::plugin::{Plugin, PluginResult};
 use kanon_sdk::KanonHost;
@@ -84,6 +78,16 @@ struct CoreStub {
 
 #[tonic::async_trait]
 impl BotApiService for CoreStub {
+    /// Liveness probe: hosts use it to notice that their core is gone.
+    async fn ping(
+        &self,
+        request: Request<PingRequest>,
+    ) -> Result<Response<PingResponse>, Status> {
+        Ok(Response::new(PingResponse {
+            timestamp: request.into_inner().timestamp,
+        }))
+    }
+
     async fn register_host(
         &self,
         request: Request<RegisterHostRequest>,
@@ -174,6 +178,13 @@ struct CoreStubServer {
 
 #[tonic::async_trait]
 impl BotApiService for CoreStubServer {
+    async fn ping(
+        &self,
+        request: Request<PingRequest>,
+    ) -> Result<Response<PingResponse>, Status> {
+        self.inner.ping(request).await
+    }
+
     async fn register_host(
         &self,
         request: Request<RegisterHostRequest>,

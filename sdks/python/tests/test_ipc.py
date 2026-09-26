@@ -155,3 +155,67 @@ class TestHostBootstrap(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StubCoreStub:
+    """Fake BotApiService stub whose Ping either answers or raises."""
+
+    def __init__(self, healthy: bool) -> None:
+        self.healthy = healthy
+
+    async def Ping(self, request, timeout=None):  # noqa: N802 - generated gRPC name
+        if not self.healthy:
+            raise RuntimeError("core is gone")
+        return object()
+
+
+class ProbingPb:
+    """Minimal protobuf surface used by the watchdog."""
+
+    @staticmethod
+    def PingRequest(timestamp: int):
+        return {"timestamp": timestamp}
+
+
+class TestCoreWatchdog(unittest.IsolatedAsyncioTestCase):
+    """A host must stop itself once the core it registered with is gone."""
+
+    async def test_lost_core_triggers_the_stop_callback(self) -> None:
+        from kanon_sdk.ipc import CoreWatchdog
+
+        reasons: list[str] = []
+        watchdog = CoreWatchdog(
+            StubCoreStub(healthy=False),
+            ProbingPb,
+            interval=0.01,
+            timeout=0.01,
+            failures=2,
+            on_lost=reasons.append,
+        )
+        watchdog.start()
+        for _ in range(50):
+            if reasons:
+                break
+            await asyncio.sleep(0.02)
+        await watchdog.stop()
+
+        self.assertEqual(len(reasons), 1, "the host must be told exactly once")
+        self.assertIn("core unreachable", reasons[0])
+
+    async def test_healthy_core_never_triggers_stop(self) -> None:
+        from kanon_sdk.ipc import CoreWatchdog
+
+        reasons: list[str] = []
+        watchdog = CoreWatchdog(
+            StubCoreStub(healthy=True),
+            ProbingPb,
+            interval=0.01,
+            timeout=0.01,
+            failures=2,
+            on_lost=reasons.append,
+        )
+        watchdog.start()
+        await asyncio.sleep(0.1)
+        await watchdog.stop()
+
+        self.assertEqual(reasons, [])

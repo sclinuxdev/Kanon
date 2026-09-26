@@ -17,13 +17,14 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use kanon_llm::tool_router::ToolRouter;
-use kanon_llm::{AgentSlot, strip_reasoning_tags};
+use kanon_llm::{AgentFactory, AgentSlot, strip_reasoning_tags};
 use kanon_proto::v1::message_segment::Segment;
 use kanon_proto::v1::{
     DeliverMessageRequest, IngestEventRequest, MessageSegment, PipelineEventRequest,
 };
 
 use crate::adapter::{AdapterDescriptor, AdapterError, AdapterKind};
+use crate::instance::InstanceRegistry;
 use crate::pipeline::command::CommandRouter;
 use crate::pipeline::dead_letter::DeadLetterWriter;
 use crate::pipeline::observer::{PipelineObserver, PipelineStage};
@@ -78,8 +79,43 @@ pub enum PipelineResult {
         /// Outbound reply segments generated for the conversational response.
         replies: Vec<MessageSegment>,
     },
+    /// The built-in `/new` command rotated the session of one conversation.
+    SessionRotated {
+        /// Instance whose conversation was rotated.
+        instance_id: String,
+        /// Freshly created session identifier; the previous session is retained.
+        session_id: String,
+        /// Confirmation delivered back to the conversation.
+        replies: Vec<MessageSegment>,
+    },
+    /// No enabled bot instance claims the event's platform, so nothing may answer it.
+    NoInstance {
+        /// Platform that nobody claimed.
+        platform: String,
+    },
     /// Inbound event passed through the pipeline without matching any slash command or LLM rule.
     Passed(PipelineEventRequest),
+}
+
+/// Name of the built-in session command, handled by the core and never by the model.
+pub const NEW_SESSION_COMMAND: &str = "new";
+
+/// Identity of one conversation inside an instance: channel plus sender.
+///
+/// Kept as a free function because both the instance gate and the LLM phase must derive exactly
+/// the same key — the `/new` command and the messages that follow it have to agree.
+fn conversation_key(event: &PipelineEventRequest) -> String {
+    if event.channel_id.trim().is_empty() {
+        if event.sender_id.trim().is_empty() {
+            "default".to_string()
+        } else {
+            event.sender_id.clone()
+        }
+    } else if event.sender_id.trim().is_empty() {
+        event.channel_id.clone()
+    } else {
+        format!("{}:{}", event.channel_id, event.sender_id)
+    }
 }
 
 /// Result produced after delivering an outbound message through a platform adapter.
@@ -102,6 +138,16 @@ pub struct PipelineEngine {
     /// Held as a shared slot rather than a captured router so that configuring, replacing or
     /// clearing the model provider on a running node takes effect on the very next event.
     agent: Arc<AgentSlot>,
+    /// Factory building per-instance agents that share the node's memory, personas and hooks.
+    ///
+    /// Optional: without it the pipeline cannot honour a per-instance model override and falls
+    /// back to the node agent, which is the documented behaviour of embedded deployments.
+    agent_factory: Option<Arc<AgentFactory>>,
+    /// Bot instances deciding whether and how an inbound event is answered.
+    ///
+    /// Optional for the same reason: an unpartitioned pipeline (tests, embedded cores) processes
+    /// every event exactly as before.
+    instances: Option<Arc<InstanceRegistry>>,
     /// Optional lifecycle observer used by the management control plane for tracing.
     observer: Option<Arc<dyn PipelineObserver>>,
     /// Persistent dead-letter queue writer for failed or dropped outbound messages.
@@ -124,6 +170,8 @@ impl PipelineEngine {
         Self {
             supervisor,
             agent: Arc::new(AgentSlot::new()),
+            agent_factory: None,
+            instances: None,
             observer: None,
             dead_letter: Arc::new(DeadLetterWriter::default()),
             outbound_sender,
@@ -155,6 +203,24 @@ impl PipelineEngine {
     /// Returns the shared agent slot backing this pipeline.
     pub fn agent_slot(&self) -> &Arc<AgentSlot> {
         &self.agent
+    }
+
+    /// Shares the factory used to build per-instance agents.
+    pub fn with_agent_factory(mut self, factory: Arc<AgentFactory>) -> Self {
+        self.agent = factory.slot().clone();
+        self.agent_factory = Some(factory);
+        self
+    }
+
+    /// Shares the bot-instance catalog that gates and partitions inbound events.
+    pub fn with_instances(mut self, instances: Arc<InstanceRegistry>) -> Self {
+        self.instances = Some(instances);
+        self
+    }
+
+    /// Returns the instance catalog backing this pipeline, when one is attached.
+    pub fn instances(&self) -> Option<&Arc<InstanceRegistry>> {
+        self.instances.as_ref()
     }
 
     /// Attaches an LLM [`ToolRouter`] snapshot to enable multi-turn reasoning and tool calling.
@@ -537,7 +603,38 @@ impl PipelineEngine {
     /// Processes a single inbound event through the PreFilter chain and command dispatcher.
     pub async fn process_event(&self, event: PipelineEventRequest) -> PipelineResult {
         let event_id = event.event_id.clone();
+        let platform = event.platform.clone();
         let hosts = self.supervisor.get_all_hosts().await;
+
+        // Phase 0: Instance gate.
+        //
+        // Adapters only declare *where* messages come from; an instance decides whether a bot is
+        // running there at all. With no enabled instance claiming the platform there is nothing
+        // to answer as, so the event is dropped here — before pre-filters, commands and the LLM.
+        let instance = match &self.instances {
+            Some(registry) => match registry.resolve_by_platform(&platform).await {
+                Ok(Some(instance)) => Some(instance),
+                Ok(None) => {
+                    tracing::warn!(
+                        platform = %platform,
+                        event_id = %event_id,
+                        "No enabled bot instance claims this platform; dropping inbound event"
+                    );
+                    return PipelineResult::NoInstance { platform };
+                }
+                Err(err) => {
+                    // Ambiguous ownership must never be resolved by guessing.
+                    tracing::error!(
+                        platform = %platform,
+                        event_id = %event_id,
+                        error = %err,
+                        "Instance routing is ambiguous; dropping inbound event"
+                    );
+                    return PipelineResult::NoInstance { platform };
+                }
+            },
+            None => None,
+        };
 
         // Phase 1: PreFilter Interception Chain
         self.observe(PipelineStage::PreFilterStarted {
@@ -588,6 +685,18 @@ impl PipelineEngine {
                 })
                 .unwrap_or_default()
         };
+
+        // Phase 2a: Built-in commands, resolved by the core itself.
+        //
+        // `/new` rotates the session of the conversation that issued it. It is matched before
+        // plugin commands (so a plugin can never shadow it) and long before the LLM, which must
+        // never receive it as conversation text.
+        if let Some(instance) = instance.as_ref()
+            && let Some((cmd_name, _args)) = CommandRouter::parse_command(&text_candidate)
+            && cmd_name.eq_ignore_ascii_case(NEW_SESSION_COMMAND)
+        {
+            return self.handle_new_session(&filtered_event, instance).await;
+        }
 
         if let Some((cmd_name, args)) = CommandRouter::parse_command(&text_candidate) {
             if let Some(target) = CommandRouter::resolve(&cmd_name, &hosts) {
@@ -647,21 +756,38 @@ impl PipelineEngine {
         // Phase 3: Conversational message (unmatched by command router, routed to LLM if enabled)
         // The agent is resolved per event so a provider configured or cleared at runtime is
         // honoured immediately; an empty slot means "no conversational LLM" and passes through.
+        let conversation = conversation_key(&filtered_event);
+
+        // The agent is resolved per event: the node provider comes from the shared slot (so a
+        // provider configured at runtime is honoured immediately) and a per-instance model
+        // override comes from the factory, which shares memory, personas and hooks with it.
+        let resolved_agent = match &self.agent_factory {
+            Some(factory) => {
+                factory.agent_for_model(instance.as_ref().and_then(|i| i.model.as_deref()))
+            }
+            None => self.agent.current(),
+        };
+
         if !text_candidate.is_empty()
-            && let Some(agent) = self.agent.current()
+            && let Some(agent) = resolved_agent
         {
-            let router = ToolRouter::from_arc(agent);
-            let session_id = if filtered_event.channel_id.trim().is_empty() {
-                if filtered_event.sender_id.trim().is_empty() {
-                    "default".to_string()
-                } else {
-                    filtered_event.sender_id.clone()
-                }
-            } else if filtered_event.sender_id.trim().is_empty() {
-                filtered_event.channel_id.clone()
-            } else {
-                format!("{}:{}", filtered_event.channel_id, filtered_event.sender_id)
+            let router = ToolRouter::from_arc(agent.clone());
+
+            // Sessions are namespaced by the instance that owns the conversation, so two bots can
+            // never share context. An unpartitioned pipeline keeps the legacy conversation key.
+            let session_id = match instance.as_ref() {
+                Some(instance) => instance.conversation_session_id(&conversation),
+                None => conversation.clone(),
             };
+
+            // The instance decides the persona; sessions without one keep whatever the console
+            // (or the default catalog) assigned to them.
+            if let Some(instance) = instance.as_ref()
+                && let Some(persona_id) = instance.effective_persona_id()
+                && let Some(sessions) = agent.session_manager()
+            {
+                sessions.set_persona(&session_id, persona_id);
+            }
             // Filter hosts whose circuit breaker is Open to fast-skip them and protect LLM throughput
             let mut active_hosts = Vec::new();
             for host in &hosts {
@@ -723,6 +849,56 @@ impl PipelineEngine {
         }
 
         PipelineResult::Passed(filtered_event)
+    }
+
+    /// Handles the built-in `/new` command for one conversation.
+    ///
+    /// The previous session is never deleted: rotation only moves the conversation to a new
+    /// session key, so the old history stays inspectable in the console.
+    async fn handle_new_session(
+        &self,
+        event: &PipelineEventRequest,
+        instance: &crate::instance::BotInstance,
+    ) -> PipelineResult {
+        let Some(registry) = self.instances.as_ref() else {
+            // Unreachable in the node (the instance gate implies a registry), but a missing
+            // registry must not silently pretend the command succeeded.
+            tracing::error!(
+                instance_id = %instance.id,
+                "Built-in /new received without an instance catalog; ignoring command"
+            );
+            return PipelineResult::Passed(event.clone());
+        };
+
+        let conversation = conversation_key(event);
+        match registry.rotate_session(&instance.id, &conversation).await {
+            Ok(session_id) => {
+                tracing::info!(
+                    instance_id = %instance.id,
+                    session_id = %session_id,
+                    conversation = %conversation,
+                    "Built-in /new started a new session for this conversation"
+                );
+                let reply = MessageSegment {
+                    segment: Some(Segment::Text(kanon_proto::v1::TextSegment {
+                        content: "已开启新会话。".to_string(),
+                    })),
+                };
+                PipelineResult::SessionRotated {
+                    instance_id: instance.id.clone(),
+                    session_id,
+                    replies: vec![reply],
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    instance_id = %instance.id,
+                    error = %err,
+                    "Failed to rotate session for built-in /new; conversation unchanged"
+                );
+                PipelineResult::Passed(event.clone())
+            }
+        }
     }
 
     /// Runs the asynchronous worker loop, draining events from the ingest receiver.
@@ -801,6 +977,22 @@ impl PipelineEngine {
                         "Pipeline slash command not found"
                     );
                 }
+                PipelineResult::SessionRotated {
+                    instance_id,
+                    session_id,
+                    ..
+                } => {
+                    tracing::info!(
+                        platform = %platform,
+                        channel_id = %channel_id,
+                        instance_id = %instance_id,
+                        session_id = %session_id,
+                        "Pipeline rotated conversation session via built-in /new"
+                    );
+                }
+                PipelineResult::NoInstance { .. } => {
+                    // Already logged with the platform in `process_event`; nothing was delivered.
+                }
                 PipelineResult::Passed(_) => {
                     tracing::info!(
                         platform = %platform,
@@ -814,6 +1006,7 @@ impl PipelineEngine {
                 PipelineResult::Blocked { replies, .. } => replies,
                 PipelineResult::CommandExecuted { replies, .. } => replies,
                 PipelineResult::LlmReplied { replies, .. } => replies,
+                PipelineResult::SessionRotated { replies, .. } => replies,
                 _ => &[][..],
             };
 

@@ -13,6 +13,7 @@ import {
   Plugin,
   PluginContext,
   loadKanonProto,
+  startCoreWatchdog,
 } from "../sdk/index.js";
 
 /** Startup budget for the Core endpoint to become reachable before standalone mode. */
@@ -327,11 +328,18 @@ async function main(): Promise<void> {
     }
   }
 
-  // 8. Handle graceful shutdown
-  const shutdown = async () => {
+  // 8. Handle graceful shutdown: unload the plugin, then stop serving and release the endpoint.
+  let shuttingDown = false;
+  const shutdown = async (exitCode = 0) => {
+    // Signals and the watchdog can race; the plugin must be unloaded exactly once.
+    if (shuttingDown) return;
+    shuttingDown = true;
+
     try {
       await plugin.onUnload();
     } catch (_) {}
+
+    stopWatchdog?.();
 
     server.tryShutdown(() => {
       // The host owns the shared channel, so it is closed here and nowhere else.
@@ -341,10 +349,23 @@ async function main(): Promise<void> {
           fs.unlinkSync(socketPath);
         } catch (_) {}
       }
-      process.exit(0);
+      process.exit(exitCode);
     });
   };
 
+  // 9. Watch the Core: a host whose Core is gone must stop, otherwise it keeps serving its
+  //    platform and double-handles every message once a new Core starts.
+  const stopWatchdog = coreHandle
+    ? startCoreWatchdog(coreHandle, {
+        onLost: (reason) => {
+          console.warn(`[kanon-host] ${reason}`);
+          void shutdown(1);
+        },
+      })
+    : undefined;
+
+  process.on("SIGINT", () => void shutdown(0));
+  process.on("SIGTERM", () => void shutdown(0));
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }

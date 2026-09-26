@@ -8,15 +8,18 @@
 pub mod plugin;
 pub mod context;
 pub mod host;
+pub mod watchdog;
 
 pub use context::CoreHandle;
 pub use host::KanonHost;
+pub use watchdog::{CoreWatchdogConfig, StopReason, watch_core};
 pub use kanon_proto as proto;
 
 pub mod prelude {
     pub use super::plugin::*;
     pub use super::context::*;
     pub use super::host::KanonHost;
+    pub use super::watchdog::{CoreWatchdogConfig, StopReason, watch_core};
     pub use async_trait::async_trait;
     pub use kanon_proto::v1::*;
     pub use prost_types;

@@ -89,6 +89,22 @@ impl CoreHandle {
         Ok(response.into_inner())
     }
 
+    /// Answers a liveness probe from the core.
+    ///
+    /// Deliberately trivial: it opens no business path, so a host can distinguish "core is gone"
+    /// from "core is busy". Used by [`crate::watchdog::watch_core`].
+    pub async fn ping(&self) -> Result<(), tonic::Status> {
+        let mut client = self.client.lock().await;
+        let request = kanon_proto::v1::PingRequest {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or_default(),
+        };
+        client.ping(request).await?;
+        Ok(())
+    }
+
     /// Registers the hosting process with the core (`BotApiService.RegisterHost`).
     ///
     /// Used by the host runner during startup; exposed because registration is also the cheapest

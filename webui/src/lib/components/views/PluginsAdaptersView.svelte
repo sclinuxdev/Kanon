@@ -25,12 +25,16 @@ import {
 import { api } from '../../api/client';
 import { t } from '../../stores/i18n.svelte';
 import type {
+  PluginMeta,
   AdapterItem,
   PluginConfigResponse,
   PluginHost,
 } from '../../types';
 
 let hosts = $state<PluginHost[]>([]);
+// Plugins without a host process. They would otherwise be invisible, and a disabled plugin is
+// precisely the one an operator needs to find again to re-enable it.
+let orphanPlugins = $state<PluginMeta[]>([]);
 let adapters = $state<AdapterItem[]>([]);
 let loading = $state(true);
 let error = $state<string | null>(null);
@@ -248,6 +252,10 @@ async function loadData() {
       api.getAdapters(),
     ]);
     hosts = pluginsRes.hosts;
+    const hostedIds = new Set(
+      pluginsRes.hosts.flatMap((host) => host.plugins.map((plugin) => plugin.id)),
+    );
+    orphanPlugins = pluginsRes.plugins.filter((plugin) => !hostedIds.has(plugin.id));
     adapters = adaptersRes.adapters;
     if (
       adapters.length > 0 &&
@@ -259,6 +267,24 @@ async function loadData() {
     error = e instanceof Error ? e.message : String(e);
   } finally {
     loading = false;
+  }
+}
+
+async function togglePlugin(pluginId: string, enabled: boolean) {
+  // Disabling stops the host process, so it is worth one confirmation; enabling is harmless.
+  if (
+    !enabled &&
+    !confirm(
+      `Disable plugin '${pluginId}'? Its host process stops and it stops handling messages.`,
+    )
+  ) {
+    return;
+  }
+  try {
+    await api.setPluginEnabled(pluginId, enabled);
+    await loadData();
+  } catch (e) {
+    alert(`Failed to change plugin state: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
 
@@ -409,18 +435,48 @@ $effect(() => {
             <div class="space-y-2.5 pt-2 border-t border-zinc-100 dark:border-zinc-800">
               {#each host.plugins as plugin}
                 <div class="p-3.5 rounded-lg bg-zinc-50 dark:bg-zinc-950/60 border border-zinc-200/80 dark:border-zinc-800/80 space-y-2">
-                  <div class="flex items-center justify-between">
-                    <div>
+                  <div class="flex items-center justify-between gap-2 flex-wrap">
+                    <div class="flex items-center gap-2 flex-wrap">
                       <span class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{plugin.name}</span>
-                      <span class="text-xs font-mono text-zinc-500 ml-2">v{plugin.version} ({plugin.id})</span>
+                      <span class="text-xs font-mono text-zinc-500">v{plugin.version} ({plugin.id})</span>
+
+                      <!-- State and health: disabling stops the process, so it must be visible. -->
+                      {#if !plugin.enabled}
+                        <span class="px-2 py-0.5 rounded text-xs font-mono bg-zinc-500/10 text-zinc-500 border border-zinc-500/20">
+                          {t('plugins.disabled')}
+                        </span>
+                      {:else if plugin.health?.state === 'crashed'}
+                        <span
+                          class="px-2 py-0.5 rounded text-xs font-mono bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/20"
+                          title={plugin.health?.last_error ?? ''}
+                        >
+                          {t('plugins.crashed')} · {plugin.health?.restarts ?? 0} {t('plugins.restarts')}
+                        </span>
+                      {:else if (plugin.health?.restarts ?? 0) > 0}
+                        <span class="px-2 py-0.5 rounded text-xs font-mono bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+                          {plugin.health?.restarts} {t('plugins.restarts')}
+                        </span>
+                      {/if}
                     </div>
-                    <button
-                      onclick={() => openConfig(plugin.id)}
-                      class="px-2.5 py-1 text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 rounded transition cursor-pointer flex items-center gap-1"
-                    >
-                      <Settings class="w-3.5 h-3.5" />
-                      <span>{t('plugins.config')}</span>
-                    </button>
+
+                    <div class="flex items-center gap-1.5">
+                      <button
+                        onclick={() => togglePlugin(plugin.id, !plugin.enabled)}
+                        class="px-2.5 py-1 text-xs font-medium rounded transition cursor-pointer border
+                          {plugin.enabled
+                          ? 'text-zinc-600 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700 hover:border-amber-400 hover:text-amber-600'
+                          : 'text-emerald-600 dark:text-emerald-400 border-emerald-300 dark:border-emerald-800 hover:bg-emerald-50 dark:hover:bg-emerald-950/40'}"
+                      >
+                        {plugin.enabled ? t('plugins.disable') : t('plugins.enable')}
+                      </button>
+                      <button
+                        onclick={() => openConfig(plugin.id)}
+                        class="px-2.5 py-1 text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-950/40 rounded transition cursor-pointer flex items-center gap-1"
+                      >
+                        <Settings class="w-3.5 h-3.5" />
+                        <span>{t('plugins.config')}</span>
+                      </button>
+                    </div>
                   </div>
 
                   <!-- Commands & Tools descriptors badges -->
@@ -443,6 +499,42 @@ $effect(() => {
         {/each}
       {/if}
     </div>
+
+    <!-- Plugins without a host process: disabled, or failed to launch. -->
+    {#if orphanPlugins.length > 0}
+      <div class="p-5 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-2xs space-y-3">
+        <div class="flex items-center gap-2">
+          <Boxes class="w-4.5 h-4.5 text-zinc-400" />
+          <h4 class="text-sm sm:text-base font-semibold text-zinc-900 dark:text-zinc-100">
+            {t('plugins.hostless_title')} ({orphanPlugins.length})
+          </h4>
+        </div>
+        <p class="text-xs text-zinc-500">{t('plugins.hostless_hint')}</p>
+
+        <div class="space-y-2.5">
+          {#each orphanPlugins as plugin (plugin.id)}
+            <div class="p-3.5 rounded-lg bg-zinc-50 dark:bg-zinc-950/60 border border-zinc-200/80 dark:border-zinc-800/80 flex flex-wrap items-center justify-between gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="text-sm font-semibold text-zinc-700 dark:text-zinc-300">{plugin.name}</span>
+                <span class="text-xs font-mono text-zinc-500">v{plugin.version} ({plugin.id})</span>
+                <span class="px-2 py-0.5 rounded text-xs font-mono bg-zinc-500/10 text-zinc-500 border border-zinc-500/20">
+                  {plugin.enabled ? t('plugins.not_running') : t('plugins.disabled')}
+                </span>
+              </div>
+              <button
+                onclick={() => togglePlugin(plugin.id, !plugin.enabled)}
+                class="px-2.5 py-1 text-xs font-medium rounded transition cursor-pointer border
+                  {plugin.enabled
+                  ? 'text-zinc-600 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700 hover:border-amber-400 hover:text-amber-600'
+                  : 'text-emerald-600 dark:text-emerald-400 border-emerald-300 dark:border-emerald-800 hover:bg-emerald-50 dark:hover:bg-emerald-950/40'}"
+              >
+                {plugin.enabled ? t('plugins.disable') : t('plugins.enable')}
+              </button>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
 
     <!-- Platform Adapters Section & Test Ingest -->
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 pt-4 border-t border-zinc-200 dark:border-zinc-800">

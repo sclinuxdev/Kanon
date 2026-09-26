@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
@@ -24,6 +24,7 @@ use kanon_transport::{
     connect_ipc, core_socket_path, default_run_dir, host_socket_path,
 };
 use crate::adapter::{AdapterDescriptor, AdapterKind, AdapterRegistry};
+use crate::plugin_state::PluginStateStore;
 use crate::manifest::PluginManifest;
 
 pub mod circuit_breaker;
@@ -141,6 +142,8 @@ pub struct ManagedHost {
     pub manifest: Option<PluginManifest>,
     /// Adaptive circuit breaker tracking latency beacons and failures for this host.
     pub circuit_breaker: Arc<CircuitBreaker>,
+    /// Runtime health reported to the control plane and updated by the host watchdog.
+    health: Mutex<HostHealth>,
 }
 
 /// Represents a plugin whose launch was deferred or failed due to runtime unavailability.
@@ -179,6 +182,7 @@ impl ManagedHost {
             launch_spec: None,
             manifest: None,
             circuit_breaker: Arc::new(CircuitBreaker::with_defaults()),
+            health: Mutex::new(HostHealth::default()),
         }
     }
 
@@ -349,6 +353,43 @@ impl ManagedHost {
         }
     }
 
+    /// Invokes a control-plane management action on this host.
+    ///
+    /// Actions are the operator-facing counterpart of tools: they are never advertised to the
+    /// model, so an adapter can expose credential binding or diagnostics without handing the LLM
+    /// a function it would otherwise call mid-conversation. Circuit-breaker accounting matches
+    /// tool calls, because both are request/response RPCs to the same host.
+    pub async fn invoke_action(
+        &self,
+        req: kanon_proto::v1::PluginActionRequest,
+    ) -> Result<kanon_proto::v1::PluginActionResponse, tonic::Status> {
+        if !self.circuit_breaker.allow_request() {
+            tracing::warn!(
+                host_id = %self.host_id,
+                action = %req.action,
+                "Circuit breaker is OPEN; fast-skipping management action"
+            );
+            return Err(tonic::Status::unavailable(format!(
+                "Circuit breaker is OPEN for host '{}'",
+                self.host_id
+            )));
+        }
+
+        let start = std::time::Instant::now();
+        let mut client = self.host_client.lock().await;
+        match client.invoke_action(req).await {
+            Ok(response) => {
+                self.circuit_breaker.record_success(start.elapsed());
+                Ok(response.into_inner())
+            }
+            Err(status) => {
+                self.circuit_breaker
+                    .record_failure(&format!("Management action gRPC error: {}", status.code()));
+                Err(status)
+            }
+        }
+    }
+
     /// Pushes a refreshed configuration object to this host and triggers in-process hot reload.
     ///
     /// The plugin host updates its memory-resident configuration cache synchronously, so the
@@ -389,6 +430,36 @@ impl ManagedHost {
                 Err(status)
             }
         }
+    }
+}
+
+impl ManagedHost {
+    /// Current runtime health of this host process.
+    pub async fn health(&self) -> HostHealth {
+        self.health.lock().await.clone()
+    }
+
+    /// Replaces the reported health (watchdog and control plane only).
+    pub async fn set_health(&self, health: HostHealth) {
+        *self.health.lock().await = health;
+    }
+
+    /// Records one health observation.
+    pub async fn report_health(&self, state: &str, restarts: u32, last_error: Option<String>) {
+        *self.health.lock().await = HostHealth::new(state, restarts, last_error);
+    }
+
+    /// Identifier of the plugin this host was launched for, when it declared one.
+    pub fn primary_plugin_id(&self) -> Option<String> {
+        self.meta
+            .first()
+            .map(|meta| meta.id.clone())
+            .or_else(|| self.manifest.as_ref().map(|m| m.plugin.id.clone()))
+    }
+
+    /// Whether the supervisor can relaunch this host from a recorded recipe.
+    pub fn is_restartable(&self) -> bool {
+        self.launch_spec.is_some()
     }
 }
 
@@ -463,6 +534,110 @@ impl std::fmt::Debug for Supervisor {
             .field("core_sock_path", &self.core_sock_path)
             .finish_non_exhaustive()
     }
+}
+
+/// Grace period a plugin host gets to finish `on_unload` before it is killed.
+pub const HOST_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
+/// How often the host watchdog checks its children for unexpected exits.
+pub const HOST_WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Consecutive automatic restarts allowed before a host is parked as crashed.
+///
+/// A plugin that crashes immediately after every launch is broken; restarting it forever would
+/// burn CPU and hide the fault from the console.
+pub const HOST_WATCHDOG_MAX_RESTARTS: u32 = 5;
+
+/// Uptime after which a restarted host is considered healthy again and its budget resets.
+pub const HOST_WATCHDOG_HEALTHY_AFTER: Duration = Duration::from_secs(60);
+
+/// Runtime health of a supervised host, as observed by the host watchdog.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HostHealth {
+    /// `running`, `restarting`, `crashed` or `disabled`.
+    pub state: String,
+    /// Automatic restarts performed since the node started.
+    pub restarts: u32,
+    /// Last observed failure, when any.
+    pub last_error: Option<String>,
+}
+
+impl HostHealth {
+    /// Builds a health snapshot.
+    pub fn new(state: impl Into<String>, restarts: u32, last_error: Option<String>) -> Self {
+        Self {
+            state: state.into(),
+            restarts,
+            last_error,
+        }
+    }
+}
+
+impl Default for HostHealth {
+    fn default() -> Self {
+        Self::new("running", 0, None)
+    }
+}
+
+/// Restart bookkeeping for one host, owned by the watchdog task.
+#[derive(Debug, Default)]
+struct RestartBudget {
+    /// Attempts since the host last stayed up long enough to be considered healthy.
+    attempts: u32,
+    /// Earliest instant at which the next attempt may run (exponential backoff).
+    next_at: Option<Instant>,
+    /// When the last attempt ran, used to detect a healthy period.
+    last_attempt: Option<Instant>,
+}
+
+/// Terminates a host process as gently as it allows.
+///
+/// Lifecycle order: ask the process to stop (`SIGTERM` on Unix, which the Python, Rust and
+/// TypeScript hosts all translate into a graceful unload), give it [`HOST_SHUTDOWN_GRACE`] to
+/// close its platform connections, then kill it. Skipping the polite request would deny plugins
+/// their `on_unload` hook and drop platform connections abruptly; skipping the escalation would
+/// let a wedged host outlive its core.
+///
+/// Windows has no `SIGTERM`; there the process is terminated directly, which is the platform's
+/// only mechanism.
+pub async fn terminate_child(child: &mut Child, grace: Duration) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // A failure here (already-exited process, for instance) is not fatal: the wait below
+            // still reaps it.
+            let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            if rc != 0 {
+                tracing::debug!(
+                    pid,
+                    error = %std::io::Error::last_os_error(),
+                    "SIGTERM could not be delivered; falling back to killing the host"
+                );
+            } else {
+                match tokio::time::timeout(grace, child.wait()).await {
+                    Ok(Ok(status)) => {
+                        tracing::debug!(pid, status = %status, "Host exited after SIGTERM");
+                        return Ok(());
+                    }
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => {
+                        tracing::warn!(
+                            pid,
+                            grace_ms = grace.as_millis() as u64,
+                            "Host ignored SIGTERM within the grace period; killing it"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    let _ = grace;
+
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    Ok(())
 }
 
 impl Supervisor {
@@ -688,8 +863,10 @@ impl Supervisor {
         let channel = match self.wait_for_readiness(&mut child, host_id, &socket_path, Duration::from_secs(5)).await {
             Ok(ch) => ch,
             Err(e) => {
-                // Terminate child process if readiness check fails to prevent orphan processes.
-                let _ = child.kill().await;
+                // The process never became usable, so there is nothing to unload gracefully:
+                // kill it outright to prevent an orphan.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
                 return Err(e);
             }
         };
@@ -728,6 +905,7 @@ impl Supervisor {
                 launch_spec: Some(spec),
                 manifest,
                 circuit_breaker: Arc::new(CircuitBreaker::with_defaults()),
+                health: Mutex::new(HostHealth::default()),
             },
         );
 
@@ -1082,6 +1260,170 @@ impl Supervisor {
         self.hosts.read().await.values().cloned().collect()
     }
 
+    /// Starts the host watchdog, which notices crashed hosts and brings them back.
+    ///
+    /// Why this is separate from shutdown handling: a host can die at any time (panic, OOM,
+    /// `SIGKILL`, a plugin's own `process.exit`). Without a monitor the supervisor keeps the dead
+    /// host in its registry, so the console shows it as healthy and every routed event fails
+    /// against a closed socket. The watchdog prunes the entry, relaunches from the recorded
+    /// recipe with exponential backoff, and parks a repeatedly-crashing host as `crashed` so the
+    /// fault is visible instead of silently looped.
+    ///
+    /// Disabled plugins are never restarted: their absence is intentional.
+    pub fn spawn_host_watchdog(
+        self: &Arc<Self>,
+        plugin_state: Arc<PluginStateStore>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let supervisor = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut budgets: HashMap<String, RestartBudget> = HashMap::new();
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                ticker.tick().await;
+                let hosts = supervisor.get_all_hosts().await.len();
+                supervisor.watchdog_tick(&plugin_state, &mut budgets).await;
+                // Debug-level heartbeat: a watchdog that stopped running would otherwise leave a
+                // dead host advertised as healthy with nothing in the log to explain it.
+                tracing::debug!(hosts, "Host watchdog pass complete");
+            }
+        })
+    }
+
+    /// One watchdog pass: inspects every host with a child process.
+    async fn watchdog_tick(
+        &self,
+        plugin_state: &PluginStateStore,
+        budgets: &mut HashMap<String, RestartBudget>,
+    ) {
+        for host in self.get_all_hosts().await {
+            let Some(plugin_id) = host.primary_plugin_id() else {
+                continue;
+            };
+
+            let attempts = budgets
+                .get(&host.host_id)
+                .map(|budget| budget.attempts)
+                .unwrap_or(0);
+
+            if !plugin_state.is_enabled(&plugin_id).await {
+                // The control plane stops disabled hosts; if one is still present, mark it so the
+                // console shows why it is not serving.
+                host.report_health("disabled", attempts, None).await;
+                continue;
+            }
+
+            let exit_status = {
+                let mut guard = host.child.lock().await;
+                match guard.as_mut() {
+                    // `try_wait` reaps the child; `None` means it is still running.
+                    Some(child) => child.try_wait().ok().flatten(),
+                    // Externally registered hosts have no child handle to observe.
+                    None => continue,
+                }
+            };
+
+            let Some(status) = exit_status else {
+                // Still alive: a host that stayed up long enough has earned a fresh budget.
+                let budget = budgets.entry(host.host_id.clone()).or_default();
+                let healthy = budget
+                    .last_attempt
+                    .map(|at| at.elapsed() >= HOST_WATCHDOG_HEALTHY_AFTER)
+                    .unwrap_or(true);
+                if budget.attempts > 0 && healthy {
+                    tracing::info!(
+                        host_id = %host.host_id,
+                        restarts = budget.attempts,
+                        "Host stayed up after restart; clearing its restart budget"
+                    );
+                    budget.attempts = 0;
+                    budget.next_at = None;
+                }
+                host.report_health("running", budget.attempts, None).await;
+                continue;
+            };
+
+            tracing::error!(
+                host_id = %host.host_id,
+                plugin_id = %plugin_id,
+                status = %status,
+                "Plugin host exited unexpectedly"
+            );
+            let failure = format!("exited with {status}");
+
+            if !host.is_restartable() {
+                tracing::error!(
+                    host_id = %host.host_id,
+                    "Host has no launch recipe; removing it from the registry instead of restarting"
+                );
+                let _ = self.stop_host(&host.host_id).await;
+                continue;
+            }
+
+            let budget = budgets.entry(host.host_id.clone()).or_default();
+            let now = Instant::now();
+
+            if budget.attempts >= HOST_WATCHDOG_MAX_RESTARTS {
+                // Park it: a plugin that dies immediately on every launch needs a human.
+                if budget.next_at.is_none() {
+                    tracing::error!(
+                        host_id = %host.host_id,
+                        plugin_id = %plugin_id,
+                        attempts = budget.attempts,
+                        "Host crashed after repeated restarts; parking it as crashed until an operator restarts it"
+                    );
+                    budget.next_at = Some(now);
+                    host.report_health("crashed", budget.attempts, Some(failure.clone()))
+                        .await;
+                    let _ = self.stop_host(&host.host_id).await;
+                }
+                continue;
+            }
+
+            if let Some(next_at) = budget.next_at
+                && next_at > now
+            {
+                host.report_health("restarting", budget.attempts, Some(failure.clone()))
+                    .await;
+                continue;
+            }
+
+            // Exponential backoff: 2s, 4s, 8s, 16s, capped at 30s.
+            let backoff = Duration::from_secs(2u64.saturating_pow(budget.attempts).min(30));
+            budget.attempts += 1;
+            let attempt = budget.attempts;
+            budget.last_attempt = Some(now);
+            budget.next_at = Some(now + backoff);
+
+            tracing::warn!(
+                host_id = %host.host_id,
+                plugin_id = %plugin_id,
+                attempt,
+                max_attempts = HOST_WATCHDOG_MAX_RESTARTS,
+                backoff_ms = backoff.as_millis() as u64,
+                "Restarting crashed plugin host"
+            );
+
+            match self.restart_host(&host.host_id).await {
+                Ok(restarted) => {
+                    // Carry the attempt count forward so the console shows the full story.
+                    restarted.report_health("running", attempt, None).await;
+                }
+                Err(err) => {
+                    tracing::error!(
+                        host_id = %host.host_id,
+                        error = %err,
+                        "Failed to restart crashed plugin host"
+                    );
+                    host.report_health("crashed", attempt, Some(err.to_string()))
+                        .await;
+                }
+            }
+        }
+    }
+
     /// Stops a specific managed host and cleans up its socket.
     pub async fn stop_host(&self, host_id: &str) -> Result<(), SupervisorError> {
         let host = {
@@ -1092,9 +1434,20 @@ impl Supervisor {
         if let Some(host) = host {
             let mut child_guard = host.child.lock().await;
             if let Some(mut child) = child_guard.take() {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
+                // Graceful first: plugins flush state and close platform connections in
+                // `on_unload`, which a bare kill would skip entirely.
+                if let Err(err) = terminate_child(&mut child, HOST_SHUTDOWN_GRACE).await {
+                    tracing::warn!(host_id = %host_id, error = %err, "Failed to terminate host cleanly");
+                }
                 tracing::info!(host_id = %host_id, "Host process terminated");
+            } else {
+                // Externally registered hosts have no child handle. They cannot be signalled, so
+                // they rely on their own core-liveness watchdog to stop; the removal above means
+                // the core no longer routes anything to them in the meantime.
+                tracing::info!(
+                    host_id = %host_id,
+                    "Host had no child handle (externally registered); it stops via its own core-liveness watchdog"
+                );
             }
             if host.socket_path.exists() {
                 let _ = std::fs::remove_file(&host.socket_path);

@@ -22,7 +22,8 @@ use kanon_proto::v1::plugin_host_service_server::{PluginHostService, PluginHostS
 use kanon_proto::v1::{
     CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse,
     EventAck, EventNotification, GetPluginMetaRequest, GetPluginMetaResponse, GetStorageRequest,
-    PingRequest, PingResponse, PipelineEventRequest, PluginMeta, PreFilterResult,
+    PingRequest, PingResponse, PipelineEventRequest, PluginActionRequest,
+    PluginActionResponse, PluginMeta, PreFilterResult,
     RegisterHostRequest, ReloadPluginConfigRequest, ReloadPluginConfigResponse,
     SendMessageRequest, SetStorageRequest, TextSegment, ToolCallRequest, ToolCallResponse,
     MessageSegment,
@@ -59,6 +60,14 @@ struct MockHostService;
 
 #[tonic::async_trait]
 impl PluginHostService for MockHostService {
+    /// This fixture declares no management actions.
+    async fn invoke_action(
+        &self,
+        _request: tonic::Request<PluginActionRequest>,
+    ) -> Result<tonic::Response<PluginActionResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("fixture host has no actions"))
+    }
+
     async fn ping(
         &self,
         request: tonic::Request<PingRequest>,

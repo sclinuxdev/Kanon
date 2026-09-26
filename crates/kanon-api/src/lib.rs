@@ -56,6 +56,7 @@ pub use metrics::{MetricsRegistry, RuntimeGauges};
 pub use observability::{
     LogLevel, LogRecord, Observability, TraceEvent, TraceEventBus, TraceRecord,
 };
+pub use kanon_core::PluginStateStore;
 pub use plugin_config::PluginConfigStore;
 pub use server::{ApiServer, app};
-pub use state::{ApiState, ApiStateBuilder, build_node_agent, default_agent_config};
+pub use state::{ApiState, ApiStateBuilder, default_agent_config};

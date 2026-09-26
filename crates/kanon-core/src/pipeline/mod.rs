@@ -14,7 +14,10 @@ pub mod pre_filter;
 
 pub use command::{CommandRouter, MatchedCommand};
 pub use dead_letter::{DeadLetterRecord, DeadLetterWriter, DEFAULT_DEAD_LETTER_DIR};
-pub use engine::{DeliveryOutcome, PipelineEngine, PipelineResult, DEFAULT_OUTBOUND_QUEUE_CAPACITY};
+pub use engine::{
+    DeliveryOutcome, PipelineEngine, PipelineResult, NEW_SESSION_COMMAND,
+    DEFAULT_OUTBOUND_QUEUE_CAPACITY,
+};
 pub use observer::{PipelineObserver, PipelineStage};
 pub use pre_filter::{
     PreFilterChain, PreFilterOutcome, PREFILTER_TOTAL_DEADLINE, PREFILTER_WARN_THRESHOLD,

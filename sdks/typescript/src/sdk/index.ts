@@ -114,6 +114,10 @@ interface BotApiServiceClient {
       response?: RawRegisterHostResponse,
     ) => void,
   ): grpc.ClientUnaryCall;
+  Ping(
+    request: { timestamp: number },
+    callback: (error: grpc.ServiceError | null) => void,
+  ): grpc.ClientUnaryCall;
   waitForReady(deadline: grpc.Deadline, callback: (error?: Error) => void): void;
   close(): void;
 }
@@ -281,6 +285,23 @@ export class CoreHandle {
         `Core rejected host registration: ${response.message ?? "no message"}`,
       );
     }
+  }
+
+  /**
+   * Probes the Core's liveness (`BotApiService.Ping`).
+   *
+   * Deliberately trivial so a host can tell "Core is gone" apart from "Core is busy";
+   * used by the core-liveness watchdog.
+   *
+   * @throws When the RPC fails or times out.
+   */
+  async ping(): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      this.client.Ping(
+        { timestamp: Date.now() },
+        (error) => (error ? reject(error) : resolve()),
+      );
+    });
   }
 
   /**
@@ -509,7 +530,11 @@ export function Command(
 export function Tool(
   nameOrOptions:
     | string
-    | { name: string; description?: string; parameters?: Record<string, any> },
+    | {
+        name: string;
+        description?: string;
+        parameters?: Record<string, any>;
+      },
 ): MethodDecorator {
   return (
     target: any,
@@ -743,3 +768,10 @@ export function fromProtoStruct(structObj: any): Record<string, any> {
   return res;
 }
 
+
+export {
+  startCoreWatchdog,
+  DEFAULT_WATCHDOG_FAILURES,
+  DEFAULT_WATCHDOG_INTERVAL_MS,
+} from "./watchdog.js";
+export type { CoreWatchdogOptions, LivenessProbeTarget } from "./watchdog.js";

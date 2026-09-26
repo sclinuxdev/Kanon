@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional, Type
 
 import grpc
+from google.protobuf.json_format import MessageToDict
 
 # Ensure sdks/python is on sys.path
 _current_dir = Path(__file__).resolve().parent
@@ -24,7 +25,7 @@ if str(_python_sdk_dir) not in sys.path:
     sys.path.insert(0, str(_python_sdk_dir))
 
 from kanon_sdk.context import CoreHandle, PluginContext
-from kanon_sdk.ipc import connect_core_channel
+from kanon_sdk.ipc import CoreWatchdog, connect_core_channel
 from kanon_sdk.plugin import Plugin
 from kanon_sdk.proto import pb, pb_grpc
 
@@ -72,6 +73,18 @@ class HostServiceImpl(pb_grpc.PluginHostServiceServicer):
             success=True,
             error_message="",
             applied_version=request.version,
+        )
+
+    async def InvokeAction(
+        self,
+        request: pb.PluginActionRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.PluginActionResponse:
+        """Serves a control-plane management action (never reachable from the LLM)."""
+        return await self.plugin.on_invoke_action(
+            request.plugin_id,
+            request.action,
+            MessageToDict(request.parameters) if request.HasField("parameters") else {},
         )
 
     async def GetPluginMeta(
@@ -231,6 +244,8 @@ async def main() -> None:
     # Reach Core before building the PluginContext so adapter plugins can capture ctx.core in on_load.
     core_channel: Optional[grpc.aio.Channel] = None
     core_handle: Optional[CoreHandle] = None
+    core_stub: Optional[pb_grpc.BotApiServiceStub] = None
+    watchdog: Optional[CoreWatchdog] = None
 
     if core_sock_str:
         core_sock = Path(core_sock_str).resolve()
@@ -307,7 +322,20 @@ async def main() -> None:
         except (NotImplementedError, RuntimeError):
             pass
 
+    # A host whose core is gone must stop instead of becoming a ghost bot that keeps serving its
+    # platform (and double-handling messages once a new core starts).
+    if core_stub is not None:
+        def _core_lost(reason: str) -> None:
+            print(f"[kanon-host] {reason}", flush=True)
+            stop_event.set()
+
+        watchdog = CoreWatchdog(core_stub, pb, on_lost=_core_lost)
+        watchdog.start()
+
     await stop_event.wait()
+
+    if watchdog is not None:
+        await watchdog.stop()
 
     # Graceful shutdown
     await plugin.on_unload()

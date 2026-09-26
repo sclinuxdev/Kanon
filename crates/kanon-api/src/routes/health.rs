@@ -32,6 +32,8 @@ pub struct HealthResponse {
     pub memory: MemorySection,
     /// Supervised plugin host summary.
     pub plugins: PluginSection,
+    /// Bot instance summary: an adapter alone answers nothing until an instance claims it.
+    pub instances: InstanceSection,
     /// Conversation session summary.
     pub sessions: SessionSection,
     /// Real-time channel summary.
@@ -54,6 +56,15 @@ pub struct PluginSection {
     pub hosts: usize,
     /// Number of plugin instances declared across those hosts.
     pub loaded: usize,
+}
+
+/// Bot instance counters.
+#[derive(Debug, Serialize)]
+pub struct InstanceSection {
+    /// Instances configured on this node.
+    pub total: usize,
+    /// Instances currently accepting messages.
+    pub enabled: usize,
 }
 
 /// Session manager counters.
@@ -85,6 +96,9 @@ async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
     let hosts = state.supervisor().get_all_hosts().await;
     let loaded = hosts.iter().map(|host| host.meta.len()).sum();
 
+    let instances = state.instances().list().await;
+    let instances_enabled = instances.iter().filter(|instance| instance.enabled).count();
+
     let memory = sample_process_memory();
 
     Json(HealthResponse {
@@ -99,6 +113,10 @@ async fn health(State(state): State<ApiState>) -> Json<HealthResponse> {
         plugins: PluginSection {
             hosts: hosts.len(),
             loaded,
+        },
+        instances: InstanceSection {
+            total: instances.len(),
+            enabled: instances_enabled,
         },
         sessions: SessionSection {
             total: state.sessions().session_count(),

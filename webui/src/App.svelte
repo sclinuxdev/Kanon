@@ -3,6 +3,7 @@ import CommandPalette from './lib/components/layout/CommandPalette.svelte';
 import Header from './lib/components/layout/Header.svelte';
 import Sidebar from './lib/components/layout/Sidebar.svelte';
 
+import InstancesView from './lib/components/views/InstancesView.svelte';
 import OverviewView from './lib/components/views/OverviewView.svelte';
 import PipelineLogsView from './lib/components/views/PipelineLogsView.svelte';
 import PlaygroundView from './lib/components/views/PlaygroundView.svelte';
@@ -60,6 +61,8 @@ function handleKeydown(e: KeyboardEvent) {
     <div class="flex-1 overflow-y-auto">
       {#if currentTab === 'overview'}
         <OverviewView onNavigate={(tab) => (currentTab = tab)} />
+      {:else if currentTab === 'instances'}
+        <InstancesView />
       {:else if currentTab === 'chat' || currentTab === 'playground'}
         <PlaygroundView />
       {:else if currentTab === 'pipeline'}

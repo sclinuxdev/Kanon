@@ -32,11 +32,40 @@ def tool(
     description: str = "",
     parameters: Optional[Dict[str, Any]] = None,
 ) -> Callable:
-    """Decorator to declare an LLM tool call handler method within a Plugin class."""
+    """Decorator to declare an LLM tool call handler method within a Plugin class.
+
+    Declared tools are advertised to the model and callable by it. Operations that an *operator*
+    triggers — credential binding, QR login, diagnostics — belong in :func:`action` instead: a
+    tool advertised by an adapter is offered to the model, which then tries to invoke it
+    mid-conversation.
+    """
     def decorator(fn: Callable) -> Callable:
         fn._kanon_tool = {
             "name": name,
             "description": description,
+            "parameters": parameters or {},
+        }
+        return fn
+    return decorator
+
+
+def action(
+    name: str,
+    parameters: Optional[Dict[str, Any]] = None,
+) -> Callable:
+    """Decorator to declare a management action invoked by the control plane.
+
+    Actions are never advertised to the model and never appear in :meth:`Plugin.meta`: they exist
+    for the console (``POST /api/v1/plugins/{id}/actions/{action}``) and for core endpoints that
+    drive plugin administration, such as the QQ credential binding flow.
+
+    Args:
+        name: Action name the control plane invokes.
+        parameters: JSON Schema for the action arguments (used for documentation).
+    """
+    def decorator(fn: Callable) -> Callable:
+        fn._kanon_action = {
+            "name": name,
             "parameters": parameters or {},
         }
         return fn
@@ -57,6 +86,7 @@ class Plugin:
         self.context: Optional[PluginContext] = None
         self._command_handlers: Dict[str, Callable] = {}
         self._tool_handlers: Dict[str, Callable] = {}
+        self._action_handlers: Dict[str, Callable] = {}
         self._collect_decorated_handlers()
 
     def _collect_decorated_handlers(self) -> None:
@@ -75,6 +105,10 @@ class Plugin:
                 if hasattr(attr, "_kanon_tool"):
                     tool_meta = getattr(attr, "_kanon_tool")
                     self._tool_handlers[tool_meta["name"]] = attr
+
+                if hasattr(attr, "_kanon_action"):
+                    action_meta = getattr(attr, "_kanon_action")
+                    self._action_handlers[action_meta["name"]] = attr
 
     def meta(self) -> pb.PluginMeta:
         """Constructs and returns static metadata for this plugin."""
@@ -174,6 +208,41 @@ class Plugin:
             success=False,
             error_message=f"Unknown command: {req.command}",
         )
+
+    async def on_invoke_action(
+        self,
+        plugin_id: str,
+        action_name: str,
+        parameters: Dict[str, Any],
+    ) -> pb.PluginActionResponse:
+        """Dispatches a control-plane management action to its handler.
+
+        Actions are the operator-facing counterpart of tools: they are never advertised to the
+        model, so credential binding and similar flows cannot be triggered by a chat message.
+        Unknown actions and handler failures are reported as explicit, structured errors rather
+        than raising through the gRPC layer.
+        """
+        handler = self._action_handlers.get(action_name)
+        if handler is None:
+            return pb.PluginActionResponse(
+                success=False,
+                error_message=(
+                    f"Unknown action '{action_name}' for plugin '{plugin_id}'; "
+                    f"declared actions: {sorted(self._action_handlers)}"
+                ),
+            )
+
+        try:
+            result = handler(parameters or {})
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            return pb.PluginActionResponse(success=False, error_message=f"Action failed: {exc}")
+
+        payload = Struct()
+        if result:
+            ParseDict(result, payload)
+        return pb.PluginActionResponse(success=True, error_message="", result=payload)
 
     async def on_call_tool(
         self,

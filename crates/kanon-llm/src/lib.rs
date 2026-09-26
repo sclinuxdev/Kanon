@@ -13,6 +13,7 @@
 
 pub mod agent;
 pub mod error;
+pub mod factory;
 pub mod gateway;
 pub mod memory;
 pub mod prompt;
@@ -28,6 +29,7 @@ pub use agent::{
     NativeToolFn, NoopHost,
 };
 pub use error::{AgentError, GatewayError, MemoryError, ToolRouterError};
+pub use factory::AgentFactory;
 pub use gateway::providers::{
     AnthropicMessagesProvider, AnthropicProvider, OpenAiChatProvider, OpenAiProvider,
     OpenAiResponsesProvider, SseDecoder, SseEvent,

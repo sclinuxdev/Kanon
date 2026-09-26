@@ -22,14 +22,13 @@ use axum::routing::post;
 use futures_util::StreamExt;
 use kanon_core::ManagedHost;
 use kanon_llm::{
-    Agent, AgentError, AnthropicMessagesProvider, LlmProvider, OpenAiChatProvider,
-    OpenAiResponsesProvider, tool_router::ExecutedToolCall,
+    Agent, AgentError, tool_router::ExecutedToolCall,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
 use crate::metrics::MetricsRegistry;
-use crate::state::ApiState;
+use crate::state::{ApiState, default_agent_config};
 
 /// Registers the sandbox chat route.
 pub fn routes() -> Router<ApiState> {
@@ -284,53 +283,35 @@ fn resolve_agent(state: &ApiState, request: &ChatCompletionRequest) -> Result<Ar
             };
             let key = request.api_key.clone().filter(|k| !k.trim().is_empty());
 
-            let prov: Arc<dyn LlmProvider> = match proto.as_str() {
-                "openai" | "openai_chat" => {
-                    Arc::new(OpenAiChatProvider::new(trimmed_url, key, model.clone()))
-                }
-                "openai_responses" => Arc::new(
-                    OpenAiResponsesProvider::new(key.unwrap_or_default()).with_base_url(trimmed_url),
-                ),
-                "anthropic" => {
-                    Arc::new(AnthropicMessagesProvider::new(trimmed_url, key, model.clone()))
-                }
-                other => {
-                    return Err(ApiError::BadRequest(format!(
-                        "Unsupported protocol '{other}'; expected openai, openai_responses or anthropic"
-                    )));
-                }
-            };
+            // Built through the shared factory so a protocol accepted here is accepted
+            // everywhere, and so the ephemeral agent still shares the node's memory, sessions,
+            // personas and trace bus.
+            let provider = kanon_llm::build_provider(&proto, trimmed_url, key, model.clone())
+                .map_err(ApiError::BadRequest)?;
+            let mut config = default_agent_config(model);
+            config.max_iterations = state
+                .agent()
+                .map(|agent| agent.config().max_iterations)
+                .unwrap_or(config.max_iterations);
 
-            let builder = Agent::builder("sandbox", prov)
-                .memory(state.sessions().memory().clone())
-                .session_manager(state.sessions().clone())
-                .persona_registry(state.personas().clone())
-                .hook_arc(state.observability().events.clone())
-                .model(model);
-
-            return Ok(Arc::new(builder.build()));
+            return Ok(state.agent_factory().build_with(provider, config));
         }
     }
 
     if let Some(agent) = state.agent() {
-        if let Some(ref raw_model) = request.model {
-            let model = match raw_model.split_once('/') {
-                Some((_prov, actual_model)) if !actual_model.trim().is_empty() => {
-                    actual_model.trim().to_string()
-                }
-                _ => raw_model.trim().to_string(),
-            };
-            if !model.is_empty() && model != agent.config().default_model {
-                let builder = Agent::builder("sandbox", agent.provider().clone())
-                    .memory(state.sessions().memory().clone())
-                    .session_manager(state.sessions().clone())
-                    .persona_registry(state.personas().clone())
-                    .hook_arc(state.observability().events.clone())
-                    .model(model);
-                return Ok(Arc::new(builder.build()));
+        // Console model keys may carry a provider prefix (`deepseek/deepseek-chat`); the agent
+        // only ever needs the model tag itself.
+        let model = request.model.as_deref().map(|raw| {
+            match raw.split_once('/') {
+                Some((_prov, actual)) if !actual.trim().is_empty() => actual.trim().to_string(),
+                _ => raw.trim().to_string(),
             }
-        }
-        return Ok(agent.clone());
+        });
+        // A per-request model override never rebuilds memory, personas or hooks: the factory
+        // derives an agent that differs only by the model tag.
+        return Ok(state
+            .agent_for_model(model.as_deref())
+            .unwrap_or(agent));
     }
 
     Err(ApiError::Unavailable(

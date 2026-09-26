@@ -70,12 +70,13 @@ impl<P: Plugin> KanonHost<P> {
         self
     }
 
-    /// Runs the plugin host, listening for shutdown via `SIGINT` (Ctrl+C).
+    /// Runs the plugin host until the process is asked to stop, or the core disappears.
+    ///
+    /// `SIGINT` and (on Unix) `SIGTERM` both request a graceful shutdown, which unloads the
+    /// plugin and closes its platform connections. A core that stops answering liveness probes
+    /// triggers the same path through [`crate::watchdog::watch_core`].
     pub async fn run(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.run_with_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
+        self.run_with_shutdown(shutdown_signal()).await
     }
 
     /// Runs the plugin host until the provided `shutdown` future resolves.
@@ -88,16 +89,26 @@ impl<P: Plugin> KanonHost<P> {
         // 1. Connect to Core before initializing the plugin: adapter plugins capture the core
         //    handle from their context during `on_load`, so the connection must already exist.
         let core_handle = self.connect_core(&plugin_id).await;
+        // The same channel backs the liveness watchdog, so a dead core is noticed without any
+        // extra connection.
+        let core_watchdog = core_handle
+            .clone()
+            .map(|handle| (handle, crate::watchdog::CoreWatchdogConfig::default()));
 
         // 2. Initialize plugin lifecycle
         let data_dir = PathBuf::from(format!("./data/plugins/{plugin_id}"));
         let mut ctx = PluginContext::new(data_dir, None);
         match core_handle {
             Some(handle) => ctx = ctx.with_core(handle),
-            None => tracing::warn!(
-                plugin_id = %plugin_id,
-                "Core is not reachable; continuing in standalone mode with ctx.core = None"
-            ),
+            None => {
+                eprintln!(
+                    "[kanon-host] core is not reachable; host '{plugin_id}' continues in standalone mode"
+                );
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    "Core is not reachable; continuing in standalone mode with ctx.core = None"
+                );
+            }
         }
 
         self.plugin.write().await.on_load(&mut ctx).await?;
@@ -116,14 +127,70 @@ impl<P: Plugin> KanonHost<P> {
             plugin: self.plugin.clone(),
         };
 
-        let server_future = tonic::transport::Server::builder()
+        // 5. Stop for whichever reason comes first: an explicit shutdown request or a core that
+        //    stopped answering. The watchdog matters because a killed core leaves this process
+        //    running; an orphaned host would keep serving its platform and, once a new core
+        //    starts, double-handle every message. Exiting is safe: the new core spawns its own
+        //    hosts from the plugin directory.
+        let (stop_tx, stop_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (reason_tx, mut reason_rx) = tokio::sync::oneshot::channel::<crate::watchdog::StopReason>();
+
+        let requested_tx = stop_tx.clone();
+        let requested = async move {
+            shutdown.await;
+            // Tell the watchdog the host is stopping for its own reasons.
+            let _ = requested_tx.send(()).await;
+            crate::watchdog::StopReason::Requested
+        };
+
+        let server_shutdown = async move {
+            let reason = match core_watchdog {
+                Some((handle, config)) => {
+                    tokio::select! {
+                        reason = crate::watchdog::watch_core(handle, config, stop_rx) => reason,
+                        reason = requested => reason,
+                    }
+                }
+                // No core was reachable at startup (standalone mode): only an explicit shutdown
+                // request can stop this host.
+                None => requested.await,
+            };
+            let _ = reason_tx.send(reason);
+        };
+
+        // 6. Serve until the shutdown future above resolves.
+        tonic::transport::Server::builder()
             .add_service(PluginHostServiceServer::new(host_svc))
             .add_service(MessagePipelineServiceServer::new(pipeline_svc))
-            .serve_with_incoming_shutdown(incoming, shutdown);
+            .serve_with_incoming_shutdown(incoming, server_shutdown)
+            .await?;
 
-        server_future.await?;
+        // Terminal lifecycle events go to stderr as well as to `tracing`: a host that stops is
+        // exactly the moment an operator needs an explanation, and plugins are free not to
+        // install a tracing subscriber. `tracing` output is kept for structured pipelines.
+        match reason_rx.try_recv() {
+            Ok(crate::watchdog::StopReason::CoreLost) => {
+                let message = format!(
+                    "[kanon-host] core unreachable; stopping host '{plugin_id}' so it cannot serve its platform without a core"
+                );
+                eprintln!("{message}");
+                tracing::warn!(plugin_id = %plugin_id, "Stopping host: the core it registered with is gone");
+            }
+            Ok(crate::watchdog::StopReason::Requested) => {
+                tracing::info!(plugin_id = %plugin_id, "Stopping host: shutdown requested");
+            }
+            // The shutdown signal future always reports a reason before the server returns; a
+            // missing one would mean the server stopped for an unknown cause, which is worth a
+            // loud line rather than silence.
+            Err(_) => {
+                eprintln!(
+                    "[kanon-host] host '{plugin_id}' gRPC server stopped without a recorded reason"
+                );
+                tracing::warn!(plugin_id = %plugin_id, "Host gRPC server stopped without a recorded reason");
+            }
+        }
 
-        // 5. Cleanup on shutdown
+        // 7. Cleanup on shutdown
         self.plugin.write().await.on_unload().await?;
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
@@ -232,6 +299,20 @@ impl<P: Plugin> PluginHostService for HostServiceImpl<P> {
         }))
     }
 
+    /// Serves a control-plane management action.
+    ///
+    /// Actions are the operator-facing counterpart of tools: they are never advertised to the
+    /// model. The Rust SDK does not declare any yet, so an incoming action is answered with an
+    /// explicit `unimplemented` status instead of being silently dropped.
+    async fn invoke_action(
+        &self,
+        _request: Request<kanon_proto::v1::PluginActionRequest>,
+    ) -> Result<Response<kanon_proto::v1::PluginActionResponse>, Status> {
+        Err(Status::unimplemented(
+            "This Rust plugin host declares no management actions",
+        ))
+    }
+
     async fn get_plugin_meta(
         &self,
         _request: Request<GetPluginMetaRequest>,
@@ -324,5 +405,35 @@ impl<P: Plugin> MessagePipelineService for PipelineServiceImpl<P> {
                 error_message: e.to_string(),
             })),
         }
+    }
+}
+
+/// Resolves when the process is asked to stop: `SIGINT`, or `SIGTERM` on Unix.
+///
+/// `SIGTERM` is what supervisors and container runtimes send, so ignoring it would leave a host
+/// that only stops on `Ctrl-C` — exactly the behaviour that produces orphaned platforms.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to install SIGTERM handler; falling back to SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }

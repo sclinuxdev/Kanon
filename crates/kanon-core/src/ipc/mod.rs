@@ -271,6 +271,19 @@ impl BotApiService for CoreApiService {
         }
     }
 
+    /// Answers a liveness probe from a plugin host.
+    ///
+    /// Deliberately trivial: it must not touch the pipeline, the supervisor or the ingest queue,
+    /// so that a host can distinguish "core is unreachable" from "core is busy".
+    async fn ping(
+        &self,
+        request: Request<kanon_proto::v1::PingRequest>,
+    ) -> Result<Response<kanon_proto::v1::PingResponse>, Status> {
+        Ok(Response::new(kanon_proto::v1::PingResponse {
+            timestamp: request.into_inner().timestamp,
+        }))
+    }
+
     /// Server streaming response type for LLM token generation chunks.
     type RequestLLMStream = tokio_stream::wrappers::ReceiverStream<Result<LlmChunk, Status>>;
 

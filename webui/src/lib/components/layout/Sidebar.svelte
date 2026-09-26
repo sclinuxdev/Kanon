@@ -2,6 +2,7 @@
 import {
   Activity,
   Blocks,
+  Bot,
   Cpu,
   Languages,
   Laptop,
@@ -29,6 +30,7 @@ let {
 
 const navItems = [
   { id: 'overview', key: 'nav.overview', icon: Activity },
+  { id: 'instances', key: 'nav.instances', icon: Bot },
   { id: 'chat', key: 'nav.chat', icon: MessageSquare },
   { id: 'pipeline', key: 'nav.pipeline', icon: Terminal },
   { id: 'plugins', key: 'nav.plugins', icon: Blocks },

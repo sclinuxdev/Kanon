@@ -38,9 +38,21 @@ pub fn routes() -> Router<ApiState> {
             get(get_config).put(put_config),
         )
         .route("/api/v1/plugins/:id/restart", post(restart_plugin))
+        // Enabling starts the host process; disabling stops it, so a disabled plugin releases its
+        // memory and disappears from routing entirely.
+        .route(
+            "/api/v1/plugins/:id/enabled",
+            axum::routing::put(set_plugin_enabled),
+        )
         .route(
             "/api/v1/plugins/:id/tools/:tool_name",
             post(call_plugin_tool),
+        )
+        // Management actions: the operator-facing counterpart of tools. They are never offered
+        // to the model, which is what lets an adapter expose credential binding safely.
+        .route(
+            "/api/v1/plugins/:id/actions/:action_name",
+            post(invoke_plugin_action),
         )
 }
 
@@ -127,12 +139,41 @@ pub struct PluginView {
     pub runtime: Option<String>,
     /// Scheduling priority inherited from the manifest.
     pub priority: i32,
-    /// Lifecycle status (`running`, `declared`, or `RuntimeUnavailable`).
+    /// Lifecycle status (`running`, `declared`, `disabled`, `crashed`, or `RuntimeUnavailable`).
     pub status: String,
+    /// Whether the operator allows this plugin to run.
+    ///
+    /// A disabled plugin is not merely idle: its host process is stopped, so its pre-filters,
+    /// commands, tools and adapter disappear from the node.
+    pub enabled: bool,
+    /// Runtime health reported by the host watchdog, when the plugin has a host process.
+    pub health: Option<kanon_core::HostHealth>,
     /// Statically declared commands.
     pub commands: Vec<CommandView>,
     /// Statically declared tools and their parameter schemas.
     pub tools: Vec<ToolView>,
+}
+
+/// Request body for enabling or disabling a plugin.
+#[derive(Debug, Deserialize)]
+pub struct SetPluginEnabledRequest {
+    /// Whether the plugin should run on this node.
+    pub enabled: bool,
+}
+
+/// Confirmation returned after a plugin is enabled or disabled.
+#[derive(Debug, Serialize)]
+pub struct PluginStateResponse {
+    /// Whether the catalog changed.
+    pub applied: bool,
+    /// Human-readable confirmation.
+    pub message: String,
+    /// Plugin identifier the request addressed.
+    pub plugin_id: String,
+    /// State after the call.
+    pub enabled: bool,
+    /// Owning host identifier, when the plugin is running.
+    pub host_id: Option<String>,
 }
 
 /// A command declared by a plugin.
@@ -242,6 +283,46 @@ async fn list_plugins(State(state): State<ApiState>) -> Json<PluginCatalog> {
         plugin_views.push(plugin_view);
     }
 
+    // Disabled plugins have no host at all, so the catalog would otherwise hide them and the
+    // console could never re-enable one. Scan the plugin directory and present the rest (with a
+    // placeholder status: the overlay below decides the final one).
+    for discovered in discovered_plugin_views(state.plugins_dir(), &plugin_views) {
+        plugin_views.push(discovered);
+    }
+
+    // Overlay the operator's enable/disable state and the watchdog's health, after every entry
+    // exists, so the console sees one authoritative status per plugin instead of inferring it from
+    // a missing host. This must run last: a plugin with no host is not necessarily disabled (its
+    // launch may have failed), and only the state store knows the operator's intent.
+    for view in &mut plugin_views {
+        let enabled = state.plugin_state().is_enabled(&view.id).await;
+        view.enabled = enabled;
+        view.health = match hosts.iter().find(|host| host.host_id == view.host_id) {
+            Some(host) => Some(host.health().await),
+            None => None,
+        };
+        if !enabled {
+            view.status = "disabled".to_string();
+        } else if let Some(health) = &view.health
+            && health.state == "crashed"
+        {
+            view.status = "crashed".to_string();
+        }
+    }
+
+    // Host views were assembled before the overlay, so propagate the resolved state into their
+    // nested plugin entries: otherwise the console would show one plugin as enabled in the host
+    // card and disabled in the catalog.
+    for host_view in &mut host_views {
+        for plugin in &mut host_view.plugins {
+            if let Some(resolved) = plugin_views.iter().find(|view| view.id == plugin.id) {
+                plugin.enabled = resolved.enabled;
+                plugin.health = resolved.health.clone();
+                plugin.status = resolved.status.clone();
+            }
+        }
+    }
+
     // Deterministic ordering keeps console tables stable across polls.
     host_views.sort_by(|a, b| a.host_id.cmp(&b.host_id));
     plugin_views.sort_by(|a, b| a.id.cmp(&b.id));
@@ -251,6 +332,43 @@ async fn list_plugins(State(state): State<ApiState>) -> Json<PluginCatalog> {
         hosts: host_views,
         plugins: plugin_views,
     })
+}
+
+/// Builds catalog entries for plugins on disk that have no running host.
+///
+/// Without this fill the console would lose the ability to re-enable a plugin it had disabled
+/// (and could not see a plugin whose runtime is missing, either), because both cases have no
+/// host process to enumerate. The caller applies the enable/disable overlay afterwards.
+fn discovered_plugin_views(
+    plugins_dir: &std::path::Path,
+    existing: &[PluginView],
+) -> Vec<PluginView> {
+    let discovered = match kanon_core::PluginScanner::scan(plugins_dir) {
+        Ok(found) => found,
+        Err(err) => {
+            tracing::warn!(
+                dir = %plugins_dir.display(),
+                error = %err,
+                "Could not scan the plugin directory while building the catalog"
+            );
+            return Vec::new();
+        }
+    };
+
+    discovered
+        .into_iter()
+        .filter(|plugin| !existing.iter().any(|view| view.id == plugin.manifest.plugin.id))
+        .map(|plugin| {
+            let manifest = plugin.manifest;
+            let host_id = format!("host_{}", manifest.plugin.id.replace('.', "_"));
+            // The state overlay in `list_plugins` runs before this fill, so mark these entries
+            // directly: a plugin with no host is either disabled or could not be launched.
+            // State-agnostic placeholder: the caller's overlay applies the operator's intent.
+            let mut view = plugin_view_from_manifest_with_status(&manifest, "declared");
+            view.host_id = host_id;
+            view
+        })
+        .collect()
 }
 
 /// Returns the current configuration and declaration schema for a plugin.
@@ -361,6 +479,14 @@ async fn restart_plugin(
     State(state): State<ApiState>,
     AxumPath(plugin_id): AxumPath<String>,
 ) -> Result<Json<RestartResponse>, ApiError> {
+    // Checked before the host lookup: a disabled plugin has no host by design, and "enable it
+    // first" is far more useful than "not loaded by any active host".
+    if !state.plugin_state().is_enabled(&plugin_id).await {
+        return Err(ApiError::Conflict(format!(
+            "Plugin '{plugin_id}' is disabled; enable it before restarting its host"
+        )));
+    }
+
     let host = state
         .supervisor()
         .find_host_for_plugin(&plugin_id)
@@ -372,6 +498,7 @@ async fn restart_plugin(
         })?;
 
     let host_id = host.host_id.clone();
+
     let restarted = state.supervisor().restart_host(&host_id).await?;
 
     state
@@ -464,6 +591,188 @@ async fn call_plugin_tool(
             Some(response.error_message)
         },
     }))
+}
+
+/// Invokes a management action declared by a plugin.
+///
+/// Actions are the console counterpart of tools: unlike `tools/{name}`, the action is never
+/// advertised to the LLM, so adapters can expose credential binding or diagnostics without the
+/// model trying to call them during a conversation.
+async fn invoke_plugin_action(
+    State(state): State<ApiState>,
+    AxumPath((plugin_id, action_name)): AxumPath<(String, String)>,
+    Json(body): Json<CallPluginToolRequest>,
+) -> Result<Json<CallPluginToolResponse>, ApiError> {
+    let host = state
+        .supervisor()
+        .find_host_for_plugin(&plugin_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "Plugin '{plugin_id}' is not loaded by any active host"
+            ))
+        })?;
+
+    let parameters = json_to_prost_struct(&body.arguments).unwrap_or_default();
+    let request = kanon_proto::v1::PluginActionRequest {
+        plugin_id: plugin_id.clone(),
+        action: action_name.clone(),
+        parameters: Some(parameters),
+    };
+
+    let response = host.invoke_action(request).await.map_err(|status| {
+        ApiError::Upstream(format!(
+            "Plugin action '{action_name}' failed on host '{}': {}",
+            host.host_id, status
+        ))
+    })?;
+
+    if !response.success {
+        tracing::warn!(
+            plugin_id = %plugin_id,
+            action = %action_name,
+            error = %response.error_message,
+            "Plugin management action reported a failure"
+        );
+    }
+
+    Ok(Json(CallPluginToolResponse {
+        success: response.success,
+        result: response.result.map(prost_struct_to_json).unwrap_or(Value::Null),
+        error: if response.error_message.is_empty() {
+            None
+        } else {
+            Some(response.error_message)
+        },
+    }))
+}
+
+/// Enables or disables a plugin, starting or stopping its host process.
+///
+/// Disabling is deliberately destructive to the process: a stopped host releases its memory and
+/// removes its pre-filters, commands, tools and platform adapter from the node, which is what an
+/// operator means by "turn this plugin off". Enabling spawns the host from the manifest on disk.
+///
+/// The recorded intent is *not* rolled back when the launch fails (for example a missing runtime):
+/// the failure is reported as an upstream error and the plugin stays `enabled` while showing up as
+/// declared, so a transient cause can be fixed and the next node start brings it up. Silently
+/// reverting the toggle would erase what the operator asked for.
+async fn set_plugin_enabled(
+    State(state): State<ApiState>,
+    AxumPath(plugin_id): AxumPath<String>,
+    Json(body): Json<SetPluginEnabledRequest>,
+) -> Result<Json<PluginStateResponse>, ApiError> {
+    let running = state.supervisor().find_host_for_plugin(&plugin_id).await;
+    let manifest_path = if running.is_none() {
+        Some(find_manifest_path(state.plugins_dir(), &plugin_id)?)
+    } else {
+        None
+    };
+
+    if running.is_none() && manifest_path.is_none() {
+        return Err(ApiError::NotFound(format!(
+            "Plugin '{plugin_id}' is not loaded and no manifest for it exists on this node"
+        )));
+    }
+
+    let changed = state
+        .plugin_state()
+        .set_enabled(&plugin_id, body.enabled)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    if !changed {
+        return Ok(Json(PluginStateResponse {
+            applied: false,
+            message: if body.enabled {
+                format!("Plugin '{plugin_id}' is already enabled")
+            } else {
+                format!("Plugin '{plugin_id}' is already disabled")
+            },
+            plugin_id,
+            enabled: body.enabled,
+            host_id: running.map(|host| host.host_id.clone()),
+        }));
+    }
+
+    if body.enabled {
+        let host_id = match running {
+            Some(host) => host.host_id.clone(),
+            None => {
+                let manifest_path = manifest_path.expect("checked above");
+                let host = state
+                    .supervisor()
+                    .spawn_from_manifest(&manifest_path, None)
+                    .await
+                    .map_err(|err| {
+                        ApiError::Upstream(format!(
+                            "Plugin '{plugin_id}' was enabled but its host failed to start: {err}"
+                        ))
+                    })?;
+                host.host_id.clone()
+            }
+        };
+
+        tracing::info!(plugin_id = %plugin_id, host_id = %host_id, "Plugin enabled by the control plane");
+        Ok(Json(PluginStateResponse {
+            applied: true,
+            message: format!("Plugin '{plugin_id}' enabled and running"),
+            plugin_id,
+            enabled: true,
+            host_id: Some(host_id),
+        }))
+    } else {
+        // Stop every host that declares the plugin. Plugin hosts are either registered as
+        // `host_<plugin_id>` or externally attached, so look the host up by declaration.
+        let host_id = match state.supervisor().find_host_for_plugin(&plugin_id).await {
+            Some(host) => {
+                let host_id = host.host_id.clone();
+                state
+                    .supervisor()
+                    .stop_host(&host_id)
+                    .await
+                    .map_err(|err| ApiError::Internal(format!("Failed to stop host: {err}")))?;
+                Some(host_id)
+            }
+            None => None,
+        };
+
+        tracing::info!(
+            plugin_id = %plugin_id,
+            host_id = ?host_id,
+            "Plugin disabled by the control plane; its host was stopped"
+        );
+        Ok(Json(PluginStateResponse {
+            applied: true,
+            message: format!("Plugin '{plugin_id}' disabled and its host stopped"),
+            plugin_id,
+            enabled: false,
+            host_id,
+        }))
+    }
+}
+
+/// Resolves the manifest path of a plugin that is present on disk but not running.
+fn find_manifest_path(
+    plugins_dir: &std::path::Path,
+    plugin_id: &str,
+) -> Result<std::path::PathBuf, ApiError> {
+    let discovered = kanon_core::PluginScanner::scan(plugins_dir).map_err(|err| {
+        ApiError::Internal(format!(
+            "Could not scan {}: {err}",
+            plugins_dir.display()
+        ))
+    })?;
+
+    discovered
+        .into_iter()
+        .find(|plugin| plugin.manifest.plugin.id == plugin_id)
+        .map(|plugin| plugin.manifest_path)
+        .ok_or_else(|| {
+            ApiError::NotFound(format!(
+                "Plugin '{plugin_id}' is not loaded and no manifest for it exists on this node"
+            ))
+        })
 }
 
 /// Handles plugin installation from a local directory path or uploaded distribution archive.
@@ -859,6 +1168,8 @@ fn plugin_view_from_meta(
         runtime: fallback.map(|m| m.plugin.runtime.clone()),
         priority: host.priority,
         status: "running".to_string(),
+        enabled: true,
+        health: None,
         commands: meta
             .commands
             .iter()
@@ -900,6 +1211,8 @@ fn plugin_view_from_manifest(
         runtime: Some(manifest.plugin.runtime.clone()),
         priority: host.priority,
         status: "declared".to_string(),
+        enabled: true,
+        health: None,
         commands: manifest
             .commands
             .iter()
@@ -941,6 +1254,8 @@ fn plugin_view_from_manifest_with_status(
         runtime: Some(manifest.plugin.runtime.clone()),
         priority: manifest.plugin.priority.unwrap_or(500),
         status: status.to_string(),
+        enabled: true,
+        health: None,
         commands: manifest
             .commands
             .iter()

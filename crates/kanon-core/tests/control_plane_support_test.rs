@@ -303,7 +303,8 @@ async fn config_hot_reload_enforces_cas_version_vectors() {
     use kanon_proto::v1::plugin_host_service_server::{PluginHostService, PluginHostServiceServer};
     use kanon_proto::v1::{
         GetPluginMetaRequest, GetPluginMetaResponse, PingRequest, PingResponse,
-        ReloadPluginConfigRequest, ReloadPluginConfigResponse,
+        PluginActionRequest, PluginActionResponse, ReloadPluginConfigRequest,
+        ReloadPluginConfigResponse,
     };
     use std::sync::atomic::{AtomicU64, Ordering};
     use tonic::{Request, Response, Status};
@@ -314,6 +315,14 @@ async fn config_hot_reload_enforces_cas_version_vectors() {
 
     #[tonic::async_trait]
     impl PluginHostService for TestHostService {
+        /// This fixture declares no management actions.
+        async fn invoke_action(
+            &self,
+            _req: Request<PluginActionRequest>,
+        ) -> Result<Response<PluginActionResponse>, Status> {
+            Err(Status::unimplemented("fixture host has no actions"))
+        }
+
         async fn ping(&self, req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
             Ok(Response::new(PingResponse {
                 timestamp: req.into_inner().timestamp,

@@ -5,7 +5,8 @@
   "main": "dist/src/sdk/index.js",
   "types": "dist/src/sdk/index.d.ts",
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "tsc && node --test dist/tests"
   },
   "dependencies": {
     "@grpc/grpc-js": "^1.10.0",

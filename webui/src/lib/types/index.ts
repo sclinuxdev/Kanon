@@ -20,7 +20,14 @@ export interface RealtimeSection {
   event_subscribers: number;
 }
 
+export interface InstanceSection {
+  total: number;
+  enabled: number;
+}
+
 export interface NodeHealth {
+  /** Bot instance gate: an adapter answers nothing until an instance claims it. */
+  instances: InstanceSection;
   status: string;
   version: string;
   uptime_seconds: number;
@@ -68,6 +75,48 @@ export interface SystemConfig {
   webhook: WebhookConfig;
   llm: LlmConfig;
   environment: EnvironmentConfig;
+}
+
+// Bot instance types
+export interface AdapterStatus {
+  platform: string;
+  /** Whether the node knows this platform at all (catches typos). */
+  known: boolean;
+  connected: boolean;
+  display_name: string | null;
+  kind: 'builtin' | 'plugin' | null;
+}
+
+export interface BotInstanceView {
+  id: string;
+  name: string;
+  enabled: boolean;
+  adapters: string[];
+  persona_id: string | null;
+  system_prompt: string | null;
+  model: string | null;
+  adapter_status: AdapterStatus[];
+}
+
+export interface InstancesResponse {
+  total: number;
+  enabled: number;
+  instances: BotInstanceView[];
+}
+
+export interface InstanceRequest {
+  name: string;
+  enabled: boolean;
+  adapters: string[];
+  persona_id?: string | null;
+  system_prompt?: string | null;
+  model?: string | null;
+}
+
+export interface InstanceMutationResponse {
+  applied: boolean;
+  message: string;
+  instance: BotInstanceView | null;
 }
 
 // Provider & Models types
@@ -147,14 +196,34 @@ export interface ToolDescriptor {
   parameters?: Record<string, unknown>;
 }
 
+export interface HostHealth {
+  /** `running`, `restarting`, `crashed` or `disabled`. */
+  state: 'running' | 'restarting' | 'crashed' | 'disabled' | string;
+  /** Automatic restarts performed by the supervisor watchdog since node start. */
+  restarts: number;
+  last_error: string | null;
+}
+
 export interface PluginMeta {
   id: string;
   name: string;
   version: string;
   description?: string;
   status?: string;
+  /** Whether the operator allows this plugin to run (disabling stops its host process). */
+  enabled: boolean;
+  /** Watchdog health, present when the plugin has a host process. */
+  health?: HostHealth | null;
   commands: CommandDescriptor[];
   tools: ToolDescriptor[];
+}
+
+export interface PluginStateResponse {
+  applied: boolean;
+  message: string;
+  plugin_id: string;
+  enabled: boolean;
+  host_id: string | null;
 }
 
 export interface PluginHost {
@@ -226,8 +295,16 @@ export interface SessionsResponse {
 }
 
 export interface PersonaItem {
+  /** Identifier used by the session and instance persona fields. */
+  id: string;
   name: string;
-  system_prompt: string;
+  description: string;
+  /** Raw prompt template, including `{{variable}}` slots. */
+  template: string;
+  variables: string[];
+  required_variables: string[];
+  default_temperature: number | null;
+  default_model: string | null;
 }
 
 export interface PersonasResponse {
@@ -270,7 +347,15 @@ export interface PipelineEventPayload {
 }
 
 export interface TraceRecord {
+  /**
+   * Node-local render key, assigned by the store.
+   *
+   * Never the server's bus sequence: that counter restarts with the core while the store keeps
+   * records across reconnects, and a duplicate keyed-`{#each}` key breaks rendering.
+   */
   seq: number;
+  /** Server-assigned sequence, retained for diagnostics only. */
+  server_seq?: number;
   timestamp_ms: number;
   event: PipelineEventPayload;
 }

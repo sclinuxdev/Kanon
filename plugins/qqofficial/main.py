@@ -27,7 +27,7 @@ for p in (str(_current_dir), _sdk_path):
         sys.path.insert(0, p)
 
 import botpy
-from kanon_sdk import CoreHandle, Plugin, PluginContext, connect_core_channel, tool
+from kanon_sdk import CoreHandle, Plugin, PluginContext, action, connect_core_channel
 from kanon_sdk.host import KanonHost
 from kanon_sdk.proto import pb, pb_grpc
 
@@ -249,9 +249,8 @@ class QQOfficialAdapter(Plugin):
 
     # --- WebUI Management Tools ----------------------------------------------
 
-    @tool(
+    @action(
         name="qq_request_login_qr",
-        description="Requests a QR code binding task for QQ Official Bot credentials setup",
         parameters={
             "type": "object",
             "properties": {
@@ -273,9 +272,8 @@ class QQOfficialAdapter(Plugin):
             "poll_interval_seconds": registration.interval,
         }
 
-    @tool(
+    @action(
         name="qq_poll_login_result",
-        description="Polls a QR code binding task once, returning credentials on confirmation",
         parameters={
             "type": "object",
             "properties": {

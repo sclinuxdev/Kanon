@@ -6,6 +6,8 @@ import warnings
 try:
     from . import plugin_pb2 as plugin__pb2
 except ImportError:
+    # The generated module is also imported as a top-level module by plugin processes that put
+    # the proto directory itself on sys.path; keep both import styles working.
     import plugin_pb2 as plugin__pb2
 
 GRPC_GENERATED_VERSION = '1.84.0'
@@ -53,6 +55,11 @@ class PluginHostServiceStub:
                 request_serializer=plugin__pb2.GetPluginMetaRequest.SerializeToString,
                 response_deserializer=plugin__pb2.GetPluginMetaResponse.FromString,
                 _registered_method=True)
+        self.InvokeAction = channel.unary_unary(
+                '/kanon.plugin.v1.PluginHostService/InvokeAction',
+                request_serializer=plugin__pb2.PluginActionRequest.SerializeToString,
+                response_deserializer=plugin__pb2.PluginActionResponse.FromString,
+                _registered_method=True)
 
 
 class PluginHostServiceServicer:
@@ -77,6 +84,18 @@ class PluginHostServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def InvokeAction(self, request, context):
+        """Management action invoked by the control plane.
+
+        Actions are the console counterpart of tools: credential binding, QR login and diagnostics
+        are operations an operator triggers, not functions the model may call. Adapter plugins must
+        expose such operations here so that their tool list stays empty — an adapter's tools would
+        otherwise be offered to the LLM, which then tries to bind credentials mid-conversation.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_PluginHostServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -94,6 +113,11 @@ def add_PluginHostServiceServicer_to_server(servicer, server):
                     servicer.GetPluginMeta,
                     request_deserializer=plugin__pb2.GetPluginMetaRequest.FromString,
                     response_serializer=plugin__pb2.GetPluginMetaResponse.SerializeToString,
+            ),
+            'InvokeAction': grpc.unary_unary_rpc_method_handler(
+                    servicer.InvokeAction,
+                    request_deserializer=plugin__pb2.PluginActionRequest.FromString,
+                    response_serializer=plugin__pb2.PluginActionResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -178,6 +202,33 @@ class PluginHostService:
             '/kanon.plugin.v1.PluginHostService/GetPluginMeta',
             plugin__pb2.GetPluginMetaRequest.SerializeToString,
             plugin__pb2.GetPluginMetaResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def InvokeAction(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kanon.plugin.v1.PluginHostService/InvokeAction',
+            plugin__pb2.PluginActionRequest.SerializeToString,
+            plugin__pb2.PluginActionResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -476,6 +527,11 @@ class BotApiServiceStub:
                 request_serializer=plugin__pb2.GetStorageRequest.SerializeToString,
                 response_deserializer=plugin__pb2.GetStorageResponse.FromString,
                 _registered_method=True)
+        self.Ping = channel.unary_unary(
+                '/kanon.plugin.v1.BotApiService/Ping',
+                request_serializer=plugin__pb2.PingRequest.SerializeToString,
+                response_deserializer=plugin__pb2.PingResponse.FromString,
+                _registered_method=True)
 
 
 class BotApiServiceServicer:
@@ -518,6 +574,18 @@ class BotApiServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Ping(self, request, context):
+        """Liveness probe answered by the core itself, without touching the pipeline.
+
+        Hosts use it to notice that the core they registered with has exited: a host whose core is
+        gone must stop, otherwise it keeps serving its platform (and, for adapters, keeps the
+        platform's long-lived connection) while no bot instance can answer — which shows up as a
+        ghost bot double-handling messages.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_BotApiServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -550,6 +618,11 @@ def add_BotApiServiceServicer_to_server(servicer, server):
                     servicer.GetStorage,
                     request_deserializer=plugin__pb2.GetStorageRequest.FromString,
                     response_serializer=plugin__pb2.GetStorageResponse.SerializeToString,
+            ),
+            'Ping': grpc.unary_unary_rpc_method_handler(
+                    servicer.Ping,
+                    request_deserializer=plugin__pb2.PingRequest.FromString,
+                    response_serializer=plugin__pb2.PingResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -715,6 +788,33 @@ class BotApiService:
             '/kanon.plugin.v1.BotApiService/GetStorage',
             plugin__pb2.GetStorageRequest.SerializeToString,
             plugin__pb2.GetStorageResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Ping(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/kanon.plugin.v1.BotApiService/Ping',
+            plugin__pb2.PingRequest.SerializeToString,
+            plugin__pb2.PingResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -290,29 +290,33 @@ async fn qqofficial_login_qr(
 ) -> Result<Json<QqQrResponse>, ApiError> {
     const QQ_PLUGIN_ID: &str = "org.kanon.adapter.qqofficial";
 
-    // Step 1: Delegate to running plugin host via gRPC Tool Calling if available
+    // Step 1: Delegate to the running adapter host through the management-action channel.
+    //
+    // Credential binding is an operator action, not an LLM tool: the adapter plugin declares no
+    // tools at all, so its binding operations can never be advertised to the model.
     if let Some(host) = state.supervisor().find_host_for_plugin(QQ_PLUGIN_ID).await {
         let args = serde_json::json!({
             "bind_host": body.bind_host,
         });
-        let req = kanon_proto::v1::ToolCallRequest {
-            call_id: generate_event_id(),
-            tool_name: "qq_request_login_qr".to_string(),
-            session_id: "system-login".to_string(),
-            payload: Some(kanon_proto::v1::tool_call_request::Payload::StructuredArgs(
-                kanon_llm::tool_router::json_to_prost_struct(&args).unwrap_or_default(),
-            )),
+        let req = kanon_proto::v1::PluginActionRequest {
+            plugin_id: QQ_PLUGIN_ID.to_string(),
+            action: "qq_request_login_qr".to_string(),
+            parameters: Some(kanon_llm::tool_router::json_to_prost_struct(&args).unwrap_or_default()),
         };
-        if let Ok(resp) = host.on_call_tool(req).await {
+        if let Ok(resp) = host.invoke_action(req).await {
             if resp.success {
-                if let Some(kanon_proto::v1::tool_call_response::Payload::StructuredResult(res)) =
-                    resp.payload
-                {
-                    let val = kanon_llm::tool_router::prost_struct_to_json(res);
+                if let Some(result) = resp.result {
+                    let val = kanon_llm::tool_router::prost_struct_to_json(result);
                     if let Ok(qr_resp) = serde_json::from_value::<QqQrResponse>(val) {
                         return Ok(Json(qr_resp));
                     }
                 }
+            } else if !resp.error_message.is_empty() {
+                tracing::warn!(
+                    plugin_id = %QQ_PLUGIN_ID,
+                    error = %resp.error_message,
+                    "QQ binding action failed; falling back to direct HTTP binding"
+                );
             }
         }
     }
@@ -396,26 +400,21 @@ async fn qqofficial_login_poll(
 ) -> Result<Json<QqPollResponse>, ApiError> {
     const QQ_PLUGIN_ID: &str = "org.kanon.adapter.qqofficial";
 
-    // Step 1: Delegate to running plugin host via gRPC Tool Calling if available
+    // Step 1: Delegate to the running adapter host through the management-action channel.
     if let Some(host) = state.supervisor().find_host_for_plugin(QQ_PLUGIN_ID).await {
         let args = serde_json::json!({
             "task_id": body.task_id,
             "bind_key": body.bind_key,
         });
-        let req = kanon_proto::v1::ToolCallRequest {
-            call_id: generate_event_id(),
-            tool_name: "qq_poll_login_result".to_string(),
-            session_id: "system-login".to_string(),
-            payload: Some(kanon_proto::v1::tool_call_request::Payload::StructuredArgs(
-                kanon_llm::tool_router::json_to_prost_struct(&args).unwrap_or_default(),
-            )),
+        let req = kanon_proto::v1::PluginActionRequest {
+            plugin_id: QQ_PLUGIN_ID.to_string(),
+            action: "qq_poll_login_result".to_string(),
+            parameters: Some(kanon_llm::tool_router::json_to_prost_struct(&args).unwrap_or_default()),
         };
-        if let Ok(resp) = host.on_call_tool(req).await {
+        if let Ok(resp) = host.invoke_action(req).await {
             if resp.success {
-                if let Some(kanon_proto::v1::tool_call_response::Payload::StructuredResult(res)) =
-                    resp.payload
-                {
-                    let val = kanon_llm::tool_router::prost_struct_to_json(res);
+                if let Some(result) = resp.result {
+                    let val = kanon_llm::tool_router::prost_struct_to_json(result);
                     if let Ok(mut poll_resp) = serde_json::from_value::<QqPollResponse>(val) {
                         if poll_resp.status == "created" && body.auto_save {
                             if let (Some(appid), Some(secret)) =
@@ -429,6 +428,12 @@ async fn qqofficial_login_poll(
                         return Ok(Json(poll_resp));
                     }
                 }
+            } else if !resp.error_message.is_empty() {
+                tracing::warn!(
+                    plugin_id = %QQ_PLUGIN_ID,
+                    error = %resp.error_message,
+                    "QQ binding poll action failed; falling back to direct HTTP polling"
+                );
             }
         }
     }

@@ -119,8 +119,28 @@ $effect(() => {
     </div>
   </div>
 
-  <!-- Secondary Stats Row (Supervisor hosts, active sessions, realtime) -->
-  <div class="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
+  <!-- Secondary Stats Row (bot instances, supervisor hosts, active sessions, realtime) -->
+  <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+    <div
+      class="p-3 border rounded-lg flex items-center justify-between font-mono text-xs shadow-2xs
+        {(nodeStore.health?.instances?.enabled ?? 0) > 0
+        ? 'bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800'
+        : 'bg-amber-50 dark:bg-amber-950/30 border-amber-300 dark:border-amber-800'}"
+      title={t('overview.instances_hint')}
+    >
+      <div class="flex items-center gap-2">
+        <Bot
+          class="w-4 h-4 {(nodeStore.health?.instances?.enabled ?? 0) > 0
+            ? 'text-emerald-500'
+            : 'text-amber-500'}"
+        />
+        <span class="text-zinc-500">{t('overview.instances_enabled')}:</span>
+      </div>
+      <span class="font-semibold text-zinc-900 dark:text-zinc-100">
+        {nodeStore.health?.instances?.enabled ?? 0} / {nodeStore.health?.instances?.total ?? 0}
+      </span>
+    </div>
+
     <div class="p-3 bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg flex items-center justify-between font-mono text-xs shadow-2xs">
       <div class="flex items-center gap-2">
         <Boxes class="w-4 h-4 text-zinc-400" />

@@ -177,7 +177,7 @@ async fn test_tool_router_successful_tool_loop() {
     let router = ToolRouter::new(mock_provider, memory.clone(), "test-model");
 
     let tool_meta = ToolMeta {
-        name: "add_numbers".to_string(),
+            name: "add_numbers".to_string(),
         description: "Adds two floating numbers".to_string(),
         parameters: json_to_prost_struct(&serde_json::json!({
             "type": "object",
@@ -237,7 +237,7 @@ async fn test_tool_router_max_recursion_limit() {
     let router = ToolRouter::new(mock_provider, memory, "test-model").with_max_iterations(2);
 
     let tool_meta = ToolMeta {
-        name: "add_numbers".to_string(),
+            name: "add_numbers".to_string(),
         description: "Adds numbers".to_string(),
         parameters: None,
     };
@@ -277,17 +277,17 @@ async fn test_aggregate_tools_disambiguates_duplicate_names() {
     use kanon_llm::tool_router::aggregate_tools;
 
     let tool_a = ToolMeta {
-        name: "search".to_string(),
+            name: "search".to_string(),
         description: "Search weather reports".to_string(),
         parameters: None,
     };
     let tool_b = ToolMeta {
-        name: "search".to_string(),
+            name: "search".to_string(),
         description: "Search github repositories".to_string(),
         parameters: None,
     };
     let unique_tool = ToolMeta {
-        name: "calc".to_string(),
+            name: "calc".to_string(),
         description: "Unique calculator tool".to_string(),
         parameters: None,
     };
@@ -333,12 +333,12 @@ async fn test_tool_router_namespaced_duplicate_dispatch() {
     let router = ToolRouter::new(mock_provider, memory, "test-model");
 
     let tool_a = ToolMeta {
-        name: "search".to_string(),
+            name: "search".to_string(),
         description: "Search weather reports".to_string(),
         parameters: None,
     };
     let tool_b = ToolMeta {
-        name: "search".to_string(),
+            name: "search".to_string(),
         description: "Search github repositories".to_string(),
         parameters: None,
     };
@@ -361,6 +361,3 @@ async fn test_tool_router_namespaced_duplicate_dispatch() {
     assert_eq!(output.executed_tools[0].plugin_id, "org.github");
     assert_eq!(output.executed_tools[0].host_id, "host_github");
 }
-
-
-

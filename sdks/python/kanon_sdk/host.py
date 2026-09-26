@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Optional, Union
 
 import grpc
+from google.protobuf.json_format import MessageToDict
 
 from kanon_sdk.context import CoreHandle, PluginContext
-from kanon_sdk.ipc import connect_core_channel
+from kanon_sdk.ipc import CoreWatchdog, connect_core_channel
 from kanon_sdk.plugin import Plugin
 from kanon_sdk.proto import pb, pb_grpc
 
@@ -58,6 +59,18 @@ class HostServiceImpl(pb_grpc.PluginHostServiceServicer):
             success=True,
             error_message="",
             applied_version=request.version,
+        )
+
+    async def InvokeAction(
+        self,
+        request: pb.PluginActionRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.PluginActionResponse:
+        """Serves a control-plane management action (never reachable from the LLM)."""
+        return await self.plugin.on_invoke_action(
+            request.plugin_id,
+            request.action,
+            MessageToDict(request.parameters) if request.HasField("parameters") else {},
         )
 
     async def GetPluginMeta(
@@ -180,7 +193,9 @@ class KanonHost:
         print(f"Kanon Python Host running on {self.socket_path}", flush=True)
 
         core_channel: Optional[grpc.aio.Channel] = None
+        core_stub: Optional[pb_grpc.BotApiServiceStub] = None
         core_handle: Optional[CoreHandle] = None
+        watchdog: Optional[CoreWatchdog] = None
 
         if self.core_sock:
             if self.core_sock.exists():
@@ -249,12 +264,25 @@ class KanonHost:
                     loop.add_signal_handler(sig, handle_signal)
                 except (NotImplementedError, RuntimeError):
                     pass
-
-            await stop_event.wait()
         else:
-            await shutdown_event.wait()
+            # The caller owns the stop event; a lost core must be able to trigger it too.
+            stop_event = shutdown_event
+
+        # A host whose core is gone must not keep serving its platform: otherwise it becomes a
+        # ghost bot that double-handles messages once a new core starts. See CoreWatchdog.
+        if core_stub is not None:
+            def _core_lost(reason: str) -> None:
+                print(f"[kanon-host] {reason}", flush=True)
+                stop_event.set()
+
+            watchdog = CoreWatchdog(core_stub, pb, on_lost=_core_lost)
+            watchdog.start()
+
+        await stop_event.wait()
 
         # Graceful shutdown
+        if watchdog is not None:
+            await watchdog.stop()
         await self.plugin.on_unload()
         await server.stop(grace=1.0)
         if core_channel is not None:

@@ -12,6 +12,10 @@
 //! | `GET` | `/api/v1/metrics` | Prometheus text exposition |
 //! | `GET` | `/api/v1/adapters` | Platform adapter catalog (built-in and plugin) |
 //! | `POST` | `/api/v1/adapters/:platform/ingest` | Fast-ACK inbound message ingress |
+//! | `GET` | `/api/v1/instances` | Bot instances gating and partitioning inbound traffic |
+//! | `POST` | `/api/v1/instances` | Create a bot instance |
+//! | `PUT` | `/api/v1/instances/{id}` | Update a bot instance (adapters, persona, model) |
+//! | `DELETE` | `/api/v1/instances/{id}` | Delete a bot instance |
 //! | `GET` | `/api/v1/plugins` | Plugin and host catalog |
 //! | `GET` | `/api/v1/plugins/:id/config` | Current values plus declaration schema |
 //! | `PUT` | `/api/v1/plugins/:id/config` | Validate, hot reload, then persist |
@@ -28,6 +32,7 @@
 pub mod adapters;
 pub mod chat;
 pub mod health;
+pub mod instances;
 pub mod metrics;
 pub mod personas;
 pub mod plugins;
@@ -46,6 +51,7 @@ pub fn api_router() -> Router<ApiState> {
         .merge(health::routes())
         .merge(metrics::routes())
         .merge(adapters::routes())
+        .merge(instances::routes())
         .merge(plugins::routes())
         .merge(sessions::routes())
         .merge(personas::routes())

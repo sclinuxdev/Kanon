@@ -8,12 +8,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use kanon_core::instance::{InstanceDraft, InstanceRegistry, ItemPolicy};
 use kanon_core::skill::{MAX_SKILL_BYTES, ReadSkillTool, SkillCatalogHook, SkillError, SkillStore};
 use kanon_core::toggle::{SKILL_SECTION, ToggleStore};
-use kanon_llm::agent::AgentHook;
-use kanon_llm::agent::AgentTool;
-use kanon_llm::gateway::types::{ChatMessage, ChatRequest, Role};
+use kanon_llm::agent::{Agent, AgentHook, AgentTool};
+use kanon_llm::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role};
+use kanon_llm::memory::SlidingWindowMemory;
+use kanon_llm::{GatewayError, LlmProvider, PersonaRegistry, SessionManager};
 
 /// Writes one installable skill and returns the store root.
 fn write_skill(root: &Path, id: &str, description: &str, body: &str) {
@@ -219,4 +221,75 @@ async fn read_skill_enforces_the_instance_override() {
         .err()
         .expect("name is required");
     assert!(missing.contains("name"), "{missing}");
+}
+
+/// Provider that records the messages of the request the agent actually sends.
+struct RecordingProvider {
+    seen: std::sync::Arc<std::sync::Mutex<Vec<ChatMessage>>>,
+}
+
+#[async_trait]
+impl LlmProvider for RecordingProvider {
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, GatewayError> {
+        *self.seen.lock().expect("recording lock") = request.messages.clone();
+        Ok(ChatResponse {
+            content: Some("ok".to_string()),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn the_skill_catalog_reaches_the_model_alongside_the_persona() {
+    // End-to-end version of the hook-order guarantee: with the real catalog hook registered the
+    // way the node registers it, a conversation that has no system prompt yet must still receive
+    // both the persona and the catalog. Injecting the catalog without this test is how it went
+    // missing in production.
+    let dir = tempfile::tempdir().expect("temp dir");
+    write_skill(dir.path(), "alpha", "Alpha description", "Alpha body");
+    let store = Arc::new(SkillStore::new(dir.path()));
+    let toggles = Arc::new(ToggleStore::in_memory());
+    let registry = Arc::new(InstanceRegistry::default());
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let memory = Arc::new(SlidingWindowMemory::new(20));
+    let sessions = Arc::new(SessionManager::new(memory.clone()));
+    let personas = Arc::new(PersonaRegistry::default());
+    sessions.set_persona("instance:ai:group:1:user:1#0", "assistant");
+
+    let agent = Agent::builder(
+        "catalog-integration",
+        Arc::new(RecordingProvider { seen: seen.clone() }),
+    )
+    .memory(memory)
+    .session_manager(sessions)
+    .persona_registry(personas)
+    .hook(SkillCatalogHook::new(store, toggles, registry))
+    .model("test-model")
+    .build();
+
+    agent
+        .run("instance:ai:group:1:user:1#0", "你好", &[])
+        .await
+        .expect("agent run");
+
+    let messages = seen.lock().expect("recording lock").clone();
+    let system_messages: Vec<&str> = messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .filter_map(|message| message.content.as_deref())
+        .collect();
+
+    assert!(
+        system_messages
+            .iter()
+            .any(|content| content.contains("Alpha description")),
+        "the catalog must be in the request: {system_messages:?}"
+    );
+    assert!(
+        system_messages
+            .iter()
+            .any(|content| content.contains("Kanon")),
+        "the persona must still be the base system message: {system_messages:?}"
+    );
 }

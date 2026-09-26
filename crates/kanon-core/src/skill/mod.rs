@@ -462,6 +462,15 @@ impl kanon_llm::agent::AgentHook for SkillCatalogHook {
         let allowed =
             allowed_skills(&self.store, &self.toggles, &self.instances, instance_id).await;
 
+        // Debug-level: the console shows the effective catalog through /api/v1/skills, but an
+        // operator chasing "why does the model not know my skill" needs the request-time view.
+        tracing::debug!(
+            session_id = %session_id,
+            instance_id = ?instance_id,
+            allowed = allowed.len(),
+            "Skill catalog evaluated for LLM request"
+        );
+
         let catalog = catalog_prompt(&allowed);
         if catalog.is_empty() {
             return Ok(());

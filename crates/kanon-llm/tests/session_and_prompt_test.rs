@@ -17,6 +17,88 @@ use kanon_llm::prompt::{
 };
 use kanon_llm::session::{SessionKey, SessionManager, SessionScope, SessionStatus};
 
+/// Hook that appends one system message, standing in for the skill catalog / RAG style hooks.
+struct AppendingHook;
+
+#[async_trait]
+impl kanon_llm::agent::AgentHook for AppendingHook {
+    async fn on_llm_request(
+        &self,
+        _session_id: &str,
+        request: &mut ChatRequest,
+    ) -> Result<(), kanon_llm::AgentError> {
+        let position = request
+            .messages
+            .iter()
+            .rposition(|message| message.role == Role::System)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        request
+            .messages
+            .insert(position, ChatMessage::system("INJECTED-CONTEXT"));
+        Ok(())
+    }
+}
+
+/// Provider that records the messages of the request it receives.
+struct RecordingProvider {
+    seen: Arc<std::sync::Mutex<Vec<ChatMessage>>>,
+}
+
+#[async_trait]
+impl LlmProvider for RecordingProvider {
+    async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, GatewayError> {
+        *self.seen.lock().expect("recording lock") = request.messages.clone();
+        Ok(ChatResponse {
+            content: Some("ok".to_string()),
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test]
+async fn injected_system_context_survives_the_persona_hook() {
+    // The persona hook rewrites the first system message in place. If it ran *after* a hook that
+    // appends context, the injected context would be overwritten — which is exactly how the skill
+    // catalog silently disappeared for sessions that had no system prompt yet.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let memory = Arc::new(SlidingWindowMemory::new(20));
+    let sessions = Arc::new(SessionManager::new(memory.clone()));
+    let personas = Arc::new(PersonaRegistry::default());
+    sessions.set_persona("session-1", "assistant");
+
+    let agent = Agent::builder(
+        "hook-order",
+        Arc::new(RecordingProvider { seen: seen.clone() }),
+    )
+    .memory(memory)
+    .session_manager(sessions)
+    .persona_registry(personas)
+    .hook(AppendingHook)
+    .model("test-model")
+    .build();
+
+    agent.run("session-1", "hello", &[]).await.expect("run");
+
+    let messages = seen.lock().expect("recording lock").clone();
+    assert_eq!(
+        messages.len(),
+        3,
+        "persona + injected context + user: {messages:?}"
+    );
+    assert_eq!(messages[0].role, Role::System);
+    assert!(
+        messages[0]
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("Kanon")),
+        "the persona must own the base system message: {messages:?}"
+    );
+    assert_eq!(messages[1].role, Role::System);
+    assert_eq!(messages[1].content.as_deref(), Some("INJECTED-CONTEXT"));
+    assert_eq!(messages[2].role, Role::User);
+}
+
 // =========================================================================
 // 1. Session Management Tests
 // =========================================================================

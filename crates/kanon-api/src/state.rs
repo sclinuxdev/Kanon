@@ -438,8 +438,13 @@ impl ApiStateBuilder {
         let slot = self
             .agent_slot
             .unwrap_or_else(|| Arc::new(AgentSlot::new()));
-        let mut hooks: Vec<Arc<dyn kanon_llm::AgentHook>> = vec![observability.events.clone()];
+        // Order is semantic, not cosmetic:
+        // 1. operator-registered hooks (skill catalog, RAG, ...) add their context;
+        // 2. the trace hook runs last so `llm_request.message_count` describes the request the
+        //    provider actually receives, injection included.
+        let mut hooks: Vec<Arc<dyn kanon_llm::AgentHook>> = Vec::new();
         hooks.extend(self.hooks);
+        hooks.push(observability.events.clone());
         let factory = Arc::new(AgentFactory::new(
             "kanon-core",
             slot.clone(),

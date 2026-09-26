@@ -1109,11 +1109,17 @@ impl AgentBuilder {
         if let Some(ref session_mgr) = self.session_manager
             && let Some(ref persona_reg) = self.persona_registry
         {
-            self.hooks
-                .push(Arc::new(crate::prompt::DynamicPromptHook::new(
+            // The persona hook *owns* the base system message: it overwrites the first system
+            // message in place. Registered first, it can therefore never clobber a system message
+            // another hook injected — a hook that appends context (the skill catalog, RAG, ...)
+            // would otherwise be silently discarded whenever the session had no system prompt yet.
+            self.hooks.insert(
+                0,
+                Arc::new(crate::prompt::DynamicPromptHook::new(
                     session_mgr.clone(),
                     persona_reg.clone(),
-                )));
+                )),
+            );
         }
 
         if let Some(summary_cfg) = self.summary_config

@@ -22,12 +22,18 @@ use serde_json::{Value, json};
 #[derive(Default)]
 struct ToolRecorder {
     offered: std::sync::Mutex<Vec<String>>,
+    messages: std::sync::Mutex<Vec<kanon_llm::gateway::types::ChatMessage>>,
 }
 
 impl ToolRecorder {
     /// Tool names offered by the most recent request.
     fn offered(&self) -> Vec<String> {
         self.offered.lock().expect("recorder lock").clone()
+    }
+
+    /// Messages of the most recent request.
+    fn messages(&self) -> Vec<kanon_llm::gateway::types::ChatMessage> {
+        self.messages.lock().expect("recorder lock").clone()
     }
 }
 
@@ -36,6 +42,7 @@ impl LlmProvider for ToolRecorder {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, GatewayError> {
         *self.offered.lock().expect("recorder lock") =
             request.tools.iter().map(|tool| tool.name.clone()).collect();
+        *self.messages.lock().expect("recorder lock") = request.messages.clone();
         Ok(ChatResponse {
             content: Some("recorded".to_string()),
             ..Default::default()
@@ -64,10 +71,24 @@ async fn extension_state_recording(root: &Path) -> (ApiState, Arc<ToolRecorder>)
             .expect("mcp config"),
     );
 
+    // Mirrors the node's composition root: the same store backing the `read_skill` tool and the
+    // catalog hook, so a test exercises the wiring the running node actually uses.
+    let instances = Arc::new(kanon_core::InstanceRegistry::default());
     let state = ApiState::builder(supervisor)
         .with_config_dir(root.join("config"))
-        .with_skill_store(skills)
-        .with_plugin_state(toggles)
+        .with_skill_store(skills.clone())
+        .with_plugin_state(toggles.clone())
+        .with_instances(instances.clone())
+        .with_native_tools(vec![Arc::new(kanon_core::ReadSkillTool::new(
+            skills.clone(),
+            toggles.clone(),
+            instances.clone(),
+        ))])
+        .with_hooks(vec![Arc::new(kanon_core::SkillCatalogHook::new(
+            skills.clone(),
+            toggles.clone(),
+            instances.clone(),
+        ))])
         .with_mcp_config(mcp_config)
         .with_mcp_pool(Arc::new(McpPool::new()))
         .with_llm_provider(
@@ -499,4 +520,50 @@ async fn mcp_rejects_unknown_servers_and_bad_identifiers() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn a_chat_turn_carries_the_persona_and_the_skill_catalog() {
+    // Regression guard for the real request composition: the skill catalog is injected as its own
+    // system message, and the persona hook must not overwrite it. This test drives the HTTP route,
+    // so it also covers the wiring between the state builder, the factory and the agent.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (state, recorder) = extension_state_recording(dir.path()).await;
+    let app = kanon_api::app(state);
+
+    let source = write_skill_source(dir.path(), "probe-skill", "PROBE-CATALOG-MARKER");
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/skills",
+        Some(json!({ "path": source.to_string_lossy(), "id": "probe" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/chat/completions",
+        Some(json!({ "session_id": "context-probe", "message": "hi", "tools": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let messages = recorder.messages();
+    let systems: Vec<&str> = messages
+        .iter()
+        .filter(|message| message.role == kanon_llm::gateway::types::Role::System)
+        .filter_map(|message| message.content.as_deref())
+        .collect();
+
+    assert_eq!(
+        systems.len(),
+        2,
+        "persona plus skill catalog, got {messages:?}"
+    );
+    assert!(
+        systems.iter().any(|c| c.contains("PROBE-CATALOG-MARKER")),
+        "the catalog must be in the request: {systems:?}"
+    );
 }

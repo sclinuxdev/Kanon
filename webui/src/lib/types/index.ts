@@ -232,6 +232,31 @@ export interface PluginMeta {
   tools: ToolDescriptor[];
 }
 
+/** Where one callable tool comes from. */
+export type ToolSource = 'builtin' | 'plugin' | 'mcp';
+
+/** One tool the model can call, with the provider that exposes it. */
+export interface ToolItem {
+  /** Name the model must use when calling the tool. */
+  name: string;
+  description: string;
+  source: ToolSource;
+  /** Plugin id, MCP server id, or `kanon-core` for builtins. */
+  provider_id: string;
+  /** Host process exposing the tool; absent for builtins. */
+  host_id?: string;
+  /** JSON Schema of the accepted arguments. */
+  parameters: Record<string, unknown>;
+}
+
+export interface ToolCatalog {
+  total: number;
+  builtin: number;
+  plugin: number;
+  mcp: number;
+  tools: ToolItem[];
+}
+
 /** An installed skill and its node-wide switch. */
 export interface SkillItem {
   id: string;

@@ -321,8 +321,24 @@ async fn test_aggregate_tools_disambiguates_duplicate_names() {
         vec![tool_b, unique_tool],
     ));
 
-    let defs = aggregate_tools(&[host_a, host_b]);
+    let hosts: Vec<Arc<dyn ToolHost>> = vec![host_a, host_b];
+    let defs = aggregate_tools(&hosts);
     assert_eq!(defs.len(), 3);
+
+    // The attributed form is what the console renders; it must agree with the model's view name by
+    // name, which is why both go through one implementation.
+    let resolved = kanon_llm::tool_router::resolve_tools(&hosts);
+    let projected: Vec<_> = resolved
+        .iter()
+        .map(|tool| tool.definition.clone())
+        .collect();
+    assert_eq!(projected, defs);
+    let github = resolved
+        .iter()
+        .find(|tool| tool.definition.name == "org_github__search")
+        .expect("namespaced tool");
+    assert_eq!(github.plugin_id, "org.github");
+    assert_eq!(github.host_id, "host_github");
 
     let names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
     // Unique tool remains bare

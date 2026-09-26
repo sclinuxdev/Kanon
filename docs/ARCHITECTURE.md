@@ -608,6 +608,8 @@ Rust 核心全权主导 LLM 的生命周期与推理编排，确保高并发下�
 | 全局 | `data/toggles.json` 的 `plugins` / `skills` / `mcp` 分区 | 运维总闸；停用即彻底不可用 |
 | 实例 | `BotInstance` 的 `plugins` / `skills` / `mcp` 覆盖表（`inherit` / `enable` / `disable`） | 仅能进一步限制，**不能**复活被全局停用的项 |
 
+控制台的"工具列表"页签通过 `GET /api/v1/tools` 展示三类来源的合并结果：内置工具（`read_skill` 等，直接来自 Agent 的原生工具表）、运行中插件宿主声明的工具，以及已启用 MCP 服务器通告的工具；插件与 MCP 工具经由同一个 `resolve_tools` 解析，因此控制台显示的名称与模型收到的名称由构造保证一致（含重名时的 `plugin__tool` 命名空间）。被全局关闭的 MCP 服务器不会出现在其中——该接口列出的是"此刻真的可调用"的工具。
+
 流水线在实例门禁之后立即按该策略过滤插件宿主（`PreFilter`、内置/插件命令、工具聚合因此同时生效），MCP 与技能策略则在聚合工具与构建技能目录时求值。策略通过会话键中的实例标识解析，因此共享同一 Agent 的不同实例不会串用彼此的工具与技能。
 
 ### 8.5 Tool Calling 跨语言执行状态机闭环
@@ -656,6 +658,7 @@ sequenceDiagram
 | `PUT` | `/api/v1/plugins/{id}/config` | 校验配置 → 检查 CAS 乐观锁版本向量 → 触发跨进程热重载 → 原子持久化（版本冲突返回 409，宿主拒绝则不落盘） |
 | `POST` | `/api/v1/plugins/{id}/restart` | 重启指定插件所在的宿主进程（依赖 Supervisor 记录的启动配方） |
 | `POST` | `/api/v1/plugins/{id}/actions/{action}` | 触发插件的**管理动作**（运维操作，永不进入模型的函数列表；区别于 `tools`） |
+| `GET` | `/api/v1/tools` | 列出模型当前可调用的**全部工具**及其提供方（内置 / 插件 / MCP），名称与分发规则和模型实际收到的完全一致 |
 | `GET` | `/api/v1/sessions` | 分页查询会话元数据（Turn 计数、Token 消耗、活跃时间、Persona、作用域） |
 | `POST` | `/api/v1/sessions/{id}/reset` | 安全重置会话历史，保留配置变量与人设 |
 | `POST` | `/api/v1/sessions/{id}/persona` | 动态热切换指定会话的生效人设 |

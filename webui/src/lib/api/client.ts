@@ -28,6 +28,7 @@ import type {
   SystemConfig,
   TestProviderRequest,
   TestProviderResponse,
+  ToolCatalog,
   UpsertMcpServerRequest,
 } from '../types';
 
@@ -187,6 +188,9 @@ export const api = {
         }),
       },
     ),
+  // Tool catalog: every tool the model can call, grouped by provider.
+  getTools: () => request<ToolCatalog>('/api/v1/tools'),
+
   // Skills: installed instruction bundles the model pulls in through `read_skill`.
   getSkills: () => request<SkillCatalog>('/api/v1/skills'),
   setSkillEnabled: (skillId: string, enabled: boolean) =>

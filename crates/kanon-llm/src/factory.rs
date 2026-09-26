@@ -82,6 +82,14 @@ impl AgentFactory {
         &self.slot
     }
 
+    /// Native in-process tools shared by every agent (e.g. `read_skill`).
+    ///
+    /// Exposed so the management gateway can list every tool the node offers, including the ones
+    /// that never come from a plugin host.
+    pub fn native_tools(&self) -> &[Arc<dyn AgentTool>] {
+        &self.tools
+    }
+
     /// Conversation memory shared by every agent.
     pub fn memory(&self) -> &Arc<dyn Memory> {
         &self.memory

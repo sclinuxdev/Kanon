@@ -80,11 +80,25 @@ pub fn namespaced_tool_name(plugin_id: &str, tool_name: &str) -> String {
     format!("{}__{}", sanitize_tool_identifier(plugin_id), tool_name)
 }
 
-/// Dynamically aggregates tool definitions declared across all active plugin hosts.
+/// One tool definition together with the provider it came from.
+///
+/// The management gateway needs the attribution to show an operator *where* a tool comes from;
+/// [`aggregate_tools`] deliberately drops it because the model only needs the definition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedTool {
+    /// Definition exactly as it is presented to the model.
+    pub definition: ToolDefinition,
+    /// Plugin (or MCP server host) identifier declaring the tool.
+    pub plugin_id: String,
+    /// Host process exposing the tool.
+    pub host_id: String,
+}
+
+/// Resolves every tool declared across the given hosts, keeping provider attribution.
 ///
 /// Prevents name collision: if multiple plugins declare tools with identical names,
 /// they are automatically disambiguated with namespacing (`<plugin_id>__<tool_name>`).
-pub fn aggregate_tools(hosts: &[Arc<dyn ToolHost>]) -> Vec<ToolDefinition> {
+pub fn resolve_tools(hosts: &[Arc<dyn ToolHost>]) -> Vec<ResolvedTool> {
     // 1. First pass: count tool name occurrences across all plugins
     let mut name_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
@@ -98,8 +112,9 @@ pub fn aggregate_tools(hosts: &[Arc<dyn ToolHost>]) -> Vec<ToolDefinition> {
     }
 
     // 2. Second pass: build definitions, namespacing any collided names
-    let mut definitions = Vec::new();
+    let mut tools = Vec::new();
     for host in hosts {
+        let host_id = host.host_id().to_string();
         let metas = host.plugin_metas();
         for plugin in &metas {
             for tool in &plugin.tools {
@@ -128,15 +143,30 @@ pub fn aggregate_tools(hosts: &[Arc<dyn ToolHost>]) -> Vec<ToolDefinition> {
                     (tool.name.clone(), tool.description.clone())
                 };
 
-                definitions.push(ToolDefinition {
-                    name: resolved_name,
-                    description,
-                    parameters,
+                tools.push(ResolvedTool {
+                    definition: ToolDefinition {
+                        name: resolved_name,
+                        description,
+                        parameters,
+                    },
+                    plugin_id: plugin.id.clone(),
+                    host_id: host_id.clone(),
                 });
             }
         }
     }
-    definitions
+    tools
+}
+
+/// Dynamically aggregates tool definitions declared across all active plugin hosts.
+///
+/// A thin projection of [`resolve_tools`], which owns the collision rule; keeping one
+/// implementation means the console and the model can never disagree about a tool name.
+pub fn aggregate_tools(hosts: &[Arc<dyn ToolHost>]) -> Vec<ToolDefinition> {
+    resolve_tools(hosts)
+        .into_iter()
+        .map(|tool| tool.definition)
+        .collect()
 }
 
 /// Central Tool Calling state machine router and execution loop.

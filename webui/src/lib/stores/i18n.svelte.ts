@@ -126,6 +126,22 @@ export const dictionaries = {
     'plugins.install': 'Install Plugin',
     'plugins.tab_plugins': 'Plugins',
     'plugins.tab_mcp': 'MCP Servers',
+    'plugins.tab_tools': 'Tools',
+
+    // Tool catalog
+    'tools.title': 'Tool Catalog',
+    'tools.subtitle':
+      'Every tool the model can call right now, and who provides it',
+    'tools.total': 'Total tools',
+    'tools.source_builtin': 'Builtin',
+    'tools.source_plugin': 'Plugin',
+    'tools.source_mcp': 'MCP',
+    'tools.search_placeholder': 'Filter by name, description or provider',
+    'tools.parameters': 'Schema',
+    'tools.empty': 'No tool is available.',
+    'tools.empty_hint':
+      'Register native tools, start a plugin host or enable an MCP server to expose tools to the model.',
+    'tools.no_match': 'No tool matches the current filter.',
     'plugins.tab_skills': 'Skills',
 
     // MCP servers
@@ -488,6 +504,21 @@ export const dictionaries = {
     'plugins.install': '安装插件',
     'plugins.tab_plugins': '插件',
     'plugins.tab_mcp': 'MCP 服务器',
+    'plugins.tab_tools': '工具',
+
+    // Tool catalog
+    'tools.title': '工具列表',
+    'tools.subtitle': '模型当前可以调用的全部工具及其提供方',
+    'tools.total': '工具总数',
+    'tools.source_builtin': '内置',
+    'tools.source_plugin': '插件',
+    'tools.source_mcp': 'MCP',
+    'tools.search_placeholder': '按名称、描述或提供方筛选',
+    'tools.parameters': '参数结构',
+    'tools.empty': '当前没有任何可用工具。',
+    'tools.empty_hint':
+      '注册内置工具、启动插件宿主或启用 MCP 服务器后，模型即可调用这些工具。',
+    'tools.no_match': '没有符合当前筛选条件的工具。',
     'plugins.tab_skills': '技能',
 
     // MCP servers

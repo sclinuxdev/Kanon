@@ -32,6 +32,7 @@ import type {
 } from '../../types';
 import McpView from './McpView.svelte';
 import SkillsView from './SkillsView.svelte';
+import ToolsView from './ToolsView.svelte';
 
 /**
  * Top-level section of the extension console.
@@ -40,7 +41,7 @@ import SkillsView from './SkillsView.svelte';
  * adapters the node can offer — so they live behind one page with three tabs instead of three
  * navigation entries.
  */
-let activeTab = $state<'plugins' | 'mcp' | 'skills'>('plugins');
+let activeTab = $state<'plugins' | 'tools' | 'mcp' | 'skills'>('plugins');
 
 let hosts = $state<PluginHost[]>([]);
 // Plugins without a host process. They would otherwise be invisible, and a disabled plugin is
@@ -397,6 +398,15 @@ $effect(() => {
     </button>
     <button
       type="button"
+      onclick={() => (activeTab = 'tools')}
+      class="px-3.5 py-1.5 text-xs sm:text-sm font-medium rounded-lg transition cursor-pointer {activeTab === 'tools'
+        ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-2xs'
+        : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}"
+    >
+      {t('plugins.tab_tools')}
+    </button>
+    <button
+      type="button"
       onclick={() => (activeTab = 'mcp')}
       class="px-3.5 py-1.5 text-xs sm:text-sm font-medium rounded-lg transition cursor-pointer {activeTab === 'mcp'
         ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-2xs'
@@ -415,7 +425,9 @@ $effect(() => {
     </button>
   </div>
 
-  {#if activeTab === 'mcp'}
+  {#if activeTab === 'tools'}
+    <ToolsView />
+  {:else if activeTab === 'mcp'}
     <McpView />
   {:else if activeTab === 'skills'}
     <SkillsView />

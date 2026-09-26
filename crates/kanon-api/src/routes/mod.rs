@@ -31,6 +31,7 @@
 //! | `POST` | `/api/v1/skills` | Install a skill from a zip archive or local directory |
 //! | `DELETE` | `/api/v1/skills/:id` | Remove an installed skill |
 //! | `PUT` | `/api/v1/skills/:id/enabled` | Enable or disable a skill node-wide |
+//! | `GET` | `/api/v1/tools` | Every tool the model can call, with its provider |
 //! | `GET` | `/api/v1/mcp/servers` | Configured MCP servers with health |
 //! | `PUT` | `/api/v1/mcp/servers/:id` | Create or replace an MCP server definition |
 //! | `DELETE` | `/api/v1/mcp/servers/:id` | Remove an MCP server definition |
@@ -49,6 +50,7 @@ pub mod providers;
 pub mod sessions;
 pub mod skills;
 pub mod system;
+pub mod tools;
 
 use axum::Router;
 
@@ -66,6 +68,7 @@ pub fn api_router() -> Router<ApiState> {
         .merge(sessions::routes())
         .merge(skills::routes())
         .merge(mcp::routes())
+        .merge(tools::routes())
         .merge(personas::routes())
         .merge(chat::routes())
         .merge(system::routes())

@@ -7,8 +7,9 @@ import OverviewView from './lib/components/views/OverviewView.svelte';
 import PipelineLogsView from './lib/components/views/PipelineLogsView.svelte';
 import PlaygroundView from './lib/components/views/PlaygroundView.svelte';
 import PluginsAdaptersView from './lib/components/views/PluginsAdaptersView.svelte';
+import ProvidersView from './lib/components/views/ProvidersView.svelte';
 import SessionsPersonasView from './lib/components/views/SessionsPersonasView.svelte';
-import SystemProvidersView from './lib/components/views/SystemProvidersView.svelte';
+import SystemConfigView from './lib/components/views/SystemConfigView.svelte';
 
 import { t } from './lib/stores/i18n.svelte';
 import { nodeStore } from './lib/stores/node.svelte';
@@ -59,16 +60,18 @@ function handleKeydown(e: KeyboardEvent) {
     <div class="flex-1 overflow-y-auto">
       {#if currentTab === 'overview'}
         <OverviewView onNavigate={(tab) => (currentTab = tab)} />
+      {:else if currentTab === 'chat' || currentTab === 'playground'}
+        <PlaygroundView />
       {:else if currentTab === 'pipeline'}
         <PipelineLogsView />
       {:else if currentTab === 'plugins'}
         <PluginsAdaptersView />
       {:else if currentTab === 'sessions'}
         <SessionsPersonasView />
-      {:else if currentTab === 'playground'}
-        <PlaygroundView />
       {:else if currentTab === 'providers'}
-        <SystemProvidersView />
+        <ProvidersView />
+      {:else if currentTab === 'system'}
+        <SystemConfigView />
       {/if}
     </div>
   </main>

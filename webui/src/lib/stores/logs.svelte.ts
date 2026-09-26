@@ -8,14 +8,35 @@ class LogStore {
   searchQuery = $state<string>('');
   autoScroll = $state<boolean>(true);
 
-  private wsBuffer: WsRingBuffer<LogRecord>;
+  private wsBuffer: WsRingBuffer<unknown>;
 
   constructor() {
-    this.wsBuffer = new WsRingBuffer<LogRecord>({
+    this.wsBuffer = new WsRingBuffer<unknown>({
       url: '/ws/v1/logs',
       capacity: 1000,
-      onMessage: () => {
-        this.records = this.wsBuffer.getItems();
+      onMessage: (raw: unknown) => {
+        let rec: LogRecord | null = null;
+        if (raw && typeof raw === 'object') {
+          const frame = raw as Record<string, unknown>;
+          if (frame.type === 'log' && frame.record) {
+            rec = frame.record as LogRecord;
+          } else if (frame.level && frame.message) {
+            rec = frame as unknown as LogRecord;
+          }
+        }
+        if (rec) {
+          const upperLevel = String(rec.level || 'INFO').toUpperCase();
+          const normalized: LogRecord = {
+            ...rec,
+            level: (['INFO', 'WARN', 'ERROR', 'DEBUG'].includes(upperLevel)
+              ? upperLevel
+              : 'INFO') as LogLevel,
+            target: rec.target || 'kanon_core',
+            message: rec.message || '',
+            timestamp_ms: rec.timestamp_ms || Date.now(),
+          };
+          this.records = [...this.records.slice(-999), normalized];
+        }
       },
       onStatusChange: (status) => {
         this.status = status;
@@ -27,17 +48,23 @@ class LogStore {
     }
   }
 
+  reconnect() {
+    this.wsBuffer.reconnect();
+  }
+
   get filteredRecords(): LogRecord[] {
     return this.records.filter((rec) => {
-      if (this.filterLevel !== 'ALL' && rec.level !== this.filterLevel) {
+      if (!rec?.message) return false;
+      const lvl = rec.level ? String(rec.level).toUpperCase() : 'INFO';
+      if (this.filterLevel !== 'ALL' && lvl !== this.filterLevel) {
         return false;
       }
       if (this.searchQuery.trim()) {
         const q = this.searchQuery.toLowerCase();
         return (
           rec.message.toLowerCase().includes(q) ||
-          rec.target.toLowerCase().includes(q) ||
-          rec.level.toLowerCase().includes(q)
+          rec.target?.toLowerCase().includes(q) ||
+          lvl.toLowerCase().includes(q)
         );
       }
       return true;

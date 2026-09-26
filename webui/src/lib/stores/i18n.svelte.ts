@@ -4,16 +4,21 @@ export const dictionaries = {
   en: {
     // Navigation
     'nav.overview': 'Overview',
+    'nav.chat': 'Chat',
     'nav.pipeline': 'Pipeline & Logs',
     'nav.plugins': 'Plugins & Adapters',
     'nav.sessions': 'Sessions & Personas',
-    'nav.playground': 'AI Playground',
-    'nav.providers': 'System & Models',
+    'nav.playground': 'Chat',
+    'nav.providers': 'Model Providers',
+    'nav.system': 'System Settings',
 
     // Titles & Subtitles
     'title.overview': 'Node Overview & Health',
     'subtitle.overview':
       'Microkernel node runtime, process supervisor, and Prometheus exposition',
+    'title.chat': 'Interactive Chat',
+    'subtitle.chat':
+      'Interactive streaming chat with multi-turn reasoning and tool calling inspection',
     'title.pipeline': 'Pipeline Tracing & Log Console',
     'subtitle.pipeline':
       'Real-time WebSocket streaming for pipeline lifecycle transitions and server logs',
@@ -23,12 +28,15 @@ export const dictionaries = {
     'title.sessions': 'Sessions & Persona Catalogs',
     'subtitle.sessions':
       'Conversation context memory, token consumption counters, and persona prompts',
-    'title.playground': 'AI Playground Sandbox',
+    'title.playground': 'Interactive Chat',
     'subtitle.playground':
       'Interactive streaming chat with multi-turn reasoning and tool calling inspection',
-    'title.providers': 'Model Providers & System Configuration',
+    'title.providers': 'Model Providers',
     'subtitle.providers':
-      'LLM gateway backends, connectivity testing, provider presets, and node runtime parameters',
+      'LLM gateway backends, connectivity testing, and provider presets',
+    'title.system': 'System Configuration',
+    'subtitle.system':
+      'Microkernel IPC socket, runtime & data paths, memory window, and platform webhook parameters',
 
     // General & Status
     'status.healthy': 'Healthy',
@@ -151,16 +159,20 @@ export const dictionaries = {
   zh: {
     // 导航项
     'nav.overview': '节点概览',
+    'nav.chat': '对话',
     'nav.pipeline': '流水线与日志',
     'nav.plugins': '插件与适配器',
     'nav.sessions': '会话与人设',
-    'nav.playground': 'AI 沙箱调试',
-    'nav.providers': '模型与系统配置',
+    'nav.playground': '对话',
+    'nav.providers': '模型提供商',
+    'nav.system': '系统配置',
 
     // 标题与副标题
     'title.overview': '微内核概览与健康状态',
     'subtitle.overview':
       '微内核运行时、进程监管 Supervisor 与 Prometheus 指标导出',
+    'title.chat': '对话',
+    'subtitle.chat': '与大模型进行交互对话，支持多轮推理与插件工具调用',
     'title.pipeline': '流水线追踪与日志控制台',
     'subtitle.pipeline':
       '基于 WebSocket 的流水线生命周期状态转移与服务器日志实时流',
@@ -169,12 +181,13 @@ export const dictionaries = {
       '物理隔离的跨进程 gRPC 插件宿主、动态 JSON Schema 配置与平台适配器',
     'title.sessions': '会话上下文与人设库',
     'subtitle.sessions': '对话上下文滑动窗口记忆、Token 消耗统计与人设提示词库',
-    'title.playground': 'AI 对话沙箱',
-    'subtitle.playground':
-      '支持多轮推理与动态 Tool Calling 工具调用的实时交互测试',
-    'title.providers': '模型 Providers 与系统配置',
-    'subtitle.providers':
-      'LLM 网关后端、连通性与延迟测速、主流服务商预设以及节点系统参数',
+    'title.playground': '对话',
+    'subtitle.playground': '与大模型进行交互对话，支持多轮推理与插件工具调用',
+    'title.providers': '模型提供商',
+    'subtitle.providers': '大语言模型提供商配置、连通性测速与主流服务商预设',
+    'title.system': '系统配置',
+    'subtitle.system':
+      '微内核 IPC 通信套接字、运行与存储路径、记忆窗口及平台适配器',
 
     // 通用与状态
     'status.healthy': '运行正常',

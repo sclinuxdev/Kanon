@@ -90,7 +90,6 @@ export interface ProviderPreset {
   name: string;
   protocol: string;
   base_url: string;
-  default_model: string;
 }
 
 export interface ProvidersCatalog {
@@ -200,7 +199,7 @@ export interface PersonasResponse {
 export type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
 
 export interface LogRecord {
-  seq: number;
+  seq?: number;
   timestamp_ms: number;
   level: LogLevel;
   target: string;
@@ -242,7 +241,11 @@ export interface ChatCompletionRequest {
   message: string;
   model?: string;
   persona?: string;
+  persona_id?: string;
   tools?: boolean;
+  protocol?: string;
+  base_url?: string;
+  api_key?: string;
 }
 
 export interface ExecutedTool {
@@ -259,4 +262,29 @@ export interface ChatCompletionResponse {
   turns: number;
   finish_reason?: string;
   executed_tools: ExecutedTool[];
+}
+
+// Multi-provider & Model management (Two-tier provider/model hierarchy)
+export interface CustomModel {
+  id: string;
+  name?: string;
+}
+
+export interface CustomProvider {
+  id: string;
+  name: string;
+  protocol: 'openai' | 'openai_responses' | 'anthropic';
+  base_url: string;
+  api_key: string;
+  models: CustomModel[];
+}
+
+export interface FetchModelsRequest {
+  protocol?: string;
+  base_url: string;
+  api_key?: string;
+}
+
+export interface FetchModelsResponse {
+  models: string[];
 }

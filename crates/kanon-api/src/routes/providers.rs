@@ -23,6 +23,7 @@ pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/api/v1/providers", get(list_providers))
         .route("/api/v1/providers/test", post(test_provider))
+        .route("/api/v1/providers/models", post(fetch_models))
 }
 
 /// Catalog response listing active and available providers and presets.
@@ -77,8 +78,6 @@ pub struct ProviderPreset {
     pub protocol: &'static str,
     /// Provider API base URL.
     pub base_url: &'static str,
-    /// Recommended default model identifier.
-    pub default_model: &'static str,
 }
 
 /// Request payload to test provider connectivity.
@@ -167,49 +166,42 @@ async fn list_providers(State(state): State<ApiState>) -> Json<ProvidersCatalogR
             name: "OpenAI Official",
             protocol: "openai",
             base_url: "https://api.openai.com/v1",
-            default_model: "gpt-4o-mini",
         },
         ProviderPreset {
             id: "anthropic",
             name: "Anthropic Claude",
             protocol: "anthropic",
             base_url: "https://api.anthropic.com/v1",
-            default_model: "claude-3-5-sonnet-20241022",
         },
         ProviderPreset {
             id: "deepseek",
             name: "DeepSeek",
             protocol: "openai",
             base_url: "https://api.deepseek.com/v1",
-            default_model: "deepseek-chat",
         },
         ProviderPreset {
             id: "ollama",
             name: "Ollama (Local)",
             protocol: "openai",
             base_url: "http://127.0.0.1:11434/v1",
-            default_model: "llama3.2",
         },
         ProviderPreset {
             id: "vllm",
             name: "vLLM (Local / Server)",
             protocol: "openai",
             base_url: "http://127.0.0.1:8000/v1",
-            default_model: "Qwen/Qwen2.5-7B-Instruct",
         },
         ProviderPreset {
             id: "openrouter",
             name: "OpenRouter",
             protocol: "openai",
             base_url: "https://openrouter.ai/api/v1",
-            default_model: "openai/gpt-4o-mini",
         },
         ProviderPreset {
             id: "siliconflow",
             name: "SiliconFlow (硅基流动)",
             protocol: "openai",
             base_url: "https://api.siliconflow.cn/v1",
-            default_model: "deepseek-ai/DeepSeek-V3",
         },
     ];
 
@@ -306,4 +298,157 @@ async fn test_provider(
             }))
         }
     }
+}
+
+/// Request payload to fetch available model tags from a provider endpoint.
+#[derive(Debug, Deserialize)]
+pub struct FetchModelsRequest {
+    /// Wire protocol (e.g. `openai`, `anthropic`).
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// Provider API base URL.
+    pub base_url: String,
+    /// Optional API key credential.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// Response payload containing list of model IDs available on the provider.
+#[derive(Debug, Serialize)]
+pub struct FetchModelsResponse {
+    /// Discovered model identifiers.
+    pub models: Vec<String>,
+}
+
+/// Handler for `POST /api/v1/providers/models`.
+async fn fetch_models(
+    State(_state): State<ApiState>,
+    Json(payload): Json<FetchModelsRequest>,
+) -> Result<Json<FetchModelsResponse>, ApiError> {
+    let protocol = payload.protocol.as_deref().unwrap_or("openai");
+    let base_url = payload.base_url.trim().trim_end_matches('/').to_string();
+    if base_url.is_empty() {
+        return Err(ApiError::BadRequest("base_url must not be empty".to_string()));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| ApiError::Internal(format!("Failed to build HTTP client: {e}")))?;
+
+    let models = if protocol == "anthropic" {
+        // Query Anthropic models endpoint (GET /v1/models)
+        let models_url = if base_url.ends_with("/models") {
+            base_url
+        } else if base_url.ends_with("/v1") {
+            format!("{base_url}/models")
+        } else {
+            format!("{base_url}/v1/models")
+        };
+        let mut req = client.get(&models_url);
+        if let Some(ref key) = payload.api_key {
+            if !key.trim().is_empty() {
+                req = req
+                    .header("x-api-key", key.trim())
+                    .header("anthropic-version", "2023-06-01");
+            }
+        }
+
+        let resp = req.send().await.map_err(|e| {
+            ApiError::Internal(format!("Failed to connect to Anthropic provider at {models_url}: {e}"))
+        })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let msg = if status == reqwest::StatusCode::UNAUTHORIZED {
+                if payload.api_key.as_deref().unwrap_or("").trim().is_empty() {
+                    format!("Anthropic provider returned HTTP 401 Unauthorized: API key is required but was not provided. Upstream: {text}")
+                } else {
+                    format!("Anthropic provider returned HTTP 401 Unauthorized: Authentication failed (check API key credentials). Upstream: {text}")
+                }
+            } else {
+                format!("Anthropic provider returned HTTP {status}: {text}")
+            };
+            return Err(ApiError::Internal(msg));
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| {
+            ApiError::Internal(format!("Failed to parse models response JSON: {e}"))
+        })?;
+
+        extract_model_ids(&json)
+    } else {
+        // OpenAI-compatible /v1/models (compatible with DeepSeek, Ollama, SiliconFlow, vLLM, OpenRouter, etc.)
+        let models_url = if base_url.ends_with("/models") {
+            base_url
+        } else if base_url.ends_with("/v1") {
+            format!("{base_url}/models")
+        } else {
+            format!("{base_url}/v1/models")
+        };
+
+        let mut req = client.get(&models_url);
+        if let Some(ref key) = payload.api_key {
+            if !key.trim().is_empty() {
+                req = req.bearer_auth(key.trim());
+            }
+        }
+
+        let resp = req.send().await.map_err(|e| {
+            ApiError::Internal(format!("Failed to connect to provider at {models_url}: {e}"))
+        })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let msg = if status == reqwest::StatusCode::UNAUTHORIZED {
+                if payload.api_key.as_deref().unwrap_or("").trim().is_empty() {
+                    format!("Provider returned HTTP 401 Unauthorized: API key is required but was not provided. Upstream: {text}")
+                } else {
+                    format!("Provider returned HTTP 401 Unauthorized: Authentication failed (check API key credentials). Upstream: {text}")
+                }
+            } else {
+                format!("Provider returned HTTP {status}: {text}")
+            };
+            return Err(ApiError::Internal(msg));
+        }
+
+        let json: serde_json::Value = resp.json().await.map_err(|e| {
+            ApiError::Internal(format!("Failed to parse models response JSON: {e}"))
+        })?;
+
+        extract_model_ids(&json)
+    };
+
+    Ok(Json(FetchModelsResponse { models }))
+}
+
+/// Extracts model identifiers from either OpenAI standard `{ data: [{ id: ... }] }`
+/// or Ollama `{ models: [{ name: ... }] }` payload formats.
+fn extract_model_ids(json: &serde_json::Value) -> Vec<String> {
+    let mut list = Vec::new();
+    // OpenAI standard: { "data": [ { "id": "..." } ] }
+    if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+        for item in data {
+            if let Some(id) = item.get("id").and_then(|s| s.as_str()) {
+                list.push(id.to_string());
+            }
+        }
+    }
+    // Ollama native: { "models": [ { "name": "..." } ] }
+    if list.is_empty() {
+        if let Some(models) = json.get("models").and_then(|m| m.as_array()) {
+            for item in models {
+                if let Some(name) = item.get("name").and_then(|s| s.as_str()) {
+                    list.push(name.to_string());
+                } else if let Some(id) = item.get("id").and_then(|s| s.as_str()) {
+                    list.push(id.to_string());
+                }
+            }
+        }
+    }
+    list.sort();
+    list.dedup();
+    list
 }

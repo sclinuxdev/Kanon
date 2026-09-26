@@ -104,18 +104,33 @@ export class WsRingBuffer<T> {
 
   private scheduleReconnect() {
     if (this.isDestroyed || this.reconnectTimer !== null) return;
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.setStatus('disconnected');
-      return;
-    }
 
-    const delay = Math.min(1000 * 1.5 ** this.reconnectAttempts, 10000);
+    // Use exponential backoff capped at 5 seconds; never permanently abandon
+    const delay = Math.min(1000 * 1.5 ** Math.min(this.reconnectAttempts, 8), 5000);
     this.reconnectAttempts++;
 
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
     }, delay);
+  }
+
+  public reconnect() {
+    if (this.isDestroyed) return;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {
+        // ignore close errors
+      }
+      this.ws = null;
+    }
+    this.reconnectAttempts = 0;
+    this.connect();
   }
 
   public destroy() {

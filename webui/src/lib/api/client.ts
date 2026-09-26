@@ -2,6 +2,8 @@ import type {
   AdaptersResponse,
   ChatCompletionRequest,
   ChatCompletionResponse,
+  FetchModelsRequest,
+  FetchModelsResponse,
   NodeHealth,
   PersonasResponse,
   PluginConfigResponse,
@@ -64,6 +66,11 @@ export const api = {
     request<TestProviderResponse>('/api/v1/providers/test', {
       method: 'POST',
       body: JSON.stringify(req ?? {}),
+    }),
+  fetchModels: (req: FetchModelsRequest) =>
+    request<FetchModelsResponse>('/api/v1/providers/models', {
+      method: 'POST',
+      body: JSON.stringify(req),
     }),
 
   getPlugins: () => request<PluginsResponse>('/api/v1/plugins'),

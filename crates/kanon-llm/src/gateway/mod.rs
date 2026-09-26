@@ -44,6 +44,7 @@ pub trait LlmProvider: Send + Sync {
                 let _ = tx
                     .send(Ok(ChatChunk {
                         delta_text: text,
+                        reasoning_text: None,
                         is_finished: false,
                         finish_reason: None,
                         tool_calls: resp.tool_calls.clone(),
@@ -53,6 +54,7 @@ pub trait LlmProvider: Send + Sync {
             let _ = tx
                 .send(Ok(ChatChunk {
                     delta_text: String::new(),
+                    reasoning_text: None,
                     is_finished: true,
                     finish_reason: resp.finish_reason,
                     tool_calls: resp.tool_calls,

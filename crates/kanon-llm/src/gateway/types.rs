@@ -168,6 +168,9 @@ pub struct ChatResponse {
 pub struct ChatChunk {
     /// Incremental textual delta generated in this chunk.
     pub delta_text: String,
+    /// Incremental reasoning or thinking delta (e.g. DeepSeek Reasoner, OpenAI o1/o3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_text: Option<String>,
     /// Whether this chunk marks the completion of the generation stream.
     pub is_finished: bool,
     /// Termination reason, present on final chunk (e.g. `stop`, `tool_calls`, `length`).
@@ -181,6 +184,18 @@ impl ChatChunk {
     pub fn delta(text: impl Into<String>) -> Self {
         Self {
             delta_text: text.into(),
+            reasoning_text: None,
+            is_finished: false,
+            finish_reason: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    /// Creates a reasoning text delta chunk.
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self {
+            delta_text: String::new(),
+            reasoning_text: Some(text.into()),
             is_finished: false,
             finish_reason: None,
             tool_calls: Vec::new(),
@@ -191,6 +206,7 @@ impl ChatChunk {
     pub fn done(finish_reason: Option<String>) -> Self {
         Self {
             delta_text: String::new(),
+            reasoning_text: None,
             is_finished: true,
             finish_reason,
             tool_calls: Vec::new(),

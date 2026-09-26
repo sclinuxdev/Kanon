@@ -1,7 +1,7 @@
 import type { ChatCompletionRequest } from '../types';
 
 export interface StreamCallbacks {
-  onChunk: (delta: string) => void;
+  onChunk: (delta: string, reasoning?: string) => void;
   onFinish?: (reason?: string) => void;
   onError?: (err: Error) => void;
 }
@@ -56,8 +56,8 @@ export async function streamChatCompletion(
 
           try {
             const data = JSON.parse(payload);
-            if (data.delta) {
-              callbacks.onChunk(data.delta);
+            if (data.delta !== undefined || data.reasoning !== undefined) {
+              callbacks.onChunk(data.delta ?? '', data.reasoning ?? undefined);
             }
             if (data.finish_reason) {
               callbacks.onFinish?.(data.finish_reason);

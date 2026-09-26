@@ -9,7 +9,7 @@ use axum::http::Method;
 use kanon_api::app;
 use serde_json::json;
 
-use common::{empty_state, error_code, fixture_state, send_json};
+use common::{empty_state, error_code, fixture_state, send_json, send_raw_json};
 
 /// Non-streaming completions return the agent answer and register the session.
 #[tokio::test]
@@ -161,3 +161,100 @@ async fn chat_completion_applies_persona_override() {
         Some("concise")
     );
 }
+
+/// A completion request specifying dynamic provider parameters executes even when
+/// no default provider is configured on the node core.
+#[tokio::test]
+async fn chat_completion_with_dynamic_provider_succeeds_without_node_agent() {
+    let mock_app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(|| async {
+            axum::Json(serde_json::json!({
+                "id": "chatcmpl-test",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "dynamic provider reply"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15
+                }
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_app).await;
+    });
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let without_provider: Router = app(empty_state(PathBuf::from(dir.path())).await);
+
+    let (status, body) = send_json(
+        &without_provider,
+        Method::POST,
+        "/api/v1/chat/completions",
+        Some(json!({
+            "session_id": "webui:dynamic",
+            "message": "hello dynamic",
+            "protocol": "openai",
+            "base_url": format!("http://{addr}/v1"),
+            "model": "deepseek/deepseek-chat"
+        })),
+    )
+    .await;
+
+    assert_eq!(status, 200, "body: {body}");
+    assert_eq!(body["session_id"], "webui:dynamic");
+    assert_eq!(body["content"], "dynamic provider reply");
+    assert_eq!(body["finish_reason"], "stop");
+}
+
+/// A streaming completion request with a reasoning-capable provider emits both reasoning and delta chunks.
+#[tokio::test]
+async fn chat_stream_with_reasoning_yields_reasoning_and_delta() {
+    let mock_app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(|| async {
+            let sse_body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"Thinking step 1...\"},\"finish_reason\":null}]}\n\n\
+                            data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Final answer text.\",\"reasoning_content\":null},\"finish_reason\":\"stop\"}]}\n\n\
+                            data: [DONE]\n\n";
+            ([("content-type", "text/event-stream")], sse_body)
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, mock_app).await;
+    });
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let without_provider: Router = app(empty_state(PathBuf::from(dir.path())).await);
+
+    let (status, body, content_type) = send_raw_json(
+        &without_provider,
+        "/api/v1/chat/completions",
+        json!({
+            "session_id": "webui:reasoning_stream",
+            "message": "reason about this",
+            "stream": true,
+            "protocol": "openai",
+            "base_url": format!("http://{addr}/v1"),
+            "model": "deepseek/deepseek-reasoner"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert!(content_type.starts_with("text/event-stream"), "content_type: {content_type}");
+    assert!(body.contains("Thinking step 1..."), "body missing reasoning: {body}");
+    assert!(body.contains("Final answer text."), "body missing delta: {body}");
+    assert!(body.contains("\"type\":\"done\""), "body missing done event: {body}");
+}
+

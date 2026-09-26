@@ -780,6 +780,7 @@ impl Agent {
         let memory = self.memory.clone();
         let sid = session_id.to_string();
         let sm_opt = self.session_manager.clone();
+        let hooks = self.hooks.clone();
         let user_toks = crate::token::estimate_text_tokens(user_input);
 
         tokio::spawn(async move {
@@ -791,6 +792,7 @@ impl Agent {
                     Ok(chunk) => {
                         accumulated.push_str(&chunk.delta_text);
                         let is_fin = chunk.is_finished;
+                        let fin_reason = chunk.finish_reason.clone();
                         let _ = tx.send(Ok(chunk)).await;
                         if is_fin {
                             if !accumulated.is_empty()
@@ -801,6 +803,15 @@ impl Agent {
                             if let Some(ref sm) = sm_opt {
                                 let tokens = user_toks + crate::token::estimate_text_tokens(&accumulated);
                                 sm.record_turn(&sid, tokens);
+                            }
+                            let mut resp = crate::gateway::ChatResponse {
+                                content: if accumulated.is_empty() { None } else { Some(accumulated.clone()) },
+                                tool_calls: Vec::new(),
+                                finish_reason: fin_reason,
+                                usage: None,
+                            };
+                            for hook in &hooks {
+                                let _ = hook.on_llm_response(&sid, &mut resp).await;
                             }
                             return;
                         }
@@ -820,6 +831,15 @@ impl Agent {
             if let Some(ref sm) = sm_opt {
                 let tokens = user_toks + crate::token::estimate_text_tokens(&accumulated);
                 sm.record_turn(&sid, tokens);
+            }
+            let mut resp = crate::gateway::ChatResponse {
+                content: if accumulated.is_empty() { None } else { Some(accumulated.clone()) },
+                tool_calls: Vec::new(),
+                finish_reason: None,
+                usage: None,
+            };
+            for hook in &hooks {
+                let _ = hook.on_llm_response(&sid, &mut resp).await;
             }
         });
 

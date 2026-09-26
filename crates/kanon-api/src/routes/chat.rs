@@ -21,8 +21,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::StreamExt;
 use kanon_core::ManagedHost;
-use kanon_llm::AgentError;
-use kanon_llm::tool_router::ExecutedToolCall;
+use kanon_llm::{
+    Agent, AgentError, AnthropicMessagesProvider, LlmProvider, OpenAiChatProvider,
+    OpenAiResponsesProvider, tool_router::ExecutedToolCall,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -50,6 +52,18 @@ pub struct ChatCompletionRequest {
     /// Optional persona override applied to the session before this turn.
     #[serde(default)]
     pub persona_id: Option<String>,
+    /// Optional model identifier (overriding active or default).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional protocol (e.g. `openai`, `anthropic`, `openai_responses`).
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// Optional provider base URL.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Optional provider API key.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 /// Non-streaming completion result.
@@ -113,7 +127,7 @@ async fn completions(
         ));
     }
 
-    let agent = state.require_agent()?.clone();
+    let agent = resolve_agent(&state, &request)?;
     MetricsRegistry::incr(&state.observability().metrics.chat_completions);
 
     apply_persona_override(&state, &session_id, request.persona_id.as_deref())?;
@@ -181,10 +195,13 @@ async fn stream_completion(
                 "type": "done",
                 "finish_reason": chunk.finish_reason,
                 "persona_id": sessions.get_persona(&sid),
+                "delta": chunk.delta_text,
+                "reasoning": chunk.reasoning_text,
             }),
             Ok(chunk) => serde_json::json!({
                 "type": "delta",
                 "delta": chunk.delta_text,
+                "reasoning": chunk.reasoning_text,
             }),
             Err(err) => serde_json::json!({
                 "type": "error",
@@ -242,4 +259,81 @@ fn map_agent_error(err: AgentError) -> ApiError {
             ApiError::Upstream(format!("Model provider failure: {gateway}"))
         }
     }
+}
+
+/// Resolves an [`Agent`] runtime to drive completion for this request.
+///
+/// If dynamic provider coordinates are specified (`protocol` and `base_url`), an ephemeral
+/// agent sharing the node's session manager, memory, and persona registry is constructed.
+/// Otherwise, falls back to the node's configured agent, applying an optional model override.
+fn resolve_agent(state: &ApiState, request: &ChatCompletionRequest) -> Result<Arc<Agent>, ApiError> {
+    if let (Some(proto), Some(url)) = (&request.protocol, &request.base_url) {
+        let trimmed_url = url.trim().trim_end_matches('/').to_string();
+        if !trimmed_url.is_empty() {
+            let raw_model = request
+                .model
+                .as_deref()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or("default");
+            // Strip any provider prefix like "deepseek/deepseek-chat" -> "deepseek-chat"
+            let model = match raw_model.split_once('/') {
+                Some((_prov, actual_model)) if !actual_model.trim().is_empty() => {
+                    actual_model.trim().to_string()
+                }
+                _ => raw_model.trim().to_string(),
+            };
+            let key = request.api_key.clone().filter(|k| !k.trim().is_empty());
+
+            let prov: Arc<dyn LlmProvider> = match proto.as_str() {
+                "openai" | "openai_chat" => {
+                    Arc::new(OpenAiChatProvider::new(trimmed_url, key, model.clone()))
+                }
+                "openai_responses" => Arc::new(
+                    OpenAiResponsesProvider::new(key.unwrap_or_default()).with_base_url(trimmed_url),
+                ),
+                "anthropic" => {
+                    Arc::new(AnthropicMessagesProvider::new(trimmed_url, key, model.clone()))
+                }
+                other => {
+                    return Err(ApiError::BadRequest(format!(
+                        "Unsupported protocol '{other}'; expected openai, openai_responses or anthropic"
+                    )));
+                }
+            };
+
+            let builder = Agent::builder("sandbox", prov)
+                .memory(state.sessions().memory().clone())
+                .session_manager(state.sessions().clone())
+                .persona_registry(state.personas().clone())
+                .hook_arc(state.observability().events.clone())
+                .model(model);
+
+            return Ok(Arc::new(builder.build()));
+        }
+    }
+
+    if let Some(agent) = state.agent() {
+        if let Some(ref raw_model) = request.model {
+            let model = match raw_model.split_once('/') {
+                Some((_prov, actual_model)) if !actual_model.trim().is_empty() => {
+                    actual_model.trim().to_string()
+                }
+                _ => raw_model.trim().to_string(),
+            };
+            if !model.is_empty() && model != agent.config().default_model {
+                let builder = Agent::builder("sandbox", agent.provider().clone())
+                    .memory(state.sessions().memory().clone())
+                    .session_manager(state.sessions().clone())
+                    .persona_registry(state.personas().clone())
+                    .hook_arc(state.observability().events.clone())
+                    .model(model);
+                return Ok(Arc::new(builder.build()));
+            }
+        }
+        return Ok(agent.clone());
+    }
+
+    Err(ApiError::Unavailable(
+        "No LLM provider is configured for this core; chat completions are disabled. 请在控制台「模型提供商」中配置提供商并选择模型。".to_string(),
+    ))
 }

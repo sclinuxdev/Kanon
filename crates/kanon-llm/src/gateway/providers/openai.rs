@@ -94,6 +94,8 @@ mod wire {
         pub role: String,
         pub content: Option<String>,
         #[serde(default)]
+        pub reasoning_content: Option<String>,
+        #[serde(default)]
         pub tool_calls: Option<Vec<OpenAiToolCallWire>>,
     }
 
@@ -122,6 +124,8 @@ mod wire {
         pub role: Option<String>,
         #[serde(default)]
         pub content: Option<String>,
+        #[serde(default)]
+        pub reasoning_content: Option<String>,
         #[serde(default)]
         pub tool_calls: Option<Vec<OpenAiToolCallChunkWire>>,
     }
@@ -328,8 +332,18 @@ impl LlmProvider for OpenAiChatProvider {
             total_tokens: u.total_tokens,
         });
 
+        let content = match (
+            choice.message.content.filter(|c| !c.is_empty()),
+            choice.message.reasoning_content.filter(|r| !r.is_empty()),
+        ) {
+            (Some(c), Some(r)) => Some(format!("<think>\n{r}\n</think>\n\n{c}")),
+            (Some(c), None) => Some(c),
+            (None, Some(r)) => Some(format!("<think>\n{r}\n</think>")),
+            (None, None) => None,
+        };
+
         Ok(ChatResponse {
-            content: choice.message.content,
+            content,
             tool_calls,
             finish_reason: choice.finish_reason,
             usage,
@@ -433,7 +447,12 @@ impl LlmProvider for OpenAiChatProvider {
                             }
 
                             let delta_text = choice.delta.content.unwrap_or_default();
-                            let tool_calls = choice
+                            let reasoning_text = choice
+                                .delta
+                                .reasoning_content
+                                .filter(|r| !r.is_empty());
+
+                            let tool_calls: Vec<ToolCall> = choice
                                 .delta
                                 .tool_calls
                                 .unwrap_or_default()
@@ -451,18 +470,32 @@ impl LlmProvider for OpenAiChatProvider {
                                         .and_then(|f| f.arguments.as_ref())
                                         .and_then(|args| serde_json::from_str(args).ok())
                                         .unwrap_or(serde_json::json!({})),
-                                })
+                                 })
                                 .collect();
 
-                            let out_chunk = ChatChunk {
-                                delta_text,
-                                is_finished: is_done,
-                                finish_reason,
-                                tool_calls,
-                            };
+                            let has_content = !delta_text.is_empty()
+                                || reasoning_text.is_some()
+                                || !tool_calls.is_empty();
 
-                            if tx.send(Ok(out_chunk)).await.is_err() {
-                                return;
+                            if has_content {
+                                let out_chunk = ChatChunk {
+                                    delta_text,
+                                    reasoning_text,
+                                    is_finished: false,
+                                    finish_reason: None,
+                                    tool_calls,
+                                };
+
+                                if tx.send(Ok(out_chunk)).await.is_err() {
+                                    return;
+                                }
+                            }
+
+                            if is_done {
+                                let done_chunk = ChatChunk::done(finish_reason);
+                                if tx.send(Ok(done_chunk)).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                     }

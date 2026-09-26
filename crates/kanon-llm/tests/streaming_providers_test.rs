@@ -243,3 +243,62 @@ async fn test_agent_run_standalone_stream() {
     assert_eq!(messages[2].content.as_deref(), Some("Token 1, Token 2, Token 3"));
 }
 
+/// Verifies that OpenAI-compatible streaming decodes reasoning_content alongside text content.
+#[tokio::test]
+async fn test_openai_chat_streaming_reasoning_sse() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            let sse_body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"I think \"},\"finish_reason\":null}]}\n\n\
+                            data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"reasoning_content\":\"therefore \"},\"finish_reason\":null}]}\n\n\
+                            data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The answer is \",\"reasoning_content\":null},\"finish_reason\":null}]}\n\n\
+                            data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"42.\",\"reasoning_content\":null},\"finish_reason\":\"stop\"}]}\n\n\
+                            data: [DONE]\n\n";
+
+            ([("content-type", "text/event-stream")], sse_body).into_response()
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let provider = OpenAiChatProvider::new(
+        format!("http://{addr}/v1"),
+        Some("test_key".to_string()),
+        "deepseek-reasoner",
+    );
+
+    let request = ChatRequest {
+        model: "deepseek-reasoner".to_string(),
+        messages: vec![ChatMessage::user("What is the answer?")],
+        tools: vec![],
+        temperature: None,
+        max_tokens: None,
+    };
+
+    let mut stream = provider.chat_stream(&request).await.expect("Failed to start stream");
+
+    let mut accumulated_content = String::new();
+    let mut accumulated_reasoning = String::new();
+    let mut finished = false;
+
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.expect("Error in chunk stream");
+        accumulated_content.push_str(&chunk.delta_text);
+        if let Some(r) = chunk.reasoning_text {
+            accumulated_reasoning.push_str(&r);
+        }
+        if chunk.is_finished {
+            finished = true;
+            assert_eq!(chunk.finish_reason.as_deref(), Some("stop"));
+        }
+    }
+
+    assert!(finished, "Stream did not signal completion");
+    assert_eq!(accumulated_reasoning, "I think therefore ");
+    assert_eq!(accumulated_content, "The answer is 42.");
+}
+

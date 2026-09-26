@@ -1,4 +1,5 @@
 <script lang="ts">
+import { onMount } from 'svelte';
 import {
   Activity,
   AlertCircle,
@@ -8,6 +9,7 @@ import {
   Clock,
   Filter,
   Layers,
+  RefreshCw,
   Search,
   Terminal,
   Trash2,
@@ -19,6 +21,15 @@ import { pipelineStore } from '../../stores/pipeline.svelte';
 import type { LogLevel } from '../../types';
 
 let logContainer = $state<HTMLDivElement | null>(null);
+
+onMount(() => {
+  if (pipelineStore.status === 'disconnected') {
+    pipelineStore.reconnect();
+  }
+  if (logStore.status === 'disconnected') {
+    logStore.reconnect();
+  }
+});
 
 // Auto scroll to bottom when new logs arrive if autoScroll is enabled
 $effect(() => {
@@ -74,79 +85,118 @@ function getStageColor(stage: string): string {
     <!-- Header -->
     <div class="p-3 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between shrink-0 bg-white dark:bg-zinc-900">
       <div class="flex items-center gap-2">
-        <Layers class="w-4 h-4 text-zinc-500" />
-        <span class="text-xs font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">{t('pipeline.live_events')}</span>
+        <Layers class="w-4.5 h-4.5 text-zinc-500" />
+        <span class="text-sm font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">{t('pipeline.live_events')}</span>
       </div>
       <div class="flex items-center gap-2">
-        <span class="text-[10px] font-mono text-zinc-400">({pipelineStore.records.length} events)</span>
+        <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono {pipelineStore.status === 'connected' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : pipelineStore.status === 'connecting' || pipelineStore.status === 'reconnecting' ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400' : 'bg-rose-500/10 text-rose-600 dark:text-rose-400'}">
+          <span class="w-1.5 h-1.5 rounded-full {pipelineStore.status === 'connected' ? 'bg-emerald-500' : pipelineStore.status === 'connecting' || pipelineStore.status === 'reconnecting' ? 'bg-amber-500 animate-pulse' : 'bg-rose-500'}"></span>
+          {pipelineStore.status}
+        </span>
+        {#if pipelineStore.status !== 'connected'}
+          <button
+            onclick={() => pipelineStore.reconnect()}
+            class="p-1 text-indigo-500 hover:text-indigo-600 transition cursor-pointer"
+            title="Reconnect Pipeline WebSocket"
+          >
+            <RefreshCw class="w-3.5 h-3.5" />
+          </button>
+        {/if}
+        <span class="text-xs font-mono text-zinc-400">({pipelineStore.records.length})</span>
         <button
           onclick={() => pipelineStore.clear()}
           class="p-1 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition cursor-pointer"
           title={t('common.clear')}
         >
-          <Trash2 class="w-3.5 h-3.5" />
+          <Trash2 class="w-4 h-4" />
         </button>
       </div>
     </div>
 
     <!-- Quick stage stats chips -->
-    <div class="p-2 border-b border-zinc-200/80 dark:border-zinc-800/80 flex items-center gap-1.5 overflow-x-auto text-[10px] font-mono shrink-0">
+    <div class="p-2.5 border-b border-zinc-200/80 dark:border-zinc-800/80 flex items-center gap-2 overflow-x-auto text-xs font-mono shrink-0">
       <button
         onclick={() => (pipelineStore.selectedStage = 'ALL')}
-        class="px-2 py-0.5 rounded cursor-pointer transition {pipelineStore.selectedStage === 'ALL' ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
+        class="px-2.5 py-1 rounded-md cursor-pointer transition {pipelineStore.selectedStage === 'ALL' ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
       >
         All ({pipelineStore.records.length})
       </button>
       <button
         onclick={() => (pipelineStore.selectedStage = 'ingested')}
-        class="px-2 py-0.5 rounded cursor-pointer transition {pipelineStore.selectedStage === 'ingested' ? 'bg-blue-600 text-white' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
+        class="px-2.5 py-1 rounded-md cursor-pointer transition {pipelineStore.selectedStage === 'ingested' ? 'bg-blue-600 text-white' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
       >
         Ingest ({pipelineStore.stats.ingested})
       </button>
       <button
         onclick={() => (pipelineStore.selectedStage = 'pre_filter')}
-        class="px-2 py-0.5 rounded cursor-pointer transition {pipelineStore.selectedStage === 'pre_filter' ? 'bg-zinc-600 text-white' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
+        class="px-2.5 py-1 rounded-md cursor-pointer transition {pipelineStore.selectedStage === 'pre_filter' ? 'bg-zinc-600 text-white' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
       >
         PreFilter ({pipelineStore.stats.pre_filter})
       </button>
       <button
         onclick={() => (pipelineStore.selectedStage = 'command')}
-        class="px-2 py-0.5 rounded cursor-pointer transition {pipelineStore.selectedStage === 'command' ? 'bg-violet-600 text-white' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
+        class="px-2.5 py-1 rounded-md cursor-pointer transition {pipelineStore.selectedStage === 'command' ? 'bg-violet-600 text-white' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
       >
         Cmd ({pipelineStore.stats.command})
       </button>
       <button
         onclick={() => (pipelineStore.selectedStage = 'llm')}
-        class="px-2 py-0.5 rounded cursor-pointer transition {pipelineStore.selectedStage === 'llm' ? 'bg-indigo-600 text-white' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
+        class="px-2.5 py-1 rounded-md cursor-pointer transition {pipelineStore.selectedStage === 'llm' ? 'bg-indigo-600 text-white' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
       >
         LLM ({pipelineStore.stats.llm})
       </button>
       <button
         onclick={() => (pipelineStore.selectedStage = 'outbound')}
-        class="px-2 py-0.5 rounded cursor-pointer transition {pipelineStore.selectedStage === 'outbound' ? 'bg-emerald-600 text-white' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
+        class="px-2.5 py-1 rounded-md cursor-pointer transition {pipelineStore.selectedStage === 'outbound' ? 'bg-emerald-600 text-white' : 'text-zinc-500 hover:bg-zinc-200/60 dark:hover:bg-zinc-800'}"
       >
         Outbound ({pipelineStore.stats.outbound})
       </button>
     </div>
 
     <!-- Event Timeline List -->
-    <div class="flex-1 overflow-y-auto p-3 space-y-2 font-mono text-xs">
+    <div class="flex-1 overflow-y-auto p-3 space-y-2.5 font-mono text-xs sm:text-sm">
       {#if pipelineStore.filteredRecords.length === 0}
-        <div class="p-8 text-center text-zinc-400 text-xs font-sans">
+        <div class="p-8 text-center text-zinc-400 text-sm font-sans">
           {t('pipeline.empty_events')}
         </div>
       {:else}
-        {#each pipelineStore.filteredRecords.slice().reverse() as record (record.seq)}
-          <div class="p-2.5 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-2xs space-y-1.5">
-            <div class="flex items-center justify-between text-[11px]">
-              <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold border {getStageColor(record.event.stage)}">
-                {record.event.stage}
+        {#each pipelineStore.filteredRecords.slice().reverse() as record, i (record.seq ?? i)}
+          <div class="p-3 rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-2xs space-y-2">
+            <div class="flex items-center justify-between text-xs">
+              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold border {getStageColor(record.event?.stage ?? '')}">
+                {record.event?.stage ?? 'unknown'}
               </span>
-              <span class="text-zinc-400 text-[10px]">{formatTime(record.timestamp_ms)}</span>
+              <span class="text-zinc-400 text-xs">{formatTime(record.timestamp_ms)}</span>
             </div>
 
             <!-- Stage Context Details -->
-            <div class="text-[11px] text-zinc-700 dark:text-zinc-300 space-y-0.5">
+            <div class="text-xs sm:text-sm text-zinc-700 dark:text-zinc-300 space-y-1">
+              {#if record.event.model}
+                <div class="text-indigo-600 dark:text-indigo-400 font-semibold">
+                  Model: {record.event.model}
+                  {#if record.event.message_count !== undefined}
+                    <span class="text-zinc-400 font-normal">({record.event.message_count} msgs, {record.event.tool_count ?? 0} tools)</span>
+                  {/if}
+                </div>
+              {/if}
+              {#if record.event.content_length !== undefined}
+                <div class="text-emerald-600 dark:text-emerald-400">
+                  Response: {record.event.content_length} chars
+                  {#if record.event.finish_reason}
+                    <span class="text-zinc-400">({record.event.finish_reason})</span>
+                  {/if}
+                </div>
+              {/if}
+              {#if record.event.tool_name}
+                <div class="text-violet-600 dark:text-violet-400 font-semibold flex items-center gap-1.5">
+                  <span>Tool: {record.event.tool_name}</span>
+                  {#if record.event.success !== undefined}
+                    <span class="{record.event.success ? 'text-emerald-500' : 'text-rose-500'} font-bold">
+                      {record.event.success ? '✓' : '✗'}
+                    </span>
+                  {/if}
+                </div>
+              {/if}
               {#if record.event.event_id}
                 <div class="flex items-center gap-1.5 text-zinc-500 text-[10px]">
                   <span>ID:</span>
@@ -172,6 +222,11 @@ function getStageColor(stage: string): string {
                   Session: {record.event.session_id}
                 </div>
               {/if}
+              {#if record.event.raw_text}
+                <div class="text-zinc-500 text-[10px] truncate">
+                  {record.event.raw_text}
+                </div>
+              {/if}
               {#if record.event.reason}
                 <div class="text-rose-500 text-[10px]">
                   Reason: {record.event.reason}
@@ -185,48 +240,62 @@ function getStageColor(stage: string): string {
   </div>
 
   <!-- Right Column: Rolling Terminal Console -->
-  <div class="w-full md:w-7/12 flex flex-col h-1/2 md:h-full bg-zinc-950 text-zinc-200 font-mono text-xs">
+  <div class="w-full md:w-7/12 flex flex-col h-1/2 md:h-full bg-zinc-950 text-zinc-200 font-mono text-xs sm:text-[13px]">
     <!-- Toolbar -->
-    <div class="p-2.5 bg-zinc-900 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-2 shrink-0">
-      <div class="flex items-center gap-1 text-[11px]">
+    <div class="p-3 bg-zinc-900 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-2.5 shrink-0">
+      <div class="flex items-center gap-1.5 text-xs">
         {#each levels as lvl}
           <button
             onclick={() => logStore.setFilter(lvl)}
-            class="px-2 py-0.5 rounded cursor-pointer transition text-[10px] font-semibold {logStore.filterLevel === lvl ? 'bg-zinc-800 text-white border border-zinc-700' : 'text-zinc-400 hover:text-zinc-200'}"
+            class="px-2.5 py-1 rounded cursor-pointer transition text-xs font-semibold {logStore.filterLevel === lvl ? 'bg-zinc-800 text-white border border-zinc-700' : 'text-zinc-400 hover:text-zinc-200'}"
           >
             {lvl}
           </button>
         {/each}
       </div>
 
-      <div class="flex items-center gap-2">
+      <div class="flex items-center gap-2.5">
+        <span class="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-mono {logStore.status === 'connected' ? 'bg-emerald-500/10 text-emerald-400' : logStore.status === 'connecting' || logStore.status === 'reconnecting' ? 'bg-amber-500/10 text-amber-400' : 'bg-rose-500/10 text-rose-400'}">
+          <span class="w-1.5 h-1.5 rounded-full {logStore.status === 'connected' ? 'bg-emerald-500' : logStore.status === 'connecting' || logStore.status === 'reconnecting' ? 'bg-amber-500 animate-pulse' : 'bg-rose-500'}"></span>
+          {logStore.status}
+        </span>
+        {#if logStore.status !== 'connected'}
+          <button
+            onclick={() => logStore.reconnect()}
+            class="p-1 text-indigo-400 hover:text-indigo-300 transition cursor-pointer"
+            title="Reconnect Logs WebSocket"
+          >
+            <RefreshCw class="w-3.5 h-3.5" />
+          </button>
+        {/if}
+
         <!-- Search filter input -->
         <div class="relative">
           <input
             type="text"
             bind:value={logStore.searchQuery}
             placeholder={t('common.search')}
-            class="w-36 sm:w-48 px-2 py-1 pl-6 text-[11px] bg-zinc-950 border border-zinc-800 rounded text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:border-zinc-700"
+            class="w-40 sm:w-52 px-2.5 py-1.5 pl-7 text-xs bg-zinc-950 border border-zinc-800 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-hidden focus:border-zinc-700"
           />
-          <Search class="w-3 h-3 text-zinc-500 absolute left-2 top-2" />
+          <Search class="w-3.5 h-3.5 text-zinc-500 absolute left-2 top-2" />
         </div>
 
         <!-- Auto-scroll lock toggle -->
         <button
           onclick={() => (logStore.autoScroll = !logStore.autoScroll)}
-          class="p-1 rounded cursor-pointer transition {logStore.autoScroll ? 'text-emerald-400' : 'text-zinc-500'}"
+          class="p-1.5 rounded cursor-pointer transition {logStore.autoScroll ? 'text-emerald-400' : 'text-zinc-500'}"
           title={logStore.autoScroll ? 'Auto-scroll enabled' : 'Auto-scroll paused'}
         >
-          <ArrowDown class="w-3.5 h-3.5" />
+          <ArrowDown class="w-4 h-4" />
         </button>
 
         <!-- Clear logs -->
         <button
           onclick={() => logStore.clear()}
-          class="p-1 text-zinc-400 hover:text-rose-400 transition cursor-pointer"
+          class="p-1.5 text-zinc-400 hover:text-rose-400 transition cursor-pointer"
           title={t('common.clear')}
         >
-          <Trash2 class="w-3.5 h-3.5" />
+          <Trash2 class="w-4 h-4" />
         </button>
       </div>
     </div>
@@ -234,21 +303,21 @@ function getStageColor(stage: string): string {
     <!-- Terminal logs viewport -->
     <div
       bind:this={logContainer}
-      class="flex-1 p-3 overflow-y-auto space-y-1 font-mono text-[11px] leading-relaxed select-text"
+      class="flex-1 p-3.5 overflow-y-auto space-y-1.5 font-mono text-xs sm:text-[13px] leading-relaxed select-text"
     >
       {#if logStore.filteredRecords.length === 0}
-        <div class="text-zinc-600 p-8 text-center font-sans">
+        <div class="text-zinc-600 p-8 text-center font-sans text-sm">
           {t('pipeline.empty_logs')}
         </div>
       {:else}
-        {#each logStore.filteredRecords as record (record.seq)}
-          <div class="flex items-start gap-2 hover:bg-zinc-900/60 p-0.5 rounded">
-            <span class="text-zinc-500 shrink-0 text-[10px]">{formatTime(record.timestamp_ms)}</span>
-            <span class="px-1 rounded text-[9px] font-bold shrink-0 {getLevelBadgeClass(record.level)}">
+        {#each logStore.filteredRecords as record, i (`${record.timestamp_ms}_${i}`)}
+          <div class="flex items-start gap-2.5 hover:bg-zinc-900/60 p-1 rounded">
+            <span class="text-zinc-500 shrink-0 text-xs">{formatTime(record.timestamp_ms)}</span>
+            <span class="px-1.5 rounded text-[10px] sm:text-xs font-bold shrink-0 {getLevelBadgeClass(record.level)}">
               {record.level}
             </span>
-            <span class="text-zinc-400 shrink-0 max-w-[140px] truncate text-[10px]" title={record.target}>
-              {record.target.split('::').slice(-2).join('::')}
+            <span class="text-zinc-400 shrink-0 max-w-[160px] truncate text-xs" title={record.target}>
+              {(record.target || 'kanon_core').split('::').slice(-2).join('::')}
             </span>
             <span class="text-zinc-200 break-all">{record.message}</span>
           </div>

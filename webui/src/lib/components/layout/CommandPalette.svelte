@@ -2,12 +2,13 @@
 import {
   Activity,
   Blocks,
-  Bot,
   Cpu,
   Languages,
+  MessageSquare,
   Moon,
   RefreshCw,
   Search,
+  Settings,
   Sun,
   Terminal,
   Trash2,
@@ -34,6 +35,13 @@ const commands = $derived([
     action: () => onSelectTab('overview'),
   },
   {
+    id: 'chat',
+    title: `${t('nav.chat')} (Chat)`,
+    category: 'Navigation',
+    icon: MessageSquare,
+    action: () => onSelectTab('chat'),
+  },
+  {
     id: 'pipeline',
     title: `${t('nav.pipeline')} (Pipeline & Logs)`,
     category: 'Navigation',
@@ -55,18 +63,18 @@ const commands = $derived([
     action: () => onSelectTab('sessions'),
   },
   {
-    id: 'playground',
-    title: `${t('nav.playground')} (AI Playground)`,
-    category: 'Navigation',
-    icon: Bot,
-    action: () => onSelectTab('playground'),
-  },
-  {
     id: 'providers',
-    title: `${t('nav.providers')} (System & Models)`,
+    title: `${t('nav.providers')} (Model Providers)`,
     category: 'Navigation',
     icon: Cpu,
     action: () => onSelectTab('providers'),
+  },
+  {
+    id: 'system',
+    title: `${t('nav.system')} (System Settings)`,
+    category: 'Navigation',
+    icon: Settings,
+    action: () => onSelectTab('system'),
   },
   {
     id: 'clear_logs',
@@ -137,34 +145,34 @@ function handleKeydown(e: KeyboardEvent) {
       role="dialog"
       tabindex="-1"
     >
-      <div class="flex items-center gap-2.5 px-3.5 py-2.5 border-b border-zinc-200 dark:border-zinc-800">
-        <Search class="w-4 h-4 text-zinc-400" />
+      <div class="flex items-center gap-3 px-4 py-3 border-b border-zinc-200 dark:border-zinc-800">
+        <Search class="w-4.5 h-4.5 text-zinc-400" />
         <!-- svelte-ignore a11y_autofocus -->
         <input
           type="text"
           bind:value={query}
           placeholder="Type a command or jump to page..."
-          class="w-full bg-transparent text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-hidden"
+          class="w-full bg-transparent text-sm sm:text-base text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-hidden"
           autofocus
         />
-        <kbd class="px-1.5 py-0.5 text-[10px] font-mono bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded text-zinc-400">ESC</kbd>
+        <kbd class="px-2 py-0.5 text-xs font-mono bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded text-zinc-400">ESC</kbd>
       </div>
 
-      <div class="max-h-72 overflow-y-auto p-1.5 space-y-0.5">
+      <div class="max-h-80 overflow-y-auto p-2 space-y-1">
         {#if filtered.length === 0}
-          <div class="px-3 py-6 text-center text-xs text-zinc-400">No matching commands found</div>
+          <div class="px-3 py-6 text-center text-sm text-zinc-400">No matching commands found</div>
         {:else}
           {#each filtered as item}
             {@const Icon = item.icon}
             <button
               onclick={() => execute(item)}
-              class="w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100 transition cursor-pointer text-left"
+              class="w-full flex items-center justify-between px-3.5 py-2.5 rounded-lg text-sm text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100 transition cursor-pointer text-left"
             >
-              <div class="flex items-center gap-2.5">
-                <Icon class="w-3.5 h-3.5 text-zinc-400" />
+              <div class="flex items-center gap-3">
+                <Icon class="w-4 h-4 text-zinc-400" />
                 <span class="font-medium">{item.title}</span>
               </div>
-              <span class="text-[10px] font-mono text-zinc-400">{item.category}</span>
+              <span class="text-xs font-mono text-zinc-400">{item.category}</span>
             </button>
           {/each}
         {/if}

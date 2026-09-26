@@ -1,6 +1,7 @@
 <script lang="ts">
 import {
   Bot,
+  BrainCircuit,
   CheckCircle2,
   Send,
   Sliders,
@@ -14,17 +15,19 @@ import {
 import { api } from '../../api/client';
 import { streamChatCompletion } from '../../api/sse';
 import { t } from '../../stores/i18n.svelte';
+import { providersStore } from '../../stores/providers.svelte';
 import type { ExecutedTool } from '../../types';
 
 interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  reasoning?: string;
   executedTools?: ExecutedTool[];
   timestamp: Date;
 }
 
-let sessionId = $state('webui:playground');
+let sessionId = $state('webui:chat');
 let inputMessage = $state('');
 let isStreaming = $state(false);
 let enableTools = $state(true);
@@ -43,6 +46,34 @@ async function sendMessage() {
   const text = inputMessage.trim();
   if (!text || isStreaming) return;
 
+  const activeModelKey = providersStore.activeModel;
+  let targetModel: string | undefined = activeModelKey || undefined;
+  let targetProtocol: string | undefined;
+  let targetBaseUrl: string | undefined;
+  let targetApiKey: string | undefined;
+
+  if (activeModelKey) {
+    const slashIdx = activeModelKey.indexOf('/');
+    if (slashIdx !== -1) {
+      const provName = activeModelKey.slice(0, slashIdx);
+      const modelId = activeModelKey.slice(slashIdx + 1);
+      const prov = providersStore.providers.find((p) => p.name === provName);
+      if (prov) {
+        targetModel = modelId;
+        targetProtocol = prov.protocol;
+        targetBaseUrl = prov.base_url;
+        targetApiKey = prov.api_key;
+      }
+    } else {
+      const prov = providersStore.selectedProvider;
+      if (prov) {
+        targetProtocol = prov.protocol;
+        targetBaseUrl = prov.base_url;
+        targetApiKey = prov.api_key;
+      }
+    }
+  }
+
   inputMessage = '';
   const userMsg: ChatMessage = {
     id: `usr_${Date.now()}`,
@@ -52,14 +83,30 @@ async function sendMessage() {
   };
   messages = [...messages, userMsg];
 
+  const assistantId = `ast_${Date.now()}`;
   const assistantMsg: ChatMessage = {
-    id: `ast_${Date.now()}`,
+    id: assistantId,
     role: 'assistant',
     content: '',
+    reasoning: '',
     executedTools: [],
     timestamp: new Date(),
   };
   messages = [...messages, assistantMsg];
+
+  // If no model or provider is configured and core has no active provider
+  if (!targetProtocol && !providersStore.catalog?.active?.configured) {
+    messages = messages.map((m) =>
+      m.id === assistantId
+        ? {
+            ...m,
+            content:
+              '未配置任何模型提供商。请先在「模型提供商」页面中添加提供商并选定模型。',
+          }
+        : m,
+    );
+    return;
+  }
 
   isStreaming = true;
   abortController = new AbortController();
@@ -69,29 +116,70 @@ async function sendMessage() {
       {
         session_id: sessionId,
         message: text,
+        model: targetModel,
+        protocol: targetProtocol,
+        base_url: targetBaseUrl,
+        api_key: targetApiKey || undefined,
         tools: enableTools,
       },
       {
-        onChunk: (delta) => {
-          assistantMsg.content += delta;
-          messages = [...messages];
+        onChunk: (delta, reasoning) => {
+          messages = messages.map((m) => {
+            if (m.id !== assistantId) return m;
+            return {
+              ...m,
+              content: m.content + (delta || ''),
+              reasoning: reasoning ? (m.reasoning || '') + reasoning : m.reasoning,
+            };
+          });
         },
         onFinish: () => {
           isStreaming = false;
         },
         onError: (err) => {
-          assistantMsg.content += `\n[Stream Error: ${err.message}]`;
+          messages = messages.map((m) => {
+            if (m.id !== assistantId) return m;
+            return {
+              ...m,
+              content: m.content ? m.content + `\n[错误: ${err.message}]` : `[错误: ${err.message}]`,
+            };
+          });
           isStreaming = false;
-          messages = [...messages];
         },
       },
       abortController.signal,
     );
   } catch (err) {
-    assistantMsg.content += `\n[Failed to initiate completion: ${err}]`;
+    messages = messages.map((m) => {
+      if (m.id !== assistantId) return m;
+      return {
+        ...m,
+        content: m.content ? m.content + `\n[发送请求失败: ${err}]` : `[发送请求失败: ${err}]`,
+      };
+    });
     isStreaming = false;
-    messages = [...messages];
   }
+}
+
+function parseMessageContent(msg: ChatMessage) {
+  let reasoning = msg.reasoning || '';
+  let content = msg.content || '';
+
+  if (content.includes('<think>')) {
+    const startIdx = content.indexOf('<think>');
+    const endIdx = content.indexOf('</think>');
+    if (endIdx !== -1) {
+      const thinkText = content.slice(startIdx + 7, endIdx).trim();
+      if (!reasoning) reasoning = thinkText;
+      content = (content.slice(0, startIdx) + content.slice(endIdx + 8)).trim();
+    } else {
+      const thinkText = content.slice(startIdx + 7).trim();
+      if (!reasoning) reasoning = thinkText;
+      content = content.slice(0, startIdx).trim();
+    }
+  }
+
+  return { reasoning, content };
 }
 
 function handleStop() {
@@ -110,29 +198,46 @@ function clearChat() {
 <div class="h-full flex flex-col bg-zinc-50/50 dark:bg-zinc-950/50 overflow-hidden">
   <!-- Top Control Bar -->
   <div class="p-3 border-b border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 flex items-center justify-between shrink-0">
-    <div class="flex items-center gap-3">
+    <div class="flex items-center gap-4">
       <div class="flex items-center gap-2">
-        <Bot class="w-4 h-4 text-indigo-500" />
-        <span class="text-xs font-semibold text-zinc-900 dark:text-zinc-100">{t('nav.playground')}</span>
+        <Bot class="w-4.5 h-4.5 text-indigo-500" />
+        <span class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{t('nav.chat')}</span>
       </div>
       <div class="flex items-center gap-1.5 text-xs">
-        <!-- svelte-ignore a11y_label_has_associated_control -->
-        <label class="text-zinc-400 font-mono text-[11px]">{t('sessions.session_id')}:</label>
+        <label for="chat-session-input" class="text-zinc-400 font-mono text-xs">{t('sessions.session_id')}:</label>
         <input
+          id="chat-session-input"
           type="text"
           bind:value={sessionId}
-          class="px-2 py-0.5 rounded font-mono text-xs bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-800 dark:text-zinc-200 w-36"
+          class="px-2.5 py-1 rounded-md font-mono text-xs sm:text-sm bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-800 dark:text-zinc-200 w-36"
         />
+      </div>
+
+      <div class="flex items-center gap-1.5 text-xs">
+        <label for="chat-model-select" class="text-zinc-400 font-mono text-xs">模型:</label>
+        <select
+          id="chat-model-select"
+          value={providersStore.activeModel}
+          onchange={(e) => providersStore.setActiveModel(e.currentTarget.value)}
+          class="px-2.5 py-1 rounded-md font-mono text-xs sm:text-sm bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-800 dark:text-zinc-200 max-w-56 truncate cursor-pointer"
+        >
+          {#if providersStore.allModelKeys.length === 0}
+            <option value="">未配置模型</option>
+          {/if}
+          {#each providersStore.allModelKeys as key}
+            <option value={key}>{key}</option>
+          {/each}
+        </select>
       </div>
     </div>
 
     <div class="flex items-center gap-3">
       <!-- Toggle tools -->
-      <label class="flex items-center gap-1.5 text-xs text-zinc-600 dark:text-zinc-400 cursor-pointer select-none">
+      <label class="flex items-center gap-1.5 text-xs sm:text-sm text-zinc-600 dark:text-zinc-400 cursor-pointer select-none">
         <input
           type="checkbox"
           bind:checked={enableTools}
-          class="rounded text-indigo-600 focus:ring-0"
+          class="rounded text-indigo-600 focus:ring-0 w-3.5 h-3.5"
         />
         <span>{t('playground.enable_tools')}</span>
       </label>
@@ -140,10 +245,10 @@ function clearChat() {
       <!-- Clear messages -->
       <button
         onclick={clearChat}
-        class="p-1 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition cursor-pointer"
+        class="p-1.5 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition cursor-pointer"
         title={t('common.clear')}
       >
-        <Trash2 class="w-3.5 h-3.5" />
+        <Trash2 class="w-4 h-4" />
       </button>
     </div>
   </div>
@@ -151,51 +256,89 @@ function clearChat() {
   <!-- Messages Scroll Area -->
   <div
     bind:this={chatContainer}
-    class="flex-1 p-6 overflow-y-auto space-y-4 max-w-4xl w-full mx-auto"
+    class="flex-1 p-6 overflow-y-auto space-y-5 max-w-4xl w-full mx-auto"
   >
     {#if messages.length === 0}
       <div class="p-16 text-center space-y-3">
-        <div class="w-12 h-12 rounded-2xl bg-indigo-50 dark:bg-indigo-950/60 border border-indigo-200 dark:border-indigo-800/60 flex items-center justify-center mx-auto text-indigo-600 dark:text-indigo-400">
-          <Bot class="w-6 h-6" />
+        <div class="w-14 h-14 rounded-2xl bg-indigo-50 dark:bg-indigo-950/60 border border-indigo-200 dark:border-indigo-800/60 flex items-center justify-center mx-auto text-indigo-600 dark:text-indigo-400">
+          <Bot class="w-7 h-7" />
         </div>
-        <h4 class="text-sm font-semibold text-zinc-900 dark:text-zinc-100">{t('title.playground')}</h4>
-        <p class="text-xs text-zinc-500 max-w-sm mx-auto leading-relaxed">
+        <h4 class="text-base font-semibold text-zinc-900 dark:text-zinc-100">{t('title.playground')}</h4>
+        <p class="text-sm text-zinc-500 max-w-sm mx-auto leading-relaxed">
           {t('playground.empty_chat')}
         </p>
       </div>
     {:else}
-      {#each messages as msg}
-        <div class="flex items-start gap-3 text-xs leading-relaxed {msg.role === 'user' ? 'justify-end' : 'justify-start'}">
+      {#each messages as msg (msg.id)}
+        {@const parsed = parseMessageContent(msg)}
+        {@const isLastAssistant = msg.role === 'assistant' && msg.id === messages[messages.length - 1]?.id}
+        {@const isThinkingNow = isLastAssistant && isStreaming && !parsed.content}
+
+        <div class="flex items-start gap-3.5 text-sm sm:text-base leading-relaxed {msg.role === 'user' ? 'justify-end' : 'justify-start'}">
           {#if msg.role === 'assistant'}
-            <div class="w-6 h-6 rounded-lg bg-indigo-600 text-white flex items-center justify-center shrink-0 mt-0.5">
-              <Bot class="w-3.5 h-3.5" />
+            <div class="w-8 h-8 rounded-xl bg-indigo-600 text-white flex items-center justify-center shrink-0 mt-0.5 shadow-xs">
+              <Bot class="w-4.5 h-4.5" />
             </div>
           {/if}
 
-          <div class="space-y-2 max-w-[85%] sm:max-w-2xl">
-            <div class="p-3 rounded-2xl shadow-2xs text-xs
-              {msg.role === 'user'
-                ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 font-medium'
-                : 'bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200'}">
-              <div class="whitespace-pre-wrap">{msg.content || (isStreaming ? 'Thinking...' : '')}</div>
-            </div>
+          <div class="space-y-2.5 max-w-[88%] sm:max-w-2xl w-full {msg.role === 'user' ? 'flex flex-col items-end' : ''}">
+            <!-- Thought / Reasoning block -->
+            {#if parsed.reasoning}
+              <details class="group rounded-xl border border-indigo-200/70 dark:border-indigo-900/70 bg-indigo-50/50 dark:bg-indigo-950/25 text-xs sm:text-sm overflow-hidden" open={isThinkingNow}>
+                <summary class="flex items-center gap-2 px-3.5 py-2 cursor-pointer text-indigo-700 dark:text-indigo-300 font-mono text-xs sm:text-sm select-none hover:bg-indigo-100/50 dark:hover:bg-indigo-900/40 transition">
+                  <BrainCircuit class="w-4 h-4 shrink-0 text-indigo-500 {isThinkingNow ? 'animate-pulse' : ''}" />
+                  <span class="font-medium">
+                    {isThinkingNow ? '思考中...' : '已深度思考'}
+                  </span>
+                  <span class="text-xs text-zinc-400">({parsed.reasoning.length} 字)</span>
+                </summary>
+                <div class="px-3.5 py-2.5 text-xs sm:text-[13px] text-zinc-600 dark:text-zinc-400 font-mono whitespace-pre-wrap border-t border-indigo-100 dark:border-indigo-950 bg-white/60 dark:bg-zinc-950/50 max-h-64 overflow-y-auto leading-relaxed">
+                  {parsed.reasoning}
+                </div>
+              </details>
+            {:else if isThinkingNow}
+              <div class="flex items-center gap-2 px-3.5 py-2 rounded-xl border border-indigo-200/70 dark:border-indigo-900/70 bg-indigo-50/50 dark:bg-indigo-950/25 text-indigo-600 dark:text-indigo-400 font-mono text-xs sm:text-sm animate-pulse">
+                <BrainCircuit class="w-4 h-4 shrink-0" />
+                <span>思考中 (Thinking)...</span>
+              </div>
+            {/if}
+
+            <!-- Main Message Bubble -->
+            {#if msg.role === 'user'}
+              <div class="p-3.5 sm:p-4 rounded-2xl shadow-2xs text-sm sm:text-base leading-relaxed bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900 font-medium">
+                <div class="whitespace-pre-wrap">{msg.content}</div>
+              </div>
+            {:else if parsed.content}
+              <div class="p-3.5 sm:p-4 rounded-2xl shadow-2xs text-sm sm:text-base leading-relaxed bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-800 dark:text-zinc-200">
+                <div class="whitespace-pre-wrap">{parsed.content}</div>
+              </div>
+            {:else if isLastAssistant && isStreaming && parsed.reasoning}
+              <div class="flex items-center gap-2 text-zinc-400 font-mono text-xs sm:text-sm px-2 py-1">
+                <span class="w-2 h-2 rounded-full bg-indigo-500 animate-pulse"></span>
+                <span>正在组织回复...</span>
+              </div>
+            {:else if !isStreaming && !parsed.reasoning}
+              <div class="p-3.5 sm:p-4 rounded-2xl shadow-2xs text-xs sm:text-sm bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/50 text-amber-700 dark:text-amber-300">
+                <div class="whitespace-pre-wrap">{parsed.content || '[无文本回复内容]'}</div>
+              </div>
+            {/if}
 
             <!-- Executed Tools inspection cards -->
             {#if msg.executedTools && msg.executedTools.length > 0}
-              <div class="space-y-1">
+              <div class="space-y-1.5">
                 {#each msg.executedTools as tool}
-                  <div class="p-2 rounded-lg bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 flex items-center justify-between text-[11px] font-mono">
-                    <div class="flex items-center gap-1.5">
-                      <Wrench class="w-3 h-3 text-indigo-500" />
+                  <div class="p-2.5 rounded-lg bg-zinc-100 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 flex items-center justify-between text-xs font-mono">
+                    <div class="flex items-center gap-2">
+                      <Wrench class="w-3.5 h-3.5 text-indigo-500" />
                       <span class="font-bold">{tool.tool_name}</span>
                       <span class="text-zinc-400">({tool.plugin_id})</span>
                     </div>
                     <span class="flex items-center gap-1 {tool.success ? 'text-emerald-500' : 'text-rose-500'} font-semibold">
                       {#if tool.success}
-                        <CheckCircle2 class="w-3 h-3" />
+                        <CheckCircle2 class="w-3.5 h-3.5" />
                         <span>Success</span>
                       {:else}
-                        <XCircle class="w-3 h-3" />
+                        <XCircle class="w-3.5 h-3.5" />
                         <span>Failed</span>
                       {/if}
                     </span>
@@ -206,8 +349,8 @@ function clearChat() {
           </div>
 
           {#if msg.role === 'user'}
-            <div class="w-6 h-6 rounded-lg bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center shrink-0 mt-0.5">
-              <User class="w-3.5 h-3.5" />
+            <div class="w-8 h-8 rounded-xl bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-300 flex items-center justify-center shrink-0 mt-0.5">
+              <User class="w-4.5 h-4.5" />
             </div>
           {/if}
         </div>
@@ -217,27 +360,27 @@ function clearChat() {
 
   <!-- Input Bar -->
   <div class="p-4 border-t border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shrink-0">
-    <div class="max-w-4xl mx-auto flex items-center gap-2">
+    <div class="max-w-4xl mx-auto flex items-center gap-2.5">
       <input
         type="text"
         bind:value={inputMessage}
         onkeydown={(e) => e.key === 'Enter' && sendMessage()}
         placeholder={t('playground.placeholder')}
-        class="flex-1 px-3.5 py-2.5 rounded-xl bg-zinc-100 dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 text-xs text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-hidden focus:border-zinc-400 dark:focus:border-zinc-600"
+        class="flex-1 px-4 py-3 rounded-xl bg-zinc-100 dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 text-sm sm:text-base text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-hidden focus:border-zinc-400 dark:focus:border-zinc-600"
       />
       {#if isStreaming}
         <button
           onclick={handleStop}
-          class="p-2.5 bg-rose-600 hover:bg-rose-500 text-white rounded-xl font-medium transition cursor-pointer flex items-center justify-center"
+          class="p-3 bg-rose-600 hover:bg-rose-500 text-white rounded-xl font-medium transition cursor-pointer flex items-center justify-center"
           title="Stop generation"
         >
-          <Square class="w-4 h-4 fill-current" />
+          <Square class="w-4.5 h-4.5 fill-current" />
         </button>
       {:else}
         <button
           onclick={sendMessage}
           disabled={!inputMessage.trim()}
-          class="p-2.5 bg-zinc-900 hover:bg-zinc-800 dark:bg-zinc-100 dark:hover:bg-zinc-200 text-white dark:text-zinc-900 rounded-xl font-medium transition cursor-pointer flex items-center justify-center disabled:opacity-40"
+          class="p-3 bg-zinc-900 hover:bg-zinc-800 dark:bg-zinc-100 dark:hover:bg-zinc-200 text-white dark:text-zinc-900 rounded-xl font-medium transition cursor-pointer flex items-center justify-center disabled:opacity-40"
           title={t('playground.send')}
         >
           <Send class="w-4 h-4" />

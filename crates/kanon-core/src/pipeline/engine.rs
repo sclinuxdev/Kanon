@@ -334,7 +334,7 @@ impl PipelineEngine {
         match self.deliver_outbound(request.clone()).await {
             Ok(outcome) => {
                 breaker.record_success(start.elapsed());
-                tracing::debug!(
+                tracing::info!(
                     platform = %outcome.platform,
                     channel_id = %channel_id,
                     message_id = %outcome.message_id,
@@ -728,7 +728,58 @@ impl PipelineEngine {
                 sender_id: recipient_id.clone(),
             });
 
+            tracing::info!(
+                platform = %platform,
+                channel_id = %channel_id,
+                sender_id = %recipient_id,
+                event_id = %event_id,
+                "Pipeline received inbound event"
+            );
+
             let result = self.process_event(event).await;
+
+            match &result {
+                PipelineResult::LlmReplied { content, .. } => {
+                    tracing::info!(
+                        platform = %platform,
+                        channel_id = %channel_id,
+                        content_len = content.len(),
+                        "Pipeline generated LLM reply"
+                    );
+                }
+                PipelineResult::CommandExecuted { command, success, .. } => {
+                    tracing::info!(
+                        platform = %platform,
+                        channel_id = %channel_id,
+                        command = %command,
+                        success = %success,
+                        "Pipeline executed command"
+                    );
+                }
+                PipelineResult::Blocked { host_id, .. } => {
+                    tracing::info!(
+                        platform = %platform,
+                        channel_id = %channel_id,
+                        host_id = %host_id,
+                        "Pipeline event blocked by PreFilter"
+                    );
+                }
+                PipelineResult::CommandNotFound { command } => {
+                    tracing::info!(
+                        platform = %platform,
+                        channel_id = %channel_id,
+                        command = %command,
+                        "Pipeline slash command not found"
+                    );
+                }
+                PipelineResult::Passed(_) => {
+                    tracing::info!(
+                        platform = %platform,
+                        channel_id = %channel_id,
+                        "Pipeline event passed (no matching slash command or active LLM provider)"
+                    );
+                }
+            }
 
             let replies = match &result {
                 PipelineResult::Blocked { replies, .. } => replies,

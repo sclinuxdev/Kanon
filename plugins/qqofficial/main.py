@@ -187,6 +187,8 @@ class QQOfficialAdapter(Plugin):
             )
             if not resp.accepted:
                 print(f"[QQOfficial] Core queue backpressure: dropped message {msg_id}", flush=True)
+            else:
+                print(f"[QQOfficial] Successfully ingested message {msg_id} into Kanon Core", flush=True)
         except Exception as e:
             print(f"[QQOfficial] Ingest RPC failed: {e}", flush=True)
 

@@ -59,6 +59,14 @@ class HostServiceImpl(pb_grpc.PluginHostServiceServicer):
             new_config = MessageToDict(request.config)
             if self.plugin.context is not None:
                 self.plugin.context.config = new_config
+            try:
+                await self.plugin.on_config_reload(new_config)
+            except Exception as e:
+                return pb.ReloadPluginConfigResponse(
+                    success=False,
+                    error_message=f"on_config_reload hook failed: {e}",
+                    applied_version=current_version,
+                )
         return pb.ReloadPluginConfigResponse(
             success=True,
             error_message="",

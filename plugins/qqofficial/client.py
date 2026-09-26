@@ -38,6 +38,12 @@ class KanonBotClient(botpy.Client):
 
     async def on_group_at_message_create(self, message: GroupMessage) -> None:
         """Handles group @ mentions."""
+        content = (message.content or "").strip()
+        print(
+            f"[QQOfficial] Received Group @ Message from member={message.author.member_openid} "
+            f"in group={message.group_openid}: '{content}' (id={message.id})",
+            flush=True,
+        )
         mentions: List[str] = [
             getattr(m, "member_openid", "")
             for m in getattr(message, "mentions", [])
@@ -45,7 +51,7 @@ class KanonBotClient(botpy.Client):
         await self.adapter.ingest_qq_message(
             channel_id=f"group:{message.group_openid}",
             sender_id=message.author.member_openid,
-            content=(message.content or "").strip(),
+            content=content,
             msg_id=message.id,
             scene="group",
             extra={"mentions": mentions},
@@ -53,10 +59,16 @@ class KanonBotClient(botpy.Client):
 
     async def on_group_message_create(self, message: GroupMessage) -> None:
         """Handles unmentioned group messages for authorized private domain bots."""
+        content = (message.content or "").strip()
+        print(
+            f"[QQOfficial] Received Group Message from member={message.author.member_openid} "
+            f"in group={message.group_openid}: '{content}' (id={message.id})",
+            flush=True,
+        )
         await self.adapter.ingest_qq_message(
             channel_id=f"group:{message.group_openid}",
             sender_id=message.author.member_openid,
-            content=(message.content or "").strip(),
+            content=content,
             msg_id=message.id,
             scene="group",
             extra={"unmentioned": True},
@@ -64,20 +76,32 @@ class KanonBotClient(botpy.Client):
 
     async def on_c2c_message_create(self, message: C2CMessage) -> None:
         """Handles direct private messages (C2C)."""
+        content = (message.content or "").strip()
+        print(
+            f"[QQOfficial] Received C2C Private Message from user={message.author.user_openid}: "
+            f"'{content}' (id={message.id})",
+            flush=True,
+        )
         await self.adapter.ingest_qq_message(
             channel_id=f"c2c:{message.author.user_openid}",
             sender_id=message.author.user_openid,
-            content=(message.content or "").strip(),
+            content=content,
             msg_id=message.id,
             scene="c2c",
         )
 
     async def on_at_message_create(self, message: Message) -> None:
         """Handles guild channel @ mentions."""
+        content = (message.content or "").strip()
+        print(
+            f"[QQOfficial] Received Guild @ Message from author={message.author.id} "
+            f"in channel={message.channel_id}: '{content}' (id={message.id})",
+            flush=True,
+        )
         await self.adapter.ingest_qq_message(
             channel_id=f"guild:{message.channel_id}",
             sender_id=message.author.id,
-            content=(message.content or "").strip(),
+            content=content,
             msg_id=message.id,
             scene="guild",
             extra={"guild_id": getattr(message, "guild_id", "")},
@@ -85,10 +109,16 @@ class KanonBotClient(botpy.Client):
 
     async def on_message_create(self, message: Message) -> None:
         """Handles unmentioned guild channel messages for authorized bots."""
+        content = (message.content or "").strip()
+        print(
+            f"[QQOfficial] Received Guild Message from author={message.author.id} "
+            f"in channel={message.channel_id}: '{content}' (id={message.id})",
+            flush=True,
+        )
         await self.adapter.ingest_qq_message(
             channel_id=f"guild:{message.channel_id}",
             sender_id=message.author.id,
-            content=(message.content or "").strip(),
+            content=content,
             msg_id=message.id,
             scene="guild",
             extra={"guild_id": getattr(message, "guild_id", ""), "unmentioned": True},
@@ -96,11 +126,18 @@ class KanonBotClient(botpy.Client):
 
     async def on_direct_message_create(self, message: DirectMessage) -> None:
         """Handles direct messages within guild."""
+        content = (message.content or "").strip()
         channel_id = getattr(message, "channel_id", "") or getattr(message, "guild_id", "")
+        author_id = getattr(message.author, "id", "")
+        print(
+            f"[QQOfficial] Received Guild DM from author={author_id} "
+            f"in channel={channel_id}: '{content}' (id={message.id})",
+            flush=True,
+        )
         await self.adapter.ingest_qq_message(
             channel_id=f"guild_dm:{channel_id}",
-            sender_id=getattr(message.author, "id", ""),
-            content=(message.content or "").strip(),
+            sender_id=author_id,
+            content=content,
             msg_id=message.id,
             scene="guild_dm",
         )

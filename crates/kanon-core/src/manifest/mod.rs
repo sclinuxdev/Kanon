@@ -129,3 +129,6 @@ impl PluginManifest {
         Ok(manifest)
     }
 }
+
+pub mod scanner;
+pub use scanner::{DiscoveredPlugin, PluginScanner};

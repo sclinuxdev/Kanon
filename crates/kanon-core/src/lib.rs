@@ -16,7 +16,10 @@ pub use adapter::{
     PlatformAdapter,
 };
 pub use ipc::{CoreApiService, CoreIpcServer};
-pub use manifest::{AdapterSection, PluginManifest, PluginSection, ToolDefinitionEntry};
+pub use manifest::{
+    AdapterSection, DiscoveredPlugin, PluginManifest, PluginScanner, PluginSection,
+    ToolDefinitionEntry,
+};
 pub use pipeline::{
     CommandRouter, DeliveryOutcome, MatchedCommand, PipelineEngine, PipelineObserver,
     PipelineResult, PipelineStage, PreFilterChain, PreFilterOutcome,
@@ -24,5 +27,5 @@ pub use pipeline::{
 };
 pub use supervisor::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState},
-    AdapterRoute, LaunchSpec, ManagedHost, Supervisor, SupervisorError,
+    AdapterRoute, LaunchSpec, ManagedHost, Supervisor, SupervisorError, UnavailablePlugin,
 };

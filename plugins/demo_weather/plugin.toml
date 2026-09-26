@@ -1,0 +1,21 @@
+[plugin]
+id = "org.kanon.plugin.weather"
+name = "Demo Weather Plugin"
+version = "0.1.0"
+author = "Kanon Dev"
+description = "Demonstration weather plugin for Kanon"
+runtime = "rust"
+entrypoint = "bin/demo_weather"
+isolated = false
+priority = 200
+
+[[commands]]
+name = "weather"
+description = "Fetch current weather report"
+usage = "/weather <city>"
+priority = 200
+
+[[tools]]
+name = "fetch_weather"
+description = "Fetch current weather data for a given city"
+parameters = { type = "object", properties = { city = { type = "string", description = "The city to query weather for" } }, required = ["city"] }

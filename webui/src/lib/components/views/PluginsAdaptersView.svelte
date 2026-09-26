@@ -4,12 +4,16 @@ import {
   Boxes,
   CheckCircle2,
   ChevronDown,
+  Folder,
   Play,
+  Plus,
   Radio,
   RefreshCw,
   Save,
   Send,
   Settings,
+  Upload,
+  X,
   XCircle,
 } from 'lucide-svelte';
 import { api } from '../../api/client';
@@ -24,6 +28,58 @@ let hosts = $state<PluginHost[]>([]);
 let adapters = $state<AdapterItem[]>([]);
 let loading = $state(true);
 let error = $state<string | null>(null);
+
+// Install Plugin Modal
+let installModalOpen = $state(false);
+let installTab = $state<'path' | 'archive'>('path');
+let localPathInput = $state('');
+let archiveFile = $state<File | null>(null);
+let installLoading = $state(false);
+let installError = $state<string | null>(null);
+let installSuccess = $state<string | null>(null);
+
+function openInstallModal() {
+  installModalOpen = true;
+  installError = null;
+  installSuccess = null;
+  localPathInput = '';
+  archiveFile = null;
+}
+
+function handleArchiveFileChange(event: Event) {
+  const target = event.target as HTMLInputElement;
+  if (target.files && target.files.length > 0) {
+    archiveFile = target.files[0];
+  } else {
+    archiveFile = null;
+  }
+}
+
+async function handleInstall() {
+  installLoading = true;
+  installError = null;
+  installSuccess = null;
+  try {
+    if (installTab === 'path') {
+      if (!localPathInput.trim()) {
+        throw new Error('Please enter a local directory path');
+      }
+      const res = await api.installPluginPath(localPathInput.trim());
+      installSuccess = `${t('plugins.install_success')} (${res.plugin_id}, status: ${res.status})`;
+    } else {
+      if (!archiveFile) {
+        throw new Error('Please select a .kpk or .zip archive file');
+      }
+      const res = await api.installPluginArchive(archiveFile);
+      installSuccess = `${t('plugins.install_success')} (${res.plugin_id}, status: ${res.status})`;
+    }
+    await loadData();
+  } catch (e) {
+    installError = e instanceof Error ? e.message : String(e);
+  } finally {
+    installLoading = false;
+  }
+}
 
 // Selected plugin for config modal / panel
 let selectedPluginId = $state<string | null>(null);
@@ -138,13 +194,22 @@ $effect(() => {
       <h3 class="text-base sm:text-lg font-semibold text-zinc-900 dark:text-zinc-100 tracking-tight">{t('plugins.hosts_title')}</h3>
       <p class="text-xs sm:text-sm text-zinc-500">{t('subtitle.plugins')}</p>
     </div>
-    <button
-      onclick={loadData}
-      class="px-3 py-1.5 text-xs sm:text-sm font-medium rounded-lg bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700 transition cursor-pointer flex items-center gap-1.5 shadow-2xs"
-    >
-      <RefreshCw class="w-4 h-4" />
-      <span>{t('common.refresh')}</span>
-    </button>
+    <div class="flex items-center gap-2">
+      <button
+        onclick={openInstallModal}
+        class="px-3 py-1.5 text-xs sm:text-sm font-medium rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition cursor-pointer flex items-center gap-1.5 shadow-2xs"
+      >
+        <Plus class="w-4 h-4" />
+        <span>{t('plugins.install')}</span>
+      </button>
+      <button
+        onclick={loadData}
+        class="px-3 py-1.5 text-xs sm:text-sm font-medium rounded-lg bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-700 transition cursor-pointer flex items-center gap-1.5 shadow-2xs"
+      >
+        <RefreshCw class="w-4 h-4" />
+        <span>{t('common.refresh')}</span>
+      </button>
+    </div>
   </div>
 
   {#if loading}
@@ -167,9 +232,15 @@ $effect(() => {
               <div class="flex items-center gap-2.5">
                 <Boxes class="w-4.5 h-4.5 text-zinc-500" />
                 <span class="font-mono font-bold text-base text-zinc-900 dark:text-zinc-100">{host.host_id}</span>
-                <span class="px-2 py-0.5 text-xs font-mono bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded text-zinc-600 dark:text-zinc-400">
-                  runtime: {host.runtime} (PID: {host.pid})
-                </span>
+                {#if host.status === 'RuntimeUnavailable'}
+                  <span class="px-2 py-0.5 text-xs font-mono bg-amber-500/10 border border-amber-500/20 rounded text-amber-600 dark:text-amber-400">
+                    {t('plugins.runtime_unavailable')}
+                  </span>
+                {:else}
+                  <span class="px-2 py-0.5 text-xs font-mono bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded text-zinc-600 dark:text-zinc-400">
+                    runtime: {host.runtime} (PID: {host.pid ?? 'N/A'})
+                  </span>
+                {/if}
               </div>
               <div class="flex items-center gap-2">
                 <button
@@ -370,3 +441,126 @@ $effect(() => {
     </div>
   </div>
 {/if}
+
+<!-- Install Plugin Modal -->
+{#if installModalOpen}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div
+    class="fixed inset-0 bg-black/40 backdrop-blur-xs z-50 flex items-center justify-center p-4"
+    onclick={() => (installModalOpen = false)}
+    role="button"
+    tabindex="-1"
+  >
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <div
+      class="w-full max-w-lg bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl shadow-2xl p-6 space-y-4"
+      onclick={(e) => e.stopPropagation()}
+      role="dialog"
+      tabindex="-1"
+    >
+      <div class="flex items-center justify-between border-b border-zinc-200 dark:border-zinc-800 pb-3">
+        <h3 class="text-base font-semibold text-zinc-900 dark:text-zinc-100 flex items-center gap-2">
+          <Plus class="w-4 h-4 text-indigo-500" />
+          <span>{t('plugins.install_modal_title')}</span>
+        </h3>
+        <button
+          onclick={() => (installModalOpen = false)}
+          class="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 p-1 cursor-pointer"
+        >
+          <X class="w-4 h-4" />
+        </button>
+      </div>
+
+      <!-- Tab switcher -->
+      <div class="flex rounded-lg bg-zinc-100 dark:bg-zinc-800/80 p-1 text-xs sm:text-sm">
+        <button
+          type="button"
+          onclick={() => { installTab = 'path'; installError = null; installSuccess = null; }}
+          class="flex-1 py-1.5 px-3 rounded-md font-medium transition cursor-pointer flex items-center justify-center gap-1.5 {installTab === 'path' ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-2xs' : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}"
+        >
+          <Folder class="w-3.5 h-3.5" />
+          <span>{t('plugins.tab_local_path')}</span>
+        </button>
+        <button
+          type="button"
+          onclick={() => { installTab = 'archive'; installError = null; installSuccess = null; }}
+          class="flex-1 py-1.5 px-3 rounded-md font-medium transition cursor-pointer flex items-center justify-center gap-1.5 {installTab === 'archive' ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-2xs' : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}"
+        >
+          <Upload class="w-3.5 h-3.5" />
+          <span>{t('plugins.tab_upload_archive')}</span>
+        </button>
+      </div>
+
+      <!-- Tab content -->
+      {#if installTab === 'path'}
+        <div class="space-y-1.5">
+          <!-- svelte-ignore a11y_label_has_associated_control -->
+          <label class="block text-xs sm:text-sm font-medium text-zinc-700 dark:text-zinc-300">
+            {t('plugins.local_path_label')}
+          </label>
+          <input
+            type="text"
+            bind:value={localPathInput}
+            placeholder={t('plugins.local_path_placeholder')}
+            class="w-full px-3 py-2 rounded-lg bg-zinc-50 dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 font-mono text-xs sm:text-sm focus:outline-hidden"
+          />
+          <p class="text-xs text-zinc-500">{t('plugins.local_path_help')}</p>
+        </div>
+      {:else}
+        <div class="space-y-1.5">
+          <!-- svelte-ignore a11y_label_has_associated_control -->
+          <label class="block text-xs sm:text-sm font-medium text-zinc-700 dark:text-zinc-300">
+            {t('plugins.archive_label')}
+          </label>
+          <input
+            type="file"
+            accept=".kpk,.zip,application/zip"
+            onchange={handleArchiveFileChange}
+            class="w-full text-xs text-zinc-500 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:text-xs file:font-medium file:bg-zinc-100 dark:file:bg-zinc-800 file:text-zinc-700 dark:file:text-zinc-200 hover:file:bg-zinc-200 dark:hover:file:bg-zinc-700 cursor-pointer"
+          />
+          <p class="text-xs text-zinc-500">{t('plugins.archive_help')}</p>
+        </div>
+      {/if}
+
+      <!-- Status alerts -->
+      {#if installError}
+        <div class="p-3 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-600 dark:text-rose-400 text-xs sm:text-sm flex items-start gap-2">
+          <AlertTriangle class="w-4 h-4 shrink-0 mt-0.5" />
+          <span>{installError}</span>
+        </div>
+      {/if}
+
+      {#if installSuccess}
+        <div class="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-600 dark:text-emerald-400 text-xs sm:text-sm flex items-start gap-2">
+          <CheckCircle2 class="w-4 h-4 shrink-0 mt-0.5" />
+          <span>{installSuccess}</span>
+        </div>
+      {/if}
+
+      <!-- Action buttons -->
+      <div class="flex items-center justify-end gap-2 pt-2 border-t border-zinc-100 dark:border-zinc-800">
+        <button
+          onclick={() => (installModalOpen = false)}
+          disabled={installLoading}
+          class="px-3.5 py-2 text-xs sm:text-sm text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 rounded-lg transition cursor-pointer"
+        >
+          {t('common.cancel')}
+        </button>
+        <button
+          onclick={handleInstall}
+          disabled={installLoading || (installTab === 'path' ? !localPathInput.trim() : !archiveFile)}
+          class="px-4 py-2 text-xs sm:text-sm bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-medium transition cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
+        >
+          {#if installLoading}
+            <RefreshCw class="w-4 h-4 animate-spin" />
+            <span>{t('plugins.installing')}</span>
+          {:else}
+            <Plus class="w-4 h-4" />
+            <span>{t('plugins.install_btn')}</span>
+          {/if}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+

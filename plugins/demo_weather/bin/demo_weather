@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Runner / test stub for demo-weather plugin.
+# Prefers pre-compiled workspace target binary; falls back to cargo run.
+set -e
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$DIR/../.."
+BIN="$ROOT/target/debug/demo-weather"
+
+if [ -x "$BIN" ]; then
+    exec "$BIN" "$@"
+else
+    exec cargo run --quiet -p demo-weather -- "$@"
+fi

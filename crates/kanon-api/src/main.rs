@@ -58,6 +58,17 @@ async fn main() -> StartupResult<()> {
         Some(socket_path.clone()),
     ));
 
+    // Ensure ./plugins and ./data/plugins directories exist
+    if let Err(err) = std::fs::create_dir_all("./plugins") {
+        tracing::warn!(error = %err, "Failed to ensure ./plugins directory exists");
+    }
+    if let Err(err) = std::fs::create_dir_all("./data/plugins") {
+        tracing::warn!(error = %err, "Failed to ensure ./data/plugins directory exists");
+    }
+
+    // Auto-discover and launch declared plugins from ./plugins directory
+    load_plugins_from_directory(&supervisor, "./plugins").await;
+
     // --- Platform adapters ------------------------------------------------------------
     register_webhook_adapter(&supervisor).await?;
     for (platform, error) in supervisor.adapters().start_all(ingress.clone()).await {
@@ -209,4 +220,50 @@ fn resolve_api_addr() -> StartupResult<SocketAddr> {
     let raw = std::env::var("KANON_API_ADDR").unwrap_or_else(|_| DEFAULT_API_ADDR.to_string());
     raw.parse::<SocketAddr>()
         .map_err(|err| format!("Invalid KANON_API_ADDR '{raw}': {err}").into())
+}
+
+/// Discovers plugins in the specified directory and launches their host processes.
+///
+/// Missing runtime environments (e.g. Python / TypeScript) or individual manifest errors
+/// degrade gracefully to ensure the core microkernel and API gateway remain operational.
+async fn load_plugins_from_directory(supervisor: &Arc<Supervisor>, dir: impl AsRef<std::path::Path>) {
+    let plugins = match kanon_core::PluginScanner::scan(dir.as_ref()) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(dir = %dir.as_ref().display(), error = %e, "Failed to scan plugins directory");
+            return;
+        }
+    };
+
+    tracing::info!(count = plugins.len(), "Discovered plugins during startup scan");
+
+    for discovered in plugins {
+        let plugin_id = discovered.manifest.plugin.id.clone();
+        let runtime = discovered.manifest.plugin.runtime.clone();
+        match supervisor.spawn_from_manifest(&discovered.manifest_path, None).await {
+            Ok(host) => {
+                tracing::info!(
+                    plugin_id = %plugin_id,
+                    host_id = %host.host_id,
+                    runtime = %runtime,
+                    "Plugin host launched and ready"
+                );
+            }
+            Err(kanon_core::SupervisorError::RuntimeUnavailable { runtime, reason }) => {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    runtime = %runtime,
+                    reason = %reason,
+                    "Plugin runtime is unavailable on this host; marked as RuntimeUnavailable"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    plugin_id = %plugin_id,
+                    error = %err,
+                    "Failed to launch plugin host; skipping gracefully without blocking startup"
+                );
+            }
+        }
+    }
 }

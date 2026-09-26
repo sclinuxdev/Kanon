@@ -4,6 +4,7 @@ import type {
   ChatCompletionResponse,
   FetchModelsRequest,
   FetchModelsResponse,
+  InstallPluginResponse,
   NodeHealth,
   PersonasResponse,
   PluginConfigResponse,
@@ -74,6 +75,34 @@ export const api = {
     }),
 
   getPlugins: () => request<PluginsResponse>('/api/v1/plugins'),
+  installPluginPath: (path: string) =>
+    request<InstallPluginResponse>('/api/v1/plugins/install', {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    }),
+  installPluginArchive: async (file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch('/api/v1/plugins/install', {
+      method: 'POST',
+      body: formData,
+    });
+    if (!res.ok) {
+      let code = 'error';
+      let message = `HTTP ${res.status}: ${res.statusText}`;
+      try {
+        const errJson = await res.json();
+        if (errJson.error?.code) code = errJson.error.code;
+        else if (errJson.code) code = errJson.code;
+        if (errJson.error?.message) message = errJson.error.message;
+        else if (errJson.message) message = errJson.message;
+      } catch {
+        // ignore json parse error
+      }
+      throw new ApiError(res.status, code, message);
+    }
+    return res.json() as Promise<InstallPluginResponse>;
+  },
   getPluginConfig: (pluginId: string) =>
     request<PluginConfigResponse>(
       `/api/v1/plugins/${encodeURIComponent(pluginId)}/config`,

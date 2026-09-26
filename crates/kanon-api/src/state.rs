@@ -50,6 +50,8 @@ struct ApiStateInner {
     observability: Arc<Observability>,
     /// Fast-ACK ingest handle driving the inbound data plane, absent when no pipeline is attached.
     ingress: Option<EventIngress>,
+    /// Base directory where discovered and installed plugins are stored.
+    plugins_dir: PathBuf,
 }
 
 impl ApiState {
@@ -112,6 +114,11 @@ impl ApiState {
     pub fn ingress(&self) -> Option<&EventIngress> {
         self.inner.ingress.as_ref()
     }
+
+    /// Plugins directory handle.
+    pub fn plugins_dir(&self) -> &std::path::Path {
+        &self.inner.plugins_dir
+    }
 }
 
 /// Fluent builder assembling [`ApiState`].
@@ -126,6 +133,7 @@ pub struct ApiStateBuilder {
     config_base_dir: Option<PathBuf>,
     observability: Option<Arc<Observability>>,
     ingress: Option<EventIngress>,
+    plugins_dir: Option<PathBuf>,
 }
 
 /// Model provider awaiting agent construction at build time.
@@ -149,12 +157,19 @@ impl ApiStateBuilder {
             config_base_dir: None,
             observability: None,
             ingress: None,
+            plugins_dir: None,
         }
     }
 
     /// Overrides the version string reported by the gateway.
     pub fn with_version(mut self, version: impl Into<String>) -> Self {
         self.version = version.into();
+        self
+    }
+
+    /// Overrides the directory where plugins are discovered and installed.
+    pub fn with_plugins_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.plugins_dir = Some(dir.into());
         self
     }
 
@@ -273,6 +288,8 @@ impl ApiStateBuilder {
             None => PluginConfigStore::default(),
         });
 
+        let plugins_dir = self.plugins_dir.unwrap_or_else(|| PathBuf::from("./plugins"));
+
         ApiState {
             inner: Arc::new(ApiStateInner {
                 started_at: Instant::now(),
@@ -284,6 +301,7 @@ impl ApiStateBuilder {
                 config_store,
                 observability,
                 ingress: self.ingress,
+                plugins_dir,
             }),
         }
     }

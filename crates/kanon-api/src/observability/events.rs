@@ -101,6 +101,13 @@ pub enum TraceEvent {
         /// Host process that was restarted.
         host_id: String,
     },
+    /// A new plugin was installed and activated.
+    PluginInstalled {
+        /// Identifier of the installed plugin.
+        plugin_id: String,
+        /// Host process identifier.
+        host_id: String,
+    },
 }
 
 impl TraceEvent {
@@ -117,6 +124,7 @@ impl TraceEvent {
             TraceEvent::PersonaSwitched { .. } => "persona_switched",
             TraceEvent::PluginConfigUpdated { .. } => "plugin_config_updated",
             TraceEvent::PluginRestarted { .. } => "plugin_restarted",
+            TraceEvent::PluginInstalled { .. } => "plugin_installed",
         }
     }
 
@@ -264,7 +272,8 @@ impl EventBus {
             | TraceEvent::SessionReset { .. }
             | TraceEvent::PersonaSwitched { .. }
             | TraceEvent::PluginConfigUpdated { .. }
-            | TraceEvent::PluginRestarted { .. } => {}
+            | TraceEvent::PluginRestarted { .. }
+            | TraceEvent::PluginInstalled { .. } => {}
         }
     }
 }

@@ -132,14 +132,15 @@ export interface PluginMeta {
   name: string;
   version: string;
   description?: string;
+  status?: string;
   commands: CommandDescriptor[];
   tools: ToolDescriptor[];
 }
 
 export interface PluginHost {
   host_id: string;
-  runtime: string;
-  pid: number;
+  runtime?: string;
+  pid?: number | null;
   status: string;
   plugins: PluginMeta[];
 }
@@ -147,6 +148,18 @@ export interface PluginHost {
 export interface PluginsResponse {
   total: number;
   hosts: PluginHost[];
+  plugins: PluginMeta[];
+}
+
+export interface InstallPluginResponse {
+  plugin_id: string;
+  name: string;
+  version: string;
+  runtime: string;
+  commands: CommandDescriptor[];
+  tools: ToolDescriptor[];
+  status: string;
+  message?: string;
 }
 
 export interface PluginConfigResponse {

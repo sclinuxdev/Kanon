@@ -156,7 +156,9 @@ pub async fn fixture_state(config_dir: PathBuf, with_agent: bool) -> ApiState {
     // detached from the returned state; only the config directory must outlive this function.
     std::mem::forget(temp);
 
-    let mut builder = ApiState::builder(supervisor).with_config_dir(config_dir);
+    let mut builder = ApiState::builder(supervisor)
+        .with_config_dir(config_dir.clone())
+        .with_plugins_dir(config_dir.join("plugins"));
     if with_agent {
         builder = builder.with_llm_provider(
             "test-agent",

@@ -143,6 +143,19 @@ pub struct ManagedHost {
     pub circuit_breaker: Arc<CircuitBreaker>,
 }
 
+/// Represents a plugin whose launch was deferred or failed due to runtime unavailability.
+#[derive(Debug, Clone)]
+pub struct UnavailablePlugin {
+    /// Parsed manifest of the plugin.
+    pub manifest: PluginManifest,
+    /// Path to the manifest file on disk.
+    pub manifest_path: PathBuf,
+    /// Reason explaining why the runtime could not be activated.
+    pub reason: String,
+    /// Lifecycle status, typically "RuntimeUnavailable".
+    pub status: String,
+}
+
 impl ManagedHost {
     /// Creates a new `ManagedHost` with an established channel, primarily used in testing or direct registration.
     ///
@@ -167,6 +180,11 @@ impl ManagedHost {
             manifest: None,
             circuit_breaker: Arc::new(CircuitBreaker::with_defaults()),
         }
+    }
+
+    /// Returns the OS process identifier (PID) of the managed child process, if running.
+    pub async fn pid(&self) -> Option<u32> {
+        self.child.lock().await.as_ref().and_then(|c| c.id())
     }
 
     /// Attaches an adaptive circuit breaker configuration to this host.
@@ -434,6 +452,8 @@ pub struct Supervisor {
     adapters: Arc<AdapterRegistry>,
     /// Monotonically increasing configuration version tracking per plugin for CAS updates.
     config_versions: Arc<RwLock<HashMap<String, u64>>>,
+    /// Plugins whose launch was prevented or deferred due to missing runtime environments.
+    unavailable_plugins: Arc<RwLock<HashMap<String, UnavailablePlugin>>>,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -463,7 +483,37 @@ impl Supervisor {
             hosts: Arc::new(RwLock::new(HashMap::new())),
             adapters: Arc::new(AdapterRegistry::new()),
             config_versions: Arc::new(RwLock::new(HashMap::new())),
+            unavailable_plugins: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Records a plugin as unavailable due to missing runtime environments or dependencies.
+    pub async fn record_unavailable_plugin(
+        &self,
+        manifest: PluginManifest,
+        manifest_path: PathBuf,
+        reason: String,
+    ) {
+        let plugin_id = manifest.plugin.id.clone();
+        self.unavailable_plugins.write().await.insert(
+            plugin_id,
+            UnavailablePlugin {
+                manifest,
+                manifest_path,
+                reason,
+                status: "RuntimeUnavailable".to_string(),
+            },
+        );
+    }
+
+    /// Returns all plugins currently recorded as unavailable.
+    pub async fn get_unavailable_plugins(&self) -> Vec<UnavailablePlugin> {
+        self.unavailable_plugins.read().await.values().cloned().collect()
+    }
+
+    /// Removes a recorded unavailable plugin entry (e.g. after a successful launch).
+    pub async fn remove_unavailable_plugin(&self, plugin_id: &str) {
+        self.unavailable_plugins.write().await.remove(plugin_id);
     }
 
     /// Returns the currently applied configuration version for a plugin (0 if never configured).
@@ -713,97 +763,113 @@ impl Supervisor {
             priority,
         };
 
-        if let Some(override_path) = executable_override {
-            return self
-                .launch_host(
-                    &host_id,
-                    override_path,
-                    &[],
-                    priority,
-                    spec,
-                    Some(manifest),
+        let result = if let Some(override_path) = executable_override {
+            self.launch_host(
+                &host_id,
+                override_path,
+                &[],
+                priority,
+                spec,
+                Some(manifest.clone()),
+            )
+            .await
+        } else {
+            match manifest.plugin.runtime.as_str() {
+                "rust" => {
+                    let exec_path = parent.join(&manifest.plugin.entrypoint);
+                    self.launch_host(&host_id, &exec_path, &[], priority, spec, Some(manifest.clone()))
+                        .await
+                }
+                "python" => {
+                    let python_bin = std::env::var("KANON_PYTHON_BIN")
+                        .map(PathBuf::from)
+                        .ok()
+                        .or_else(|| find_file_upwards(parent, "sdks/python/.venv/bin/python"))
+                        .or_else(|| find_binary_in_path("python3"))
+                        .or_else(|| find_binary_in_path("python"))
+                        .ok_or_else(|| SupervisorError::RuntimeUnavailable {
+                            runtime: "python".to_string(),
+                            reason: "Neither python3 nor a virtual environment (.venv) was found in PATH"
+                                .to_string(),
+                        })?;
+
+                    let host_script = std::env::var("KANON_PYTHON_HOST_PATH")
+                        .map(PathBuf::from)
+                        .ok()
+                        .or_else(|| find_file_upwards(parent, "sdks/python/kanon_host/main.py"))
+                        .or_else(|| find_file_upwards(parent, "kanon_host/main.py"))
+                        .ok_or_else(|| SupervisorError::RuntimeUnavailable {
+                            runtime: "python".to_string(),
+                            reason: "Could not locate Python host runner script (kanon_host/main.py)"
+                                .to_string(),
+                        })?;
+
+                    let host_script_str = host_script.to_string_lossy();
+                    let manifest_str = manifest_path_ref.to_string_lossy();
+                    let args = [
+                        host_script_str.as_ref(),
+                        "--plugin",
+                        manifest_str.as_ref(),
+                    ];
+
+                    self.launch_host(&host_id, &python_bin, &args, priority, spec, Some(manifest.clone()))
+                        .await
+                }
+                "typescript" | "ts" => {
+                    let node_bin = std::env::var("KANON_NODE_BIN")
+                        .map(PathBuf::from)
+                        .ok()
+                        .or_else(|| find_binary_in_path("bun"))
+                        .or_else(|| find_binary_in_path("node"))
+                        .ok_or_else(|| SupervisorError::RuntimeUnavailable {
+                            runtime: "typescript".to_string(),
+                            reason: "Neither bun nor node was found in PATH".to_string(),
+                        })?;
+
+                    let host_script = std::env::var("KANON_TS_HOST_PATH")
+                        .map(PathBuf::from)
+                        .ok()
+                        .or_else(|| find_file_upwards(parent, "sdks/typescript/dist/src/host/index.js"))
+                        .or_else(|| find_file_upwards(parent, "dist/src/host/index.js"))
+                        .ok_or_else(|| SupervisorError::RuntimeUnavailable {
+                            runtime: "typescript".to_string(),
+                            reason: "Could not locate TypeScript host runner script (dist/src/host/index.js)"
+                                .to_string(),
+                        })?;
+
+                    let host_script_str = host_script.to_string_lossy();
+                    let manifest_str = manifest_path_ref.to_string_lossy();
+                    let args = [
+                        host_script_str.as_ref(),
+                        "--plugin",
+                        manifest_str.as_ref(),
+                    ];
+
+                    self.launch_host(&host_id, &node_bin, &args, priority, spec, Some(manifest.clone()))
+                        .await
+                }
+                other => Err(SupervisorError::RuntimeUnavailable {
+                    runtime: other.to_string(),
+                    reason: format!("Unsupported plugin runtime '{other}' declared in manifest"),
+                }),
+            }
+        };
+
+        match result {
+            Ok(host) => {
+                self.remove_unavailable_plugin(&manifest.plugin.id).await;
+                Ok(host)
+            }
+            Err(SupervisorError::RuntimeUnavailable { runtime, reason }) => {
+                self.record_unavailable_plugin(
+                    manifest,
+                    manifest_path_ref.to_path_buf(),
+                    reason.clone(),
                 )
                 .await;
-        }
-
-        match manifest.plugin.runtime.as_str() {
-            "rust" => {
-                let exec_path = parent.join(&manifest.plugin.entrypoint);
-                self.launch_host(&host_id, &exec_path, &[], priority, spec, Some(manifest))
-                    .await
+                Err(SupervisorError::RuntimeUnavailable { runtime, reason })
             }
-            "python" => {
-                let python_bin = std::env::var("KANON_PYTHON_BIN")
-                    .map(PathBuf::from)
-                    .ok()
-                    .or_else(|| find_file_upwards(parent, "sdks/python/.venv/bin/python"))
-                    .or_else(|| find_binary_in_path("python3"))
-                    .or_else(|| find_binary_in_path("python"))
-                    .ok_or_else(|| SupervisorError::RuntimeUnavailable {
-                        runtime: "python".to_string(),
-                        reason: "Neither python3 nor a virtual environment (.venv) was found in PATH"
-                            .to_string(),
-                    })?;
-
-                let host_script = std::env::var("KANON_PYTHON_HOST_PATH")
-                    .map(PathBuf::from)
-                    .ok()
-                    .or_else(|| find_file_upwards(parent, "sdks/python/kanon_host/main.py"))
-                    .or_else(|| find_file_upwards(parent, "kanon_host/main.py"))
-                    .ok_or_else(|| SupervisorError::RuntimeUnavailable {
-                        runtime: "python".to_string(),
-                        reason: "Could not locate Python host runner script (kanon_host/main.py)"
-                            .to_string(),
-                    })?;
-
-                let host_script_str = host_script.to_string_lossy();
-                let manifest_str = manifest_path_ref.to_string_lossy();
-                let args = [
-                    host_script_str.as_ref(),
-                    "--plugin",
-                    manifest_str.as_ref(),
-                ];
-
-                self.launch_host(&host_id, &python_bin, &args, priority, spec, Some(manifest))
-                    .await
-            }
-            "typescript" | "ts" => {
-                let node_bin = std::env::var("KANON_NODE_BIN")
-                    .map(PathBuf::from)
-                    .ok()
-                    .or_else(|| find_binary_in_path("bun"))
-                    .or_else(|| find_binary_in_path("node"))
-                    .ok_or_else(|| SupervisorError::RuntimeUnavailable {
-                        runtime: "typescript".to_string(),
-                        reason: "Neither bun nor node was found in PATH".to_string(),
-                    })?;
-
-                let host_script = std::env::var("KANON_TS_HOST_PATH")
-                    .map(PathBuf::from)
-                    .ok()
-                    .or_else(|| find_file_upwards(parent, "sdks/typescript/dist/src/host/index.js"))
-                    .or_else(|| find_file_upwards(parent, "dist/src/host/index.js"))
-                    .ok_or_else(|| SupervisorError::RuntimeUnavailable {
-                        runtime: "typescript".to_string(),
-                        reason: "Could not locate TypeScript host runner script (dist/src/host/index.js)"
-                            .to_string(),
-                    })?;
-
-                let host_script_str = host_script.to_string_lossy();
-                let manifest_str = manifest_path_ref.to_string_lossy();
-                let args = [
-                    host_script_str.as_ref(),
-                    "--plugin",
-                    manifest_str.as_ref(),
-                ];
-
-                self.launch_host(&host_id, &node_bin, &args, priority, spec, Some(manifest))
-                    .await
-            }
-            other => Err(SupervisorError::RuntimeUnavailable {
-                runtime: other.to_string(),
-                reason: format!("Unsupported plugin runtime '{other}' declared in manifest"),
-            }),
+            Err(err) => Err(err),
         }
     }
 

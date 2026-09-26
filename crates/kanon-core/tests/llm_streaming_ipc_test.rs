@@ -75,9 +75,9 @@ async fn test_core_request_llm_streaming_with_gateway() {
 }
 
 #[tokio::test]
-async fn test_core_request_llm_fallback_without_gateway() {
+async fn test_core_request_llm_unavailable_without_provider() {
     let (event_tx, _event_rx) = mpsc::channel(16);
-    let service = CoreApiService::new(event_tx); // No gateway configured
+    let service = CoreApiService::new(event_tx); // No agent slot configured
 
     let request = Request::new(LlmRequest {
         prompt: "ping".to_string(),
@@ -85,16 +85,15 @@ async fn test_core_request_llm_fallback_without_gateway() {
         parameters: None,
     });
 
-    let response = service
+    // A node without a provider must refuse explicitly. Answering with a synthetic completion
+    // would let a plugin mistake a misconfigured node for a working model backend.
+    let status = service
         .request_llm(request)
         .await
-        .expect("RequestLLM failed");
+        .expect_err("RequestLLM must fail when no provider is configured");
 
-    let mut stream = response.into_inner();
-    let first = stream.next().await.expect("Stream empty").expect("Chunk error");
-
-    assert_eq!(first.delta_text, "Echo: ping");
-    assert!(first.is_finished);
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert!(status.message().contains("No LLM provider"));
 }
 
 #[tokio::test]

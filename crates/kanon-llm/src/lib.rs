@@ -8,6 +8,7 @@
 //! - [`error`]: Granular error types for gateway, agent, and tool routing.
 //! - [`gateway`]: Protocol-level LLM client implementations (OpenAI Chat, OpenAI Responses, Anthropic Messages).
 //! - [`memory`]: Pluggable conversation memory subsystem with [`Memory`] trait and lock-free [`SlidingWindowMemory`].
+//! - [`slot`]: Shared hot-swappable handle to the node's active agent runtime.
 //! - [`tool_router`]: Specialized pipeline router adapter, dynamic tool aggregation, and in-memory Protobuf/JSON translation.
 
 pub mod agent;
@@ -16,6 +17,7 @@ pub mod gateway;
 pub mod memory;
 pub mod prompt;
 pub mod session;
+pub mod slot;
 pub mod sqlite_memory;
 pub mod summary;
 pub mod token;
@@ -32,7 +34,8 @@ pub use gateway::providers::{
 };
 pub use gateway::{
     ChatChunk, ChatChunkStream, ChatMessage, ChatRequest, ChatResponse, LlmGateway, LlmProvider,
-    ProviderSetup, Role, TokenUsage, ToolCall, ToolDefinition, provider_from_env,
+    ProviderSetup, Role, SUPPORTED_PROTOCOLS, TokenUsage, ToolCall, ToolDefinition, build_provider,
+    provider_from_env,
 };
 pub use memory::{ConversationManager, Memory, SessionMemory, SlidingWindowMemory};
 pub use prompt::{
@@ -42,6 +45,7 @@ pub use session::{
     RuntimeSessionMetadata, SessionKey, SessionManager, SessionMetadata, SessionScope,
     SessionStatus,
 };
+pub use slot::AgentSlot;
 pub use sqlite_memory::{PersistentMemory, SqliteMemory};
 pub use summary::{ContextSummarizer, SummaryConfig, SummaryHook};
 pub use token::{

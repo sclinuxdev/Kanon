@@ -21,7 +21,7 @@ use kanon_transport::{core_socket_path, IpcListener};
 
 use crate::adapter::{EventIngress, IngestError};
 use crate::supervisor::Supervisor;
-use kanon_llm::{ChatMessage, ChatRequest, LlmGateway};
+use kanon_llm::{AgentSlot, ChatMessage, ChatRequest, LlmGateway};
 use tokio_stream::StreamExt;
 
 /// Default capacity for the inbound asynchronous event ingest queue.
@@ -39,8 +39,11 @@ pub struct CoreApiService {
     supervisor: Option<Arc<Supervisor>>,
     /// Producer channel connected to the central pipeline outbound dispatcher.
     outbound_sender: Option<mpsc::Sender<DeliverMessageRequest>>,
-    /// Optional shared LLM gateway instance for delegating model completions.
-    gateway: Option<Arc<LlmGateway>>,
+    /// Shared agent slot resolving the node's live model provider for `RequestLLM`.
+    ///
+    /// A slot (not a captured gateway) so that a provider configured, replaced or cleared
+    /// through the control plane is observed by the next request without a restart.
+    llm: Option<Arc<AgentSlot>>,
 }
 
 impl CoreApiService {
@@ -53,7 +56,7 @@ impl CoreApiService {
             ingress: ingress.into(),
             supervisor: None,
             outbound_sender: None,
-            gateway: None,
+            llm: None,
         }
     }
 
@@ -74,10 +77,36 @@ impl CoreApiService {
         self
     }
 
-    /// Configures the active LLM gateway instance.
-    pub fn with_gateway(mut self, gateway: Arc<LlmGateway>) -> Self {
-        self.gateway = Some(gateway);
+    /// Shares the node's agent slot, enabling `RequestLLM` for plugin hosts.
+    pub fn with_agent_slot(mut self, agent: Arc<AgentSlot>) -> Self {
+        self.llm = Some(agent);
         self
+    }
+
+    /// Configures a fixed LLM gateway instance for embedded deployments and tests.
+    ///
+    /// The gateway is captured into a slot holding exactly one agent, so a caller that never
+    /// rewires the slot keeps the previous static behaviour.
+    pub fn with_gateway(mut self, gateway: Arc<LlmGateway>) -> Self {
+        // The gateway carries no session memory of its own: `RequestLLM` is a stateless
+        // pass-through, so a private sliding-window memory is sufficient and never shared.
+        let agent = kanon_llm::Agent::builder("core-gateway", gateway.provider().clone())
+            .model(gateway.default_model())
+            .build();
+        self.llm = Some(Arc::new(AgentSlot::with_agent(Arc::new(agent))));
+        self
+    }
+
+    /// Resolves the provider that should serve a `RequestLLM` call right now.
+    ///
+    /// Returns `None` when the node has no model provider configured; callers must surface that
+    /// as an explicit `unavailable` status rather than fabricating a completion.
+    fn current_gateway(&self) -> Option<LlmGateway> {
+        let agent = self.llm.as_ref()?.current()?;
+        Some(LlmGateway::new(
+            agent.provider().clone(),
+            agent.config().default_model.clone(),
+        ))
     }
 }
 
@@ -251,19 +280,12 @@ impl BotApiService for CoreApiService {
         request: Request<LlmRequest>,
     ) -> Result<Response<Self::RequestLLMStream>, Status> {
         let req = request.into_inner();
-        let gateway = match &self.gateway {
-            Some(g) => g.clone(),
-            None => {
-                // When no gateway is bound, return a single completed fallback chunk
-                let (tx, rx) = mpsc::channel(1);
-                let _ = tx
-                    .send(Ok(LlmChunk {
-                        delta_text: format!("Echo: {}", req.prompt),
-                        is_finished: true,
-                    }))
-                    .await;
-                return Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)));
-            }
+        // No provider ⇒ explicit failure. Returning a synthetic completion here would let a
+        // plugin mistake a misconfigured node for a working model backend.
+        let Some(gateway) = self.current_gateway() else {
+            return Err(Status::unavailable(
+                "No LLM provider is configured on this core; RequestLLM is disabled",
+            ));
         };
 
         let mut messages = Vec::new();

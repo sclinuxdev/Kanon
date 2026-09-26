@@ -17,6 +17,7 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use kanon_llm::tool_router::ToolRouter;
+use kanon_llm::AgentSlot;
 use kanon_proto::v1::message_segment::Segment;
 use kanon_proto::v1::{
     DeliverMessageRequest, IngestEventRequest, MessageSegment, PipelineEventRequest,
@@ -96,8 +97,11 @@ pub struct DeliveryOutcome {
 pub struct PipelineEngine {
     /// Reference to the process supervisor managing active plugin hosts and adapters.
     supervisor: Arc<Supervisor>,
-    /// Optional ToolRouter driving LLM reasoning and cross-language tool calling.
-    tool_router: Option<Arc<ToolRouter>>,
+    /// Live agent runtime driving LLM reasoning and cross-language tool calling.
+    ///
+    /// Held as a shared slot rather than a captured router so that configuring, replacing or
+    /// clearing the model provider on a running node takes effect on the very next event.
+    agent: Arc<AgentSlot>,
     /// Optional lifecycle observer used by the management control plane for tracing.
     observer: Option<Arc<dyn PipelineObserver>>,
     /// Persistent dead-letter queue writer for failed or dropped outbound messages.
@@ -119,7 +123,7 @@ impl PipelineEngine {
         let (outbound_sender, outbound_receiver) = mpsc::channel(DEFAULT_OUTBOUND_QUEUE_CAPACITY);
         Self {
             supervisor,
-            tool_router: None,
+            agent: Arc::new(AgentSlot::new()),
             observer: None,
             dead_letter: Arc::new(DeadLetterWriter::default()),
             outbound_sender,
@@ -139,10 +143,26 @@ impl PipelineEngine {
         &self.dead_letter
     }
 
-    /// Attaches an LLM [`ToolRouter`] to enable multi-turn reasoning and tool calling.
-    pub fn with_tool_router(mut self, tool_router: Arc<ToolRouter>) -> Self {
-        self.tool_router = Some(tool_router);
+    /// Shares the node's agent slot, enabling multi-turn reasoning and tool calling.
+    ///
+    /// Sharing the slot (instead of a router snapshot) is what allows a provider configured
+    /// later through the control plane to start answering without a restart.
+    pub fn with_agent_slot(mut self, agent: Arc<AgentSlot>) -> Self {
+        self.agent = agent;
         self
+    }
+
+    /// Returns the shared agent slot backing this pipeline.
+    pub fn agent_slot(&self) -> &Arc<AgentSlot> {
+        &self.agent
+    }
+
+    /// Attaches an LLM [`ToolRouter`] snapshot to enable multi-turn reasoning and tool calling.
+    ///
+    /// Kept for callers that already hold a router (mostly tests); runtime wiring should prefer
+    /// [`PipelineEngine::with_agent_slot`] so provider changes are observed.
+    pub fn with_tool_router(self, tool_router: Arc<ToolRouter>) -> Self {
+        self.with_agent_slot(Arc::new(AgentSlot::with_agent(tool_router.agent_arc())))
     }
 
     /// Attaches a lifecycle observer for control-plane tracing.
@@ -625,9 +645,12 @@ impl PipelineEngine {
         }
 
         // Phase 3: Conversational message (unmatched by command router, routed to LLM if enabled)
-        if let Some(ref router) = self.tool_router
-            && !text_candidate.is_empty()
+        // The agent is resolved per event so a provider configured or cleared at runtime is
+        // honoured immediately; an empty slot means "no conversational LLM" and passes through.
+        if !text_candidate.is_empty()
+            && let Some(agent) = self.agent.current()
         {
+            let router = ToolRouter::from_arc(agent);
             let session_id = if filtered_event.channel_id.trim().is_empty() {
                 if filtered_event.sender_id.trim().is_empty() {
                     "default".to_string()

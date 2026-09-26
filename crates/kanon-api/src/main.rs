@@ -21,7 +21,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use kanon_api::{ApiServer, ApiState, Observability, WebhookAdapter, default_agent_config};
+use kanon_api::llm_config::resolve_bootstrap;
+use kanon_api::{
+    ApiServer, ApiState, LlmProviderConfig, Observability, SystemConfigStore, WebhookAdapter,
+};
 use kanon_core::EventIngress;
 use kanon_core::ipc::{CoreApiService, CoreIpcServer, DEFAULT_INGEST_QUEUE_CAPACITY};
 use kanon_core::pipeline::PipelineEngine;
@@ -59,41 +62,56 @@ async fn main() -> StartupResult<()> {
     ));
 
     // --- Management gateway state & agent engine --------------------------------------
-    let mut builder = ApiState::builder(supervisor.clone())
+    // One agent slot is shared by the management gateway, the pipeline worker and the IPC
+    // service, so a provider configured later through the console is observed by all three
+    // without a restart.
+    let agent_slot = Arc::new(kanon_llm::AgentSlot::new());
+    let state = ApiState::builder(supervisor.clone())
         .with_observability(observability.clone())
-        .with_ingress(ingress.clone());
-    if let Some((provider, model)) = kanon_llm::provider_from_env()? {
-        tracing::info!(model = %model, "LLM provider configured for conversational pipeline and sandbox chat");
-        builder = builder.with_llm_provider("kanon-core", provider, default_agent_config(model));
-    } else {
-        tracing::warn!(
-            "KANON_LLM_BASE_URL is unset; chat completions and conversational LLM routing are disabled"
-        );
+        .with_ingress(ingress.clone())
+        .with_agent_slot(agent_slot.clone())
+        .build();
+
+    // Bootstrap order: a provider saved by the console wins over the environment, because the
+    // console is how an operator changes the node after it started. Installation goes through
+    // `apply_llm_provider`, the very same path the console uses, so a bootstrapped provider and a
+    // console-configured one are constructed identically (shared memory, personas, trace hooks).
+    match bootstrap_provider()? {
+        Some((config, source)) => {
+            let provider = config
+                .resolve()
+                .map_err(|err| format!("Invalid LLM provider from {source}: {err}"))?;
+            tracing::info!(
+                source = %source,
+                protocol = %config.protocol,
+                base_url = %config.base_url,
+                model = %config.model,
+                "LLM provider configured for conversational pipeline and sandbox chat"
+            );
+            state.apply_llm_provider("kanon-core", provider, config.agent_config());
+        }
+        None => {
+            tracing::warn!(
+                "No LLM provider is configured (data/system.json and KANON_LLM_BASE_URL are both empty); \
+                 chat completions and conversational LLM routing are disabled"
+            );
+        }
     }
-    let state = builder.build();
 
     // The pipeline never awaits platform I/O: replies are queued and an independent dispatcher
     // resolves the destination platform to a built-in adapter or a plugin host.
-    let mut engine_builder = PipelineEngine::new(supervisor.clone())
-        .with_observer(observability.events.clone());
-    if let Some(agent) = state.agent() {
-        let tool_router = Arc::new(kanon_llm::ToolRouter::from_arc(agent.clone()));
-        engine_builder = engine_builder.with_tool_router(tool_router);
-    }
-    let engine = Arc::new(engine_builder);
+    let engine = Arc::new(
+        PipelineEngine::new(supervisor.clone())
+            .with_observer(observability.events.clone())
+            .with_agent_slot(agent_slot.clone()),
+    );
     let pipeline_worker = engine.clone().start_worker(event_rx);
     let outbound_dispatcher = engine.clone().start_outbound_dispatcher();
 
-    let mut service = CoreApiService::new(ingress.clone())
+    let service = CoreApiService::new(ingress.clone())
         .with_supervisor(supervisor.clone())
-        .with_outbound_sender(engine.outbound_sender());
-    if let Some(agent) = state.agent() {
-        let gateway = Arc::new(kanon_llm::LlmGateway::new(
-            agent.provider().clone(),
-            agent.config().default_model.clone(),
-        ));
-        service = service.with_gateway(gateway);
-    }
+        .with_outbound_sender(engine.outbound_sender())
+        .with_agent_slot(agent_slot.clone());
     let ipc_server = CoreIpcServer::new(socket_path.clone(), service);
 
     // --- Graceful shutdown channels ---------------------------------------------------
@@ -171,6 +189,25 @@ async fn main() -> StartupResult<()> {
 
     tracing::info!("Kanon node shut down gracefully");
     Ok(())
+}
+
+/// Resolves the provider a freshly started node should use.
+///
+/// A provider persisted through the management console takes precedence over the
+/// `KANON_LLM_*` environment bootstrap; the returned label names the source for the startup log.
+/// A malformed persisted document is a hard startup error rather than a silent fallback, because
+/// running without the operator's chosen provider is exactly the surprise this precedence exists
+/// to prevent.
+fn bootstrap_provider() -> StartupResult<Option<(LlmProviderConfig, &'static str)>> {
+    let store = SystemConfigStore::default();
+    let persisted = store.load().map_err(|err| {
+        format!(
+            "Failed to load node system configuration at {}: {err}",
+            store.path().display()
+        )
+    })?;
+
+    Ok(resolve_bootstrap(persisted, LlmProviderConfig::from_env()))
 }
 
 /// Registers the bundled webhook adapter from environment configuration.

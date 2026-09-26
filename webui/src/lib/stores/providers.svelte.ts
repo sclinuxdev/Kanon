@@ -1,5 +1,7 @@
 import { api } from '../api/client';
 import type {
+  ActivateProviderRequest,
+  ActiveProviderInfo,
   CustomProvider,
   ProviderPreset,
   ProvidersCatalog,
@@ -16,6 +18,17 @@ class ProvidersStore {
   systemConfig = $state<SystemConfig | null>(null);
   loading = $state(false);
   error = $state<string | null>(null);
+
+  /**
+   * The provider the *node* is actually using, as reported by the backend.
+   *
+   * Distinct from `activeModel`, which is a browser-local playlist entry for the Playground:
+   * only this value decides whether the bot answers messages.
+   */
+  nodeProvider = $state<ActiveProviderInfo | null>(null);
+  nodeActionPending = $state(false);
+  nodeMessage = $state<string | null>(null);
+  nodeError = $state<string | null>(null);
 
   // Two-tier providers & models: Empty by default per user rule
   providers = $state<CustomProvider[]>([]);
@@ -376,6 +389,83 @@ class ProvidersStore {
     }
   }
 
+  /** Model id of the browser-local selection, without the `provider/` display prefix. */
+  get activeModelId(): string {
+    const key = this.activeModel;
+    if (!key) return '';
+    const separator = key.indexOf('/');
+    return separator === -1 ? key : key.slice(separator + 1);
+  }
+
+  /**
+   * Persists the selected provider to the node and applies it immediately.
+   *
+   * The credential comes from the browser-local provider entry only because that is where the
+   * operator typed it; once accepted it lives in `data/system.json` on the node.
+   */
+  async activateOnNode(options?: { providerId?: string; modelId?: string }) {
+    const provider = options?.providerId
+      ? this.providers.find((p) => p.id === options.providerId)
+      : this.selectedProvider;
+    const modelId = (options?.modelId ?? this.activeModelId).trim();
+
+    this.nodeMessage = null;
+    this.nodeError = null;
+
+    if (!provider) {
+      this.nodeError = '请先配置提供商（API Base URL 与密钥），再应用到节点。';
+      return null;
+    }
+    if (!modelId) {
+      this.nodeError = '请先为该提供商添加并选择一个模型，再应用到节点。';
+      return null;
+    }
+
+    const payload: ActivateProviderRequest = {
+      protocol: provider.protocol,
+      base_url: provider.base_url,
+      model: modelId,
+      api_key: provider.api_key || undefined,
+    };
+
+    this.nodeActionPending = true;
+    try {
+      const res = await api.activateProvider(payload);
+      this.nodeProvider = res.active;
+      if (this.catalog) {
+        this.catalog = { ...this.catalog, active: res.active };
+      }
+      this.nodeMessage = res.message;
+      return res;
+    } catch (e) {
+      this.nodeError = e instanceof Error ? e.message : String(e);
+      return null;
+    } finally {
+      this.nodeActionPending = false;
+    }
+  }
+
+  /** Clears the node's provider, disabling chat until one is applied again. */
+  async clearOnNode() {
+    this.nodeMessage = null;
+    this.nodeError = null;
+    this.nodeActionPending = true;
+    try {
+      const res = await api.clearActiveProvider();
+      this.nodeProvider = res.active;
+      if (this.catalog) {
+        this.catalog = { ...this.catalog, active: res.active };
+      }
+      this.nodeMessage = res.message;
+      return res;
+    } catch (e) {
+      this.nodeError = e instanceof Error ? e.message : String(e);
+      return null;
+    } finally {
+      this.nodeActionPending = false;
+    }
+  }
+
   async load() {
     this.loading = true;
     this.error = null;
@@ -385,6 +475,7 @@ class ProvidersStore {
         api.getSystemConfig(),
       ]);
       this.catalog = cat;
+      this.nodeProvider = cat.active;
       this.systemConfig = sys;
     } catch (e) {
       this.error = e instanceof Error ? e.message : String(e);

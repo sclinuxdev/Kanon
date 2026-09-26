@@ -17,22 +17,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Initialize process supervisor and pipeline engine.
     let supervisor = Arc::new(Supervisor::new(None, Some(socket_path.clone())));
-    let mut engine_builder = PipelineEngine::new(supervisor.clone());
-    let mut gateway_opt = None;
+    let agent_slot = Arc::new(kanon_llm::AgentSlot::new());
+    let engine_builder =
+        PipelineEngine::new(supervisor.clone()).with_agent_slot(agent_slot.clone());
 
     match kanon_llm::provider_from_env() {
         Ok(Some((provider, model))) => {
             tracing::info!(model = %model, "LLM provider configured for core pipeline");
             let memory = Arc::new(kanon_llm::SlidingWindowMemory::new(40));
             let agent = Arc::new(
-                kanon_llm::Agent::builder("kanon-core", provider.clone())
+                kanon_llm::Agent::builder("kanon-core", provider)
                     .memory(memory)
-                    .model(model.clone())
+                    .model(model)
                     .build(),
             );
-            let tool_router = Arc::new(kanon_llm::ToolRouter::from_arc(agent));
-            engine_builder = engine_builder.with_tool_router(tool_router);
-            gateway_opt = Some(Arc::new(kanon_llm::LlmGateway::new(provider, model)));
+            agent_slot.set(Some(agent));
         }
         Ok(None) => {
             tracing::info!(
@@ -52,12 +51,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // disappearing silently.
     let dispatcher_handle = engine.clone().start_outbound_dispatcher();
 
-    let mut service = CoreApiService::new(event_tx)
+    let service = CoreApiService::new(event_tx)
         .with_supervisor(supervisor.clone())
-        .with_outbound_sender(engine.outbound_sender());
-    if let Some(gw) = gateway_opt {
-        service = service.with_gateway(gw);
-    }
+        .with_outbound_sender(engine.outbound_sender())
+        .with_agent_slot(agent_slot.clone());
     let server = CoreIpcServer::new(socket_path, service);
 
     server

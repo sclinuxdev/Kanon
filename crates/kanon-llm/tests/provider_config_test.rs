@@ -1,0 +1,101 @@
+//! Contract tests for the shared model-provider factory and the hot-swappable agent slot.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use kanon_llm::{
+    Agent, AgentSlot, ChatRequest, ChatResponse, GatewayError, LlmProvider, SUPPORTED_PROTOCOLS,
+    build_provider,
+};
+
+/// Minimal provider stub used to observe slot semantics.
+struct StubProvider;
+
+#[async_trait]
+impl LlmProvider for StubProvider {
+    async fn chat(&self, _request: &ChatRequest) -> Result<ChatResponse, GatewayError> {
+        Ok(ChatResponse {
+            content: Some("stub".to_string()),
+            tool_calls: Vec::new(),
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+        })
+    }
+}
+
+fn stub_agent(model: &str) -> Arc<Agent> {
+    Arc::new(
+        Agent::builder("slot-test", Arc::new(StubProvider))
+            .model(model)
+            .build(),
+    )
+}
+
+#[test]
+fn build_provider_accepts_every_documented_protocol() {
+    for protocol in SUPPORTED_PROTOCOLS {
+        // Construction is pure dispatch: no network access happens until a completion is sent,
+        // so an unreachable host is fine here and keeps the test hermetic.
+        build_provider(protocol, "https://example.invalid/v1", None, "m")
+            .unwrap_or_else(|err| panic!("protocol '{protocol}' must be supported: {err}"));
+    }
+
+    // The legacy alias must keep working so existing deployments do not break on upgrade.
+    build_provider("openai_chat", "https://example.invalid/v1", None, "m")
+        .expect("openai_chat alias must stay supported");
+}
+
+#[test]
+fn build_provider_rejects_unknown_protocol_and_blank_base_url() {
+    // `.err()` rather than `.expect_err()`: the success type is a trait object without `Debug`.
+    let err = build_provider("grpc-ish", "https://example.invalid/v1", None, "m")
+        .err()
+        .expect("unknown protocol must be rejected");
+    assert!(err.contains("Unsupported protocol"), "unexpected error: {err}");
+
+    let err = build_provider("openai", "   ", None, "m")
+        .err()
+        .expect("blank base URL must be rejected");
+    assert!(err.contains("base URL"), "unexpected error: {err}");
+}
+
+#[test]
+fn agent_slot_starts_empty_and_follows_swaps() {
+    let slot = AgentSlot::new();
+    assert!(!slot.is_configured());
+    assert!(slot.current().is_none());
+
+    slot.set(Some(stub_agent("first")));
+    assert!(slot.is_configured());
+    assert_eq!(
+        slot.current()
+            .expect("agent installed")
+            .config()
+            .default_model,
+        "first"
+    );
+
+    // A later provider replaces the previous one outright: there is exactly one active agent.
+    slot.set(Some(stub_agent("second")));
+    assert_eq!(
+        slot.current()
+            .expect("agent replaced")
+            .config()
+            .default_model,
+        "second"
+    );
+
+    slot.set(None);
+    assert!(!slot.is_configured());
+    assert!(slot.current().is_none());
+}
+
+#[test]
+fn agent_slot_with_agent_is_configured_immediately() {
+    let slot = AgentSlot::with_agent(stub_agent("seeded"));
+    assert!(slot.is_configured());
+    assert_eq!(
+        slot.current().expect("seeded agent").config().default_model,
+        "seeded"
+    );
+}

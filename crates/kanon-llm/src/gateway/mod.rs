@@ -96,6 +96,11 @@ impl LlmGateway {
         &self.provider
     }
 
+    /// Default model tag used when a request does not name one.
+    pub fn default_model(&self) -> &str {
+        &self.default_model
+    }
+
     /// Dispatches a chat completion request to the active provider.
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, GatewayError> {
         let mut req = request.clone();
@@ -118,6 +123,51 @@ impl LlmGateway {
 /// Configured model provider and the model identifier it should default to.
 pub type ProviderSetup = (Arc<dyn LlmProvider>, String);
 
+/// Protocol identifiers accepted by [`build_provider`].
+pub const SUPPORTED_PROTOCOLS: [&str; 3] = ["openai", "openai_responses", "anthropic"];
+
+/// Instantiates the wire client for one provider configuration.
+///
+/// This is the single owner of the protocol switch: the environment bootstrap
+/// ([`provider_from_env`]) and the management gateway's provider endpoints both build their
+/// clients here, so a protocol accepted in one path can never be rejected by the other.
+///
+/// `protocol` accepts `openai` (alias `openai_chat`), `openai_responses` and `anthropic`;
+/// any other value is rejected explicitly instead of silently falling back to a default.
+pub fn build_provider(
+    protocol: &str,
+    base_url: impl Into<String>,
+    api_key: Option<String>,
+    model: impl Into<String>,
+) -> Result<Arc<dyn LlmProvider>, String> {
+    let base_url = base_url.into();
+    let base_url = base_url.trim().to_string();
+    if base_url.is_empty() {
+        return Err("Provider base URL must not be empty".to_string());
+    }
+
+    let api_key = api_key.filter(|k| !k.trim().is_empty());
+    let model = model.into();
+
+    let provider: Arc<dyn LlmProvider> = match protocol {
+        "openai" | "openai_chat" => Arc::new(OpenAiChatProvider::new(base_url, api_key, model)),
+        // The Responses API carries the credential in its own constructor, so the key is
+        // required here rather than optional.
+        "openai_responses" => Arc::new(
+            OpenAiResponsesProvider::new(api_key.unwrap_or_default()).with_base_url(base_url),
+        ),
+        "anthropic" => Arc::new(AnthropicMessagesProvider::new(base_url, api_key, model)),
+        other => {
+            return Err(format!(
+                "Unsupported protocol '{other}'; expected one of {}",
+                SUPPORTED_PROTOCOLS.join(", ")
+            ));
+        }
+    };
+
+    Ok(provider)
+}
+
 /// Configures an [`LlmProvider`] and default model name from standard environment variables:
 ///
 /// - `KANON_LLM_BASE_URL` — model provider base URL. If unset or empty, returns `Ok(None)`.
@@ -139,25 +189,11 @@ pub fn provider_from_env() -> Result<Option<ProviderSetup>, String> {
         .filter(|s| !s.trim().is_empty());
     let protocol = std::env::var("KANON_LLM_PROTOCOL").unwrap_or_else(|_| "openai".to_string());
 
-    let provider: Arc<dyn LlmProvider> = match protocol.as_str() {
-        "openai" | "openai_chat" => {
-            Arc::new(OpenAiChatProvider::new(base_url, api_key, model.clone()))
-        }
-        "openai_responses" => Arc::new(
-            OpenAiResponsesProvider::new(api_key.unwrap_or_default()).with_base_url(base_url),
-        ),
-        "anthropic" => Arc::new(AnthropicMessagesProvider::new(
-            base_url,
-            api_key,
-            model.clone(),
-        )),
-        other => {
-            return Err(format!(
-                "Unsupported KANON_LLM_PROTOCOL '{other}'; expected openai, openai_responses or anthropic"
-            ));
-        }
-    };
+    let provider = build_provider(&protocol, base_url, api_key, model.clone()).map_err(|err| {
+        format!("{err} (from KANON_LLM_PROTOCOL)")
+    })?;
 
     Ok(Some((provider, model)))
 }
+
 

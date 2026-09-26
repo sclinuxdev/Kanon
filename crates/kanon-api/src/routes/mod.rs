@@ -20,6 +20,9 @@
 //! | `POST` | `/api/v1/sessions/:id/reset` | Clear history, keep persona and variables |
 //! | `POST` | `/api/v1/sessions/:id/persona` | Hot-swap the session persona |
 //! | `GET` | `/api/v1/personas` | Persona catalog |
+//! | `GET` | `/api/v1/providers` | Provider catalog plus the node's effective provider |
+//! | `PUT` | `/api/v1/providers/active` | Configure the node's provider (persisted, live) |
+//! | `DELETE` | `/api/v1/providers/active` | Clear the node's provider |
 //! | `POST` | `/api/v1/chat/completions` | Sandbox chat with JSON or SSE responses |
 
 pub mod adapters;

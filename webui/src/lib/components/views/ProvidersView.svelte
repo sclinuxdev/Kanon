@@ -169,7 +169,67 @@ function handleImportAllCandidates() {
 </script>
 
 <div class="p-6 space-y-6 max-w-7xl mx-auto font-sans">
-  <!-- Top Active Model Banner (全局默认模型展示) -->
+  <!-- Node provider state: this is what actually decides whether the bot replies. -->
+  <div class="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-4 sm:p-5 shadow-xs space-y-4">
+    <div class="flex flex-wrap items-start justify-between gap-4">
+      <div class="flex items-start gap-3.5">
+        <div
+          class="p-2.5 rounded-xl {providersStore.nodeProvider?.configured
+            ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+            : 'bg-amber-500/10 text-amber-600 dark:text-amber-400'}"
+        >
+          <Cpu class="w-6 h-6" />
+        </div>
+        <div>
+          <div class="flex items-center gap-2.5 flex-wrap">
+            <span class="text-sm text-zinc-500 font-medium">节点当前生效的提供商:</span>
+            {#if providersStore.nodeProvider?.configured}
+              <code class="px-2.5 py-1 rounded-lg font-mono text-sm font-bold bg-emerald-50 dark:bg-emerald-950/80 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800/60">
+                {providersStore.nodeProvider.protocol} · {providersStore.nodeProvider.model}
+              </code>
+              <span class="px-2 py-0.5 rounded-md text-xs font-mono border border-zinc-200 dark:border-zinc-700 text-zinc-500">
+                {providersStore.nodeProvider.source === 'console' ? '控制台已保存' : '环境变量引导'}
+              </span>
+            {:else}
+              <span class="text-sm text-amber-600 dark:text-amber-400 font-medium">
+                未配置 —— 机器人不会回复普通消息
+              </span>
+            {/if}
+          </div>
+          <p class="text-xs text-zinc-400 mt-1 font-mono break-all">
+            {providersStore.nodeProvider?.base_url ?? 'base_url: 未设置'}
+            {providersStore.nodeProvider?.api_key_configured ? ' · key: 已配置' : ' · key: 无'}
+          </p>
+        </div>
+      </div>
+
+      <button
+        onclick={() => providersStore.activateOnNode()}
+        disabled={providersStore.nodeActionPending || !providersStore.selectedProvider}
+        class="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium flex items-center gap-2 transition cursor-pointer shadow-2xs"
+        title="把下方选中的提供商与模型写入节点配置并立即生效"
+      >
+        <Zap class="w-4 h-4" />
+        <span>{providersStore.nodeActionPending ? '应用中...' : '应用到此节点'}</span>
+      </button>
+    </div>
+
+    {#if providersStore.nodeMessage}
+      <p class="text-xs text-emerald-600 dark:text-emerald-400 flex items-center gap-1.5">
+        <CheckCircle2 class="w-3.5 h-3.5" /> {providersStore.nodeMessage}
+      </p>
+    {/if}
+    {#if providersStore.nodeError}
+      <p class="text-xs text-rose-600 dark:text-rose-400 flex items-center gap-1.5">
+        <AlertCircle class="w-3.5 h-3.5" /> {providersStore.nodeError}
+      </p>
+    {/if}
+    <p class="text-xs text-zinc-400">
+      应用后会写入节点的 <code class="font-mono">data/system.json</code> 并立即对流水线、RequestLLM 与聊天接口生效，无需重启。
+    </p>
+  </div>
+
+  <!-- Browser-local model playlist (Playground only; does not configure the node) -->
   <div class="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-4 sm:p-5 shadow-xs flex flex-wrap items-center justify-between gap-4">
     <div class="flex items-center gap-3.5">
       <div class="p-2.5 rounded-xl bg-indigo-500/10 text-indigo-600 dark:text-indigo-400">
@@ -177,7 +237,7 @@ function handleImportAllCandidates() {
       </div>
       <div>
         <div class="flex items-center gap-2.5">
-          <span class="text-sm text-zinc-500 font-medium">当前全局默认模型:</span>
+          <span class="text-sm text-zinc-500 font-medium">浏览器本地选中的模型:</span>
           {#if providersStore.activeModel}
             <code class="px-2.5 py-1 rounded-lg font-mono text-sm font-bold bg-indigo-50 dark:bg-indigo-950/80 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-800/60">
               {providersStore.activeModel}
@@ -187,7 +247,7 @@ function handleImportAllCandidates() {
           {/if}
         </div>
         <p class="text-xs text-zinc-400 mt-1 font-mono">
-          模型表示规范: 设定的提供商名称/模型ID (例如: deepseek/deepseek-chat)
+          仅用于本机 Playground 调试；要让机器人使用，请点击上方“应用到此节点”。
         </p>
       </div>
     </div>

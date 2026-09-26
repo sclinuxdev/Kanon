@@ -17,6 +17,9 @@
 //! - `POST /api/v1/sessions/:id/reset` — clear history, keep persona and variables;
 //! - `POST /api/v1/sessions/:id/persona` — hot-swap the session persona;
 //! - `GET  /api/v1/personas` — persona catalog;
+//! - `GET  /api/v1/providers` — model provider catalog plus the node's effective provider;
+//! - `PUT  /api/v1/providers/active` — configure the node's provider (persisted, applied live);
+//! - `DELETE /api/v1/providers/active` — clear the node's provider;
 //! - `POST /api/v1/chat/completions` — sandbox chat, JSON or `text/event-stream`;
 //! - `GET  /ws/v1/logs` — structured log broadcast with level / plugin filters;
 //! - `GET  /ws/v1/events` — end-to-end message lifecycle trace bus.
@@ -36,6 +39,7 @@
 
 pub mod adapters;
 pub mod error;
+pub mod llm_config;
 pub mod metrics;
 pub mod observability;
 pub mod plugin_config;
@@ -47,10 +51,11 @@ pub mod ws;
 
 pub use adapters::WebhookAdapter;
 pub use error::ApiError;
+pub use llm_config::{LlmProviderConfig, SystemConfigStore};
 pub use metrics::{MetricsRegistry, RuntimeGauges};
 pub use observability::{
     LogLevel, LogRecord, Observability, TraceEvent, TraceEventBus, TraceRecord,
 };
 pub use plugin_config::PluginConfigStore;
 pub use server::{ApiServer, app};
-pub use state::{ApiState, ApiStateBuilder, default_agent_config};
+pub use state::{ApiState, ApiStateBuilder, build_node_agent, default_agent_config};

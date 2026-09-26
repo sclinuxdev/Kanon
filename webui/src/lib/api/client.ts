@@ -1,4 +1,6 @@
 import type {
+  ActivateProviderRequest,
+  ActivateProviderResponse,
   AdaptersResponse,
   CallPluginToolResponse,
   ChatCompletionRequest,
@@ -66,6 +68,17 @@ export const api = {
 
   getSystemConfig: () => request<SystemConfig>('/api/v1/system/config'),
   getProviders: () => request<ProvidersCatalog>('/api/v1/providers'),
+  // Provider selection is a node property, not a browser one: this persists it to
+  // data/system.json and applies it to the running node immediately.
+  activateProvider: (req: ActivateProviderRequest) =>
+    request<ActivateProviderResponse>('/api/v1/providers/active', {
+      method: 'PUT',
+      body: JSON.stringify(req),
+    }),
+  clearActiveProvider: () =>
+    request<ActivateProviderResponse>('/api/v1/providers/active', {
+      method: 'DELETE',
+    }),
   testProvider: (req?: TestProviderRequest) =>
     request<TestProviderResponse>('/api/v1/providers/test', {
       method: 'POST',

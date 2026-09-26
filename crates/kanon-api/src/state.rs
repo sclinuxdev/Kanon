@@ -14,10 +14,12 @@ use std::time::Instant;
 
 use kanon_core::{EventIngress, Supervisor};
 use kanon_llm::{
-    Agent, AgentConfig, LlmProvider, Memory, PersonaRegistry, SessionManager, SlidingWindowMemory,
+    Agent, AgentConfig, AgentSlot, LlmProvider, Memory, PersonaRegistry, SessionManager,
+    SlidingWindowMemory,
 };
 
 use crate::error::ApiError;
+use crate::llm_config::SystemConfigStore;
 use crate::observability::Observability;
 use crate::plugin_config::PluginConfigStore;
 
@@ -42,10 +44,16 @@ struct ApiStateInner {
     sessions: Arc<SessionManager>,
     /// Persona catalog backing the persona endpoints.
     personas: Arc<PersonaRegistry>,
-    /// Agent runtime backing sandbox chat completions, absent when no provider is configured.
-    agent: Option<Arc<Agent>>,
+    /// Live agent runtime backing chat completions, conversational pipeline turns and IPC
+    /// `RequestLLM`; empty until a model provider is configured.
+    ///
+    /// Shared with the pipeline worker and the IPC service, so provider changes made through the
+    /// control plane take effect on the next request without restarting the node.
+    llm: Arc<AgentSlot>,
     /// Persistence for per-plugin configuration values.
     config_store: Arc<PluginConfigStore>,
+    /// Persistence for node-level system settings, including the console-selected provider.
+    system_config: Arc<SystemConfigStore>,
     /// Real-time log and trace channels plus the metrics registry.
     observability: Arc<Observability>,
     /// Fast-ACK ingest handle driving the inbound data plane, absent when no pipeline is attached.
@@ -86,13 +94,16 @@ impl ApiState {
     }
 
     /// Agent runtime handle, if a model provider was configured.
-    pub fn agent(&self) -> Option<&Arc<Agent>> {
-        self.inner.agent.as_ref()
+    ///
+    /// Returns a snapshot of the live slot: callers always observe the provider that is
+    /// configured *now*, which is what lets the console change it at runtime.
+    pub fn agent(&self) -> Option<Arc<Agent>> {
+        self.inner.llm.current()
     }
 
     /// Requires an agent runtime, failing with `503` when none is configured.
-    pub fn require_agent(&self) -> Result<&Arc<Agent>, ApiError> {
-        self.inner.agent.as_ref().ok_or_else(|| {
+    pub fn require_agent(&self) -> Result<Arc<Agent>, ApiError> {
+        self.agent().ok_or_else(|| {
             ApiError::Unavailable(
                 "No LLM provider is configured for this core; chat completions are disabled"
                     .to_string(),
@@ -100,9 +111,62 @@ impl ApiState {
         })
     }
 
+    /// Shared agent slot, used by the composition root to wire the pipeline, the IPC service and
+    /// the provider endpoints to one provider source.
+    pub fn llm_slot(&self) -> &Arc<AgentSlot> {
+        &self.inner.llm
+    }
+
+    /// Builds an agent runtime that shares this node's memory, sessions, personas and trace hooks.
+    ///
+    /// This is the single constructor for the node's agent: the startup builder and the runtime
+    /// provider endpoints both funnel through it, so a provider configured from the console
+    /// behaves exactly like one bootstrapped from the environment.
+    pub fn build_agent(
+        &self,
+        name: impl Into<String>,
+        provider: Arc<dyn LlmProvider>,
+        config: AgentConfig,
+    ) -> Arc<Agent> {
+        build_node_agent(
+            name,
+            provider,
+            config,
+            self.inner.sessions.memory(),
+            &self.inner.sessions,
+            &self.inner.personas,
+            &self.inner.observability,
+        )
+    }
+
+    /// Installs a model provider on the running node and returns the resulting agent.
+    ///
+    /// The pipeline worker, the chat endpoints and the IPC gateway all observe the swap on their
+    /// next call; nothing needs to be restarted and no request in flight is disturbed.
+    pub fn apply_llm_provider(
+        &self,
+        name: impl Into<String>,
+        provider: Arc<dyn LlmProvider>,
+        config: AgentConfig,
+    ) -> Arc<Agent> {
+        let agent = self.build_agent(name, provider, config);
+        self.inner.llm.set(Some(agent.clone()));
+        agent
+    }
+
+    /// Clears the configured provider, disabling chat and conversational routing.
+    pub fn clear_llm_provider(&self) {
+        self.inner.llm.set(None);
+    }
+
     /// Plugin configuration store handle.
     pub fn config_store(&self) -> &Arc<PluginConfigStore> {
         &self.inner.config_store
+    }
+
+    /// Node-level system configuration store handle.
+    pub fn system_config(&self) -> &Arc<SystemConfigStore> {
+        &self.inner.system_config
     }
 
     /// Observability hub handle.
@@ -130,6 +194,8 @@ pub struct ApiStateBuilder {
     memory: Option<Arc<dyn Memory>>,
     agent: Option<Arc<Agent>>,
     pending_llm: Option<PendingLlm>,
+    agent_slot: Option<Arc<AgentSlot>>,
+    system_config: Option<Arc<SystemConfigStore>>,
     config_base_dir: Option<PathBuf>,
     observability: Option<Arc<Observability>>,
     ingress: Option<EventIngress>,
@@ -154,6 +220,8 @@ impl ApiStateBuilder {
             memory: None,
             agent: None,
             pending_llm: None,
+            agent_slot: None,
+            system_config: None,
             config_base_dir: None,
             observability: None,
             ingress: None,
@@ -195,8 +263,19 @@ impl ApiStateBuilder {
     ///
     /// Prefer [`ApiStateBuilder::with_llm_provider`] unless the agent already carries its own
     /// lifecycle hooks: an agent built elsewhere will not publish tool-calling trace events.
+    /// Ignored when an explicit slot is injected, which stays authoritative.
     pub fn with_agent(mut self, agent: Arc<Agent>) -> Self {
         self.agent = Some(agent);
+        self
+    }
+
+    /// Shares an externally owned agent slot as the node's provider source.
+    ///
+    /// The composition root uses this to hand the *same* slot to the pipeline worker, the IPC
+    /// service and the management gateway. When a slot is injected it is authoritative: the
+    /// builder neither constructs nor overwrites an agent for it.
+    pub fn with_agent_slot(mut self, slot: Arc<AgentSlot>) -> Self {
+        self.agent_slot = Some(slot);
         self
     }
 
@@ -216,6 +295,15 @@ impl ApiStateBuilder {
             provider,
             config,
         });
+        self
+    }
+
+    /// Overrides the node-level system configuration store.
+    ///
+    /// Defaults to the node's `data/system.json`, which is where the provider endpoints persist
+    /// the operator's selection.
+    pub fn with_system_config(mut self, store: Arc<SystemConfigStore>) -> Self {
+        self.system_config = Some(store);
         self
     }
 
@@ -257,36 +345,46 @@ impl ApiStateBuilder {
             .unwrap_or_else(|| Arc::new(SessionManager::new(memory.clone())));
         let personas = self.personas.unwrap_or_default();
 
-        let agent = self.agent.or_else(|| {
+        // Provider source resolution. A caller-supplied slot is shared verbatim (the composition
+        // root hands the same instance to the pipeline, the IPC service and this gateway), and any
+        // provider the builder was given is installed *into* it. A provider is never dropped
+        // silently just because a slot was injected: that would leave the node permanently
+        // unconfigured while reporting a configured provider.
+        let provided_agent = self.agent.or_else(|| {
             self.pending_llm.map(|pending| {
-                let config = pending.config;
-
-                // The builder exposes fluent setters rather than a whole-config setter, so the
-                // optional sampling knobs are applied only when explicitly configured.
-                let mut builder = Agent::builder(pending.name, pending.provider)
-                    .memory(memory.clone())
-                    .session_manager(sessions.clone())
-                    .persona_registry(personas.clone())
-                    .hook_arc(observability.events.clone())
-                    .model(config.default_model.clone())
-                    .max_iterations(config.max_iterations)
-                    .stop_on_tool_failure(config.stop_on_tool_failure);
-
-                if let Some(temperature) = config.temperature {
-                    builder = builder.temperature(temperature);
-                }
-                if let Some(max_tokens) = config.max_tokens {
-                    builder = builder.max_tokens(max_tokens);
-                }
-
-                Arc::new(builder.build())
+                build_node_agent(
+                    pending.name,
+                    pending.provider,
+                    pending.config,
+                    &memory,
+                    &sessions,
+                    &personas,
+                    &observability,
+                )
             })
         });
+
+        let llm = match self.agent_slot {
+            Some(slot) => {
+                if let Some(agent) = provided_agent {
+                    slot.set(Some(agent));
+                }
+                slot
+            }
+            None => Arc::new(match provided_agent {
+                Some(agent) => AgentSlot::with_agent(agent),
+                None => AgentSlot::new(),
+            }),
+        };
 
         let config_store = Arc::new(match self.config_base_dir {
             Some(dir) => PluginConfigStore::new(dir),
             None => PluginConfigStore::default(),
         });
+
+        let system_config = self
+            .system_config
+            .unwrap_or_else(|| Arc::new(SystemConfigStore::default()));
 
         let plugins_dir = self.plugins_dir.unwrap_or_else(|| PathBuf::from("./plugins"));
 
@@ -297,14 +395,53 @@ impl ApiStateBuilder {
                 supervisor: self.supervisor,
                 sessions,
                 personas,
-                agent,
+                llm,
                 config_store,
+                system_config,
                 observability,
                 ingress: self.ingress,
                 plugins_dir,
             }),
         }
     }
+}
+
+/// Constructs the node's agent runtime around a model provider.
+///
+/// The agent shares the node's conversation memory, session manager, persona registry and
+/// observability event bus, so a provider installed at runtime is indistinguishable from one
+/// configured at startup — including the trace events it publishes.
+///
+/// This is the single owner of node-agent construction: the state builder and
+/// [`ApiState::apply_llm_provider`] both call it.
+pub fn build_node_agent(
+    name: impl Into<String>,
+    provider: Arc<dyn LlmProvider>,
+    config: AgentConfig,
+    memory: &Arc<dyn Memory>,
+    sessions: &Arc<SessionManager>,
+    personas: &Arc<PersonaRegistry>,
+    observability: &Arc<Observability>,
+) -> Arc<Agent> {
+    // The Agent builder exposes fluent setters rather than a whole-config setter, so the
+    // optional sampling knobs are applied only when explicitly configured.
+    let mut builder = Agent::builder(name, provider)
+        .memory(memory.clone())
+        .session_manager(sessions.clone())
+        .persona_registry(personas.clone())
+        .hook_arc(observability.events.clone())
+        .model(config.default_model.clone())
+        .max_iterations(config.max_iterations)
+        .stop_on_tool_failure(config.stop_on_tool_failure);
+
+    if let Some(temperature) = config.temperature {
+        builder = builder.temperature(temperature);
+    }
+    if let Some(max_tokens) = config.max_tokens {
+        builder = builder.max_tokens(max_tokens);
+    }
+
+    Arc::new(builder.build())
 }
 
 /// Applies the default agent configuration used by the standalone gateway binary.

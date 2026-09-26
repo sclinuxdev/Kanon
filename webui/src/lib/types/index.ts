@@ -41,6 +41,8 @@ export interface WebhookConfig {
 
 export interface LlmConfig {
   configured: boolean;
+  /** Where the effective provider comes from: console selection, environment bootstrap, or none. */
+  source: 'console' | 'env' | 'runtime' | 'none';
   protocol: string;
   model: string;
   base_url: string | null;
@@ -71,6 +73,8 @@ export interface SystemConfig {
 // Provider & Models types
 export interface ActiveProviderInfo {
   configured: boolean;
+  /** Where the effective provider comes from: console selection, environment bootstrap, or none. */
+  source: 'console' | 'env' | 'runtime' | 'none';
   protocol: string;
   model: string;
   base_url: string | null;
@@ -96,6 +100,22 @@ export interface ProvidersCatalog {
   active: ActiveProviderInfo;
   available_protocols: ProtocolDescriptor[];
   presets: ProviderPreset[];
+}
+
+/** Payload for `PUT /api/v1/providers/active`; mirrors the `KANON_LLM_*` variables. */
+export interface ActivateProviderRequest {
+  protocol: string;
+  base_url: string;
+  model: string;
+  api_key?: string;
+  temperature?: number;
+  max_tokens?: number;
+}
+
+export interface ActivateProviderResponse {
+  applied: boolean;
+  message: string;
+  active: ActiveProviderInfo;
 }
 
 export interface TestProviderRequest {

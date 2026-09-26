@@ -54,6 +54,8 @@ pub struct WebhookConfigSection {
 pub struct LlmConfigSection {
     /// Whether an LLM provider is active.
     pub configured: bool,
+    /// Where the effective provider comes from: `console`, `env` or `none`.
+    pub source: &'static str,
     /// Active protocol identifier.
     pub protocol: String,
     /// Default model tag.
@@ -82,7 +84,9 @@ pub struct EnvironmentSection {
 }
 
 /// Handler for `GET /api/v1/system/config`.
-async fn system_config(State(state): State<ApiState>) -> Json<SystemConfigResponse> {
+async fn system_config(
+    State(state): State<ApiState>,
+) -> Result<Json<SystemConfigResponse>, crate::error::ApiError> {
     let webhook_adapter = state.supervisor().adapters().get("webhook").await;
     let callback_url_env = std::env::var("KANON_WEBHOOK_CALLBACK_URL")
         .ok()
@@ -103,46 +107,32 @@ async fn system_config(State(state): State<ApiState>) -> Json<SystemConfigRespon
         signature_verification: secret_env.is_some(),
     };
 
-    let base_url = std::env::var("KANON_LLM_BASE_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
-    let api_key_configured = std::env::var("KANON_LLM_API_KEY")
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false);
-    let protocol = std::env::var("KANON_LLM_PROTOCOL").unwrap_or_else(|_| "openai".to_string());
+    // Report the *effective* provider (console selection first, environment bootstrap second)
+    // rather than merely echoing the environment, which may have been overridden at runtime.
+    // A failure to read the persisted document is surfaced rather than masked by a default.
+    let active = super::providers::active_provider_info(&state)?;
 
-    let (configured, model, max_iterations, temperature, max_tokens) =
-        if let Some(agent) = state.agent() {
+    let (max_iterations, temperature, max_tokens) = match state.agent() {
+        Some(agent) => {
             let cfg = agent.config();
-            (
-                true,
-                cfg.default_model.clone(),
-                cfg.max_iterations,
-                cfg.temperature,
-                cfg.max_tokens,
-            )
-        } else {
-            (
-                false,
-                std::env::var("KANON_LLM_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
-                5,
-                None,
-                None,
-            )
-        };
+            (cfg.max_iterations, cfg.temperature, cfg.max_tokens)
+        }
+        None => (5, active.temperature, active.max_tokens),
+    };
 
     let llm = LlmConfigSection {
-        configured,
-        protocol,
-        model,
-        base_url,
-        api_key_configured,
+        configured: active.configured,
+        source: active.source,
+        protocol: active.protocol,
+        model: active.model,
+        base_url: active.base_url,
+        api_key_configured: active.api_key_configured,
         max_iterations,
         temperature,
         max_tokens,
     };
 
-    Json(SystemConfigResponse {
+    Ok(Json(SystemConfigResponse {
         version: state.version().to_string(),
         uptime_seconds: state.started_at().elapsed().as_secs(),
         ipc_socket_path: state
@@ -160,5 +150,5 @@ async fn system_config(State(state): State<ApiState>) -> Json<SystemConfigRespon
             arch: std::env::consts::ARCH,
             rust_edition: "2024",
         },
-    })
+    }))
 }

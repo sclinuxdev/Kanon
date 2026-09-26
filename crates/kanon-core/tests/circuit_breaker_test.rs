@@ -33,7 +33,11 @@ impl PipelineObserver for TestObserver {
 }
 
 /// Helper creating a dummy ManagedHost with an unattached channel (sufficient for circuit breaker checks).
-fn create_test_host(host_id: &str, priority: i32, config: CircuitBreakerConfig) -> Arc<ManagedHost> {
+fn create_test_host(
+    host_id: &str,
+    priority: i32,
+    config: CircuitBreakerConfig,
+) -> Arc<ManagedHost> {
     let dummy_endpoint = tonic::transport::Endpoint::from_static("http://127.0.0.1:50051");
     let channel = dummy_endpoint.connect_lazy();
     let cb = Arc::new(CircuitBreaker::new(config));
@@ -163,7 +167,10 @@ async fn test_circuit_breaker_sliding_window_latency_tripping() {
     cb.record_success(Duration::from_millis(50));
     // Window samples: [5ms, 10ms, 40ms, 50ms] -> avg = 26.25ms (>= 20ms)
     assert_eq!(cb.state(), CircuitState::Open);
-    assert!(!cb.allow_request(), "Breaker must trip on high average latency");
+    assert!(
+        !cb.allow_request(),
+        "Breaker must trip on high average latency"
+    );
     assert!(cb.last_failure_reason().unwrap().contains("Average RTT"));
 }
 
@@ -173,7 +180,8 @@ async fn test_prefilter_fast_skips_open_host_and_emits_observation_event() {
     let host = create_test_host("stalled_host", 100, config);
 
     // Manually trip the circuit breaker on this host
-    host.circuit_breaker.trip("Simulated host network partition");
+    host.circuit_breaker
+        .trip("Simulated host network partition");
     assert_eq!(host.circuit_breaker.state(), CircuitState::Open);
 
     let observer = Arc::new(TestObserver::default());
@@ -280,9 +288,7 @@ async fn test_pipeline_engine_tool_router_fast_skips_open_host() {
         .circuit_breaker
         .trip("Simulated host unresponsive");
 
-    supervisor
-        .register_managed_host(open_host)
-        .await;
+    supervisor.register_managed_host(open_host).await;
 
     let provider = Arc::new(MockChatProvider);
     let memory = Arc::new(kanon_llm::memory::ConversationManager::new(5));
@@ -377,13 +383,17 @@ async fn test_circuit_breaker_half_open_limits_concurrent_probes() {
     assert_eq!(cb.state(), CircuitState::HalfOpen);
 
     // Concurrent callers while probe is in flight must be rejected!
-    assert!(!cb.allow_request(), "Second concurrent probe must be rejected");
-    assert!(!cb.allow_request(), "Third concurrent probe must be rejected");
+    assert!(
+        !cb.allow_request(),
+        "Second concurrent probe must be rejected"
+    );
+    assert!(
+        !cb.allow_request(),
+        "Third concurrent probe must be rejected"
+    );
 
     // Once in-flight probe finishes successfully, breaker recovers to Closed
     cb.record_success(Duration::from_millis(10));
     assert_eq!(cb.state(), CircuitState::Closed);
     assert!(cb.allow_request(), "Normal traffic admitted after recovery");
 }
-
-

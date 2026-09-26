@@ -28,7 +28,9 @@ pub enum LintError {
         source: toml::de::Error,
     },
     /// Manifest file not found at the specified path.
-    #[error("Manifest file not found: '{0}' (expected 'plugin.toml' file or directory containing it)")]
+    #[error(
+        "Manifest file not found: '{0}' (expected 'plugin.toml' file or directory containing it)"
+    )]
     ManifestNotFound(PathBuf),
 }
 
@@ -87,11 +89,10 @@ pub fn lint_plugin(path: &Path) -> Result<LintReport, LintError> {
         source: e,
     })?;
 
-    let manifest: PluginManifest =
-        toml::from_str(&raw_toml).map_err(|e| LintError::Toml {
-            path: manifest_path.clone(),
-            source: e,
-        })?;
+    let manifest: PluginManifest = toml::from_str(&raw_toml).map_err(|e| LintError::Toml {
+        path: manifest_path.clone(),
+        source: e,
+    })?;
 
     let mut errors = Vec::new();
     let mut warnings = Vec::new();

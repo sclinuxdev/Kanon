@@ -5,13 +5,13 @@
 //! intelligently extracted, summarized via a lightweight model, and replaced with a
 //! condensed summary system block, preventing context blowout.
 
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use crate::agent::AgentHook;
 use crate::error::AgentError;
-use crate::gateway::types::{ChatMessage, ChatRequest, Role};
 use crate::gateway::LlmProvider;
+use crate::gateway::types::{ChatMessage, ChatRequest, Role};
 use crate::memory::Memory;
 use crate::token::estimate_conversation_tokens;
 
@@ -100,9 +100,14 @@ impl ContextSummarizer {
         );
 
         // Determine split boundary (excluding the system prompt at index 0 if present)
-        let has_system_prompt = messages.first().map(|m| m.role == Role::System).unwrap_or(false);
+        let has_system_prompt = messages
+            .first()
+            .map(|m| m.role == Role::System)
+            .unwrap_or(false);
         let start_idx = if has_system_prompt { 1 } else { 0 };
-        let end_idx = messages.len().saturating_sub(self.config.preserve_recent_messages);
+        let end_idx = messages
+            .len()
+            .saturating_sub(self.config.preserve_recent_messages);
 
         if end_idx <= start_idx {
             return Ok(false);
@@ -130,12 +135,19 @@ impl ContextSummarizer {
                 transcript.push_str(&format!("{role_name}: {text}\n"));
             } else if let Some(ref calls) = msg.tool_calls {
                 let call_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
-                transcript.push_str(&format!("Assistant invoked tools: {}\n", call_names.join(", ")));
+                transcript.push_str(&format!(
+                    "Assistant invoked tools: {}\n",
+                    call_names.join(", ")
+                ));
             }
         }
 
         let default_instruction = "Provide a concise, factual summary of the following prior conversation transcript. Preserve important entity names, user preferences, conclusions, and key state:";
-        let instruction = self.config.custom_instruction.as_deref().unwrap_or(default_instruction);
+        let instruction = self
+            .config
+            .custom_instruction
+            .as_deref()
+            .unwrap_or(default_instruction);
 
         let summary_prompt = format!("{instruction}\n\n---\n{transcript}\n---");
 
@@ -154,7 +166,9 @@ impl ContextSummarizer {
         };
 
         let resp = self.provider.chat(&req).await?;
-        let summary_text = resp.content.unwrap_or_else(|| "Previous context summarized.".to_string());
+        let summary_text = resp
+            .content
+            .unwrap_or_else(|| "Previous context summarized.".to_string());
 
         tracing::info!(
             session_key = %session_key,
@@ -176,7 +190,9 @@ impl ContextSummarizer {
 
         // Atomically replace history in a single transaction, eliminating the destructive
         // clear-and-insert vulnerability window where history could be permanently lost!
-        self.memory.replace_history(session_key, system_prompt, compacted).await?;
+        self.memory
+            .replace_history(session_key, system_prompt, compacted)
+            .await?;
 
         Ok(true)
     }
@@ -197,7 +213,11 @@ impl SummaryHook {
 
 #[async_trait]
 impl AgentHook for SummaryHook {
-    async fn on_llm_request(&self, session_id: &str, request: &mut ChatRequest) -> Result<(), AgentError> {
+    async fn on_llm_request(
+        &self,
+        session_id: &str,
+        request: &mut ChatRequest,
+    ) -> Result<(), AgentError> {
         let did_compress = self.summarizer.compress_session(session_id).await?;
         if did_compress {
             // When compression occurs, immediately update outbound request.messages

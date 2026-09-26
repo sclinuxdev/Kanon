@@ -345,14 +345,17 @@ async fn webhook_adapter_reports_delivery_failures() {
     );
 
     // Inbound-only adapters report themselves as not connected and fail loudly on delivery.
-    let inbound_only = kanon_api::WebhookAdapter::new("webhook_inbound", None, None)
-        .expect("adapter constructs");
+    let inbound_only =
+        kanon_api::WebhookAdapter::new("webhook_inbound", None, None).expect("adapter constructs");
     assert!(!inbound_only.is_connected());
     let error = inbound_only
         .deliver(test_request())
         .await
         .expect_err("missing callback must fail the delivery");
-    assert!(error.to_string().contains("no callback URL"), "error: {error}");
+    assert!(
+        error.to_string().contains("no callback URL"),
+        "error: {error}"
+    );
 
     // An empty platform identifier is a configuration error, not a usable adapter.
     assert!(kanon_api::WebhookAdapter::new("   ", None, None).is_err());
@@ -435,7 +438,9 @@ async fn test_webhook_inbound_hmac_sha256_signature_verification() {
     let resp = app.clone().oneshot(req).await.expect("execute request");
     assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
 
-    let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.expect("bytes");
+    let bytes = axum::body::to_bytes(resp.into_body(), 1024)
+        .await
+        .expect("bytes");
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(body["error"]["code"], "unauthorized");
 
@@ -444,17 +449,18 @@ async fn test_webhook_inbound_hmac_sha256_signature_verification() {
         .method(Method::POST)
         .uri("/api/v1/adapters/secured_webhook/ingest")
         .header("content-type", "application/json")
-        .header("x-hub-signature-256", "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        .header(
+            "x-hub-signature-256",
+            "sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
         .body(Body::from(payload_str.clone()))
         .expect("build request");
     let resp = app.clone().oneshot(req).await.expect("execute request");
     assert_eq!(resp.status(), axum::http::StatusCode::UNAUTHORIZED);
 
     // 3. Valid HMAC-SHA256 signature must be accepted with 202
-    let valid_sig = kanon_api::adapters::webhook::sign_hmac_sha256(
-        secret.as_bytes(),
-        payload_str.as_bytes(),
-    );
+    let valid_sig =
+        kanon_api::adapters::webhook::sign_hmac_sha256(secret.as_bytes(), payload_str.as_bytes());
     let req = Request::builder()
         .method(Method::POST)
         .uri("/api/v1/adapters/secured_webhook/ingest")
@@ -472,9 +478,9 @@ async fn test_webhook_inbound_hmac_sha256_signature_verification() {
 /// Outbound delivery retries on transient errors (503) with backoff and succeeds when endpoint recovers.
 #[tokio::test]
 async fn test_webhook_outbound_retry_and_backoff() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use axum::http::StatusCode;
     use axum::routing::post;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_clone = attempts.clone();
@@ -485,10 +491,16 @@ async fn test_webhook_outbound_retry_and_backoff() {
         let count = counter.fetch_add(1, Ordering::SeqCst);
         if count < 2 {
             // Fail first 2 attempts with transient 503
-            (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"error": "server busy"})))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"error": "server busy"})),
+            )
         } else {
             // Succeed on 3rd attempt
-            (StatusCode::OK, axum::Json(json!({"message_id": "recovered-msg-99"})))
+            (
+                StatusCode::OK,
+                axum::Json(json!({"message_id": "recovered-msg-99"})),
+            )
         }
     }
 
@@ -518,15 +530,19 @@ async fn test_webhook_outbound_retry_and_backoff() {
 
     assert!(resp.success);
     assert_eq!(resp.message_id, "recovered-msg-99");
-    assert_eq!(attempts.load(Ordering::SeqCst), 3, "expected 3 total delivery attempts");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        3,
+        "expected 3 total delivery attempts"
+    );
 }
 
 /// Outbound delivery must NOT retry on permanent 4xx client errors (e.g. 400 Bad Request).
 #[tokio::test]
 async fn test_webhook_outbound_non_retryable_on_4xx_client_error() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use axum::http::StatusCode;
     use axum::routing::post;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let attempts = Arc::new(AtomicUsize::new(0));
     let attempts_clone = attempts.clone();
@@ -573,9 +589,9 @@ async fn test_webhook_outbound_non_retryable_on_4xx_client_error() {
 /// Outbound delivery attaches HMAC signature headers when a secret is configured.
 #[tokio::test]
 async fn test_webhook_outbound_signing_header() {
-    use tokio::sync::Mutex;
     use axum::http::HeaderMap;
     use axum::routing::post;
+    use tokio::sync::Mutex;
 
     let captured_header = Arc::new(Mutex::new(None));
     let captured_clone = captured_header.clone();
@@ -609,10 +625,17 @@ async fn test_webhook_outbound_signing_header() {
         .expect("adapter constructs")
         .with_secret(secret);
 
-    let resp = adapter.deliver(test_request()).await.expect("deliver succeeds");
+    let resp = adapter
+        .deliver(test_request())
+        .await
+        .expect("deliver succeeds");
     assert!(resp.success);
 
-    let sig = captured_header.lock().await.clone().expect("signature header captured");
+    let sig = captured_header
+        .lock()
+        .await
+        .clone()
+        .expect("signature header captured");
     assert!(sig.starts_with("sha256="), "expected sha256 prefix: {sig}");
 }
 
@@ -687,7 +710,11 @@ async fn pipeline_llm_conversational_turn_routes_to_outbound_delivery() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    assert_eq!(deliveries.len(), 1, "expected 1 outbound delivery to adapter");
+    assert_eq!(
+        deliveries.len(),
+        1,
+        "expected 1 outbound delivery to adapter"
+    );
     let delivery = &deliveries[0];
     assert_eq!(delivery.platform, BUILTIN_PLATFORM);
     assert_eq!(delivery.channel_id, "chan-llm-1");

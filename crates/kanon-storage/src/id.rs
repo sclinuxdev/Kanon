@@ -3,9 +3,9 @@
 //! Enforces single path segment isolation and path traversal prevention across
 //! all subsystems (PluginDataDir, PluginConfigStore, Supervisor, etc.).
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use std::str::FromStr;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// Error returned when a plugin identifier fails path safety or syntax validation.

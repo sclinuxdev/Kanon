@@ -7,16 +7,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use async_trait::async_trait;
 use kanon_api::{ApiState, default_agent_config};
 use kanon_core::supervisor::Supervisor;
 use kanon_core::{AdapterError, EventIngress, PlatformAdapter, PluginManifest};
-use kanon_proto::v1::{DeliverMessageRequest, DeliverMessageResponse, IngestEventRequest};
 use kanon_llm::{ChatRequest, ChatResponse, GatewayError, LlmProvider, TokenUsage};
 use kanon_proto::v1::{CommandMeta, PluginMeta, ToolMeta};
+use kanon_proto::v1::{DeliverMessageRequest, DeliverMessageResponse, IngestEventRequest};
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -316,10 +316,7 @@ impl PlatformAdapter for RecordingAdapter {
         request: DeliverMessageRequest,
     ) -> Result<DeliverMessageResponse, AdapterError> {
         let message_id = format!("builtin-{}", request.channel_id);
-        self.deliveries
-            .lock()
-            .expect("delivery lock")
-            .push(request);
+        self.deliveries.lock().expect("delivery lock").push(request);
 
         Ok(DeliverMessageResponse {
             success: true,

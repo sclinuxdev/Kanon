@@ -23,7 +23,10 @@ fn save_load_round_trip_preserves_every_field() {
     assert!(store.load().expect("load empty store").is_none());
 
     store.save(&sample()).expect("save provider");
-    let loaded = store.load().expect("load provider").expect("provider present");
+    let loaded = store
+        .load()
+        .expect("load provider")
+        .expect("provider present");
 
     assert_eq!(loaded, sample());
 }
@@ -40,7 +43,10 @@ fn clear_removes_only_the_provider_entry() {
     store.clear().expect("clear provider");
 
     let raw = std::fs::read_to_string(&path).expect("read document");
-    assert!(raw.contains("future_setting"), "unrelated settings must be preserved: {raw}");
+    assert!(
+        raw.contains("future_setting"),
+        "unrelated settings must be preserved: {raw}"
+    );
     assert!(store.load().expect("load after clear").is_none());
 }
 

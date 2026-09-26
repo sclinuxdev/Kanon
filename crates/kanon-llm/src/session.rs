@@ -296,7 +296,12 @@ impl SessionManager {
     }
 
     /// Sets a session-scoped state variable.
-    pub fn set_variable(&self, session_key: &str, key: impl Into<String>, value: impl Into<String>) {
+    pub fn set_variable(
+        &self,
+        session_key: &str,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) {
         let k = key.into();
         let v = value.into();
         let mut entry = self

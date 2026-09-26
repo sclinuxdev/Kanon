@@ -1,9 +1,9 @@
 //! Kanon Core microkernel server entrypoint.
 
-use std::sync::Arc;
 use kanon_core::ipc::{CoreApiService, CoreIpcServer, DEFAULT_INGEST_QUEUE_CAPACITY};
 use kanon_core::pipeline::PipelineEngine;
 use kanon_core::supervisor::Supervisor;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[tokio::main]
@@ -34,9 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             agent_slot.set(Some(agent));
         }
         Ok(None) => {
-            tracing::info!(
-                "KANON_LLM_BASE_URL is unset; conversational LLM routing is disabled"
-            );
+            tracing::info!("KANON_LLM_BASE_URL is unset; conversational LLM routing is disabled");
         }
         Err(e) => {
             return Err(format!("Failed to initialize LLM provider: {e}").into());
@@ -72,4 +70,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Kanon Core Engine shut down gracefully");
     Ok(())
 }
-

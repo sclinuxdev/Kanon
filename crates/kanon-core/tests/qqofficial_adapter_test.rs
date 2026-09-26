@@ -24,9 +24,14 @@ fn find_workspace_root() -> PathBuf {
 fn test_qqofficial_manifest_and_scanner() {
     let root = find_workspace_root();
     let manifest_path = root.join("plugins/qqofficial/plugin.toml");
-    assert!(manifest_path.exists(), "Manifest must exist at {}", manifest_path.display());
+    assert!(
+        manifest_path.exists(),
+        "Manifest must exist at {}",
+        manifest_path.display()
+    );
 
-    let manifest = PluginManifest::load_from_file(&manifest_path).expect("Manifest must parse cleanly");
+    let manifest =
+        PluginManifest::load_from_file(&manifest_path).expect("Manifest must parse cleanly");
     assert_eq!(manifest.plugin.id, "org.kanon.adapter.qqofficial");
     assert_eq!(manifest.plugin.name, "QQ Official Adapter");
     assert_eq!(manifest.plugin.runtime, "python");
@@ -37,15 +42,21 @@ fn test_qqofficial_manifest_and_scanner() {
     assert_eq!(adapter.platform, "qqofficial");
     assert_eq!(adapter.display_name.as_deref(), Some("QQ 官方机器人"));
 
-    let deps = manifest.dependencies.expect("Dependencies section must be defined");
+    let deps = manifest
+        .dependencies
+        .expect("Dependencies section must be defined");
     assert!(deps.packages.iter().any(|p| p.contains("qq-botpy")));
 
     // Verify discovery via PluginScanner
-    let discovered = PluginScanner::scan(root.join("plugins")).expect("Scanner must scan plugins dir");
+    let discovered =
+        PluginScanner::scan(root.join("plugins")).expect("Scanner must scan plugins dir");
     let qq_plugin = discovered
         .iter()
         .find(|p| p.manifest.plugin.id == "org.kanon.adapter.qqofficial");
-    assert!(qq_plugin.is_some(), "PluginScanner must discover qqofficial");
+    assert!(
+        qq_plugin.is_some(),
+        "PluginScanner must discover qqofficial"
+    );
 }
 
 #[tokio::test]
@@ -88,8 +99,14 @@ async fn test_qqofficial_adapter_supervisor_lifecycle() {
     // 5. Verify GetPluginMeta handshake and adapter status
     assert_eq!(managed_host.meta.len(), 1);
     assert_eq!(managed_host.meta[0].id, "org.kanon.adapter.qqofficial");
-    assert_eq!(managed_host.adapter_platforms(), vec!["qqofficial".to_string()]);
-    assert_eq!(managed_host.adapter_display_name().as_deref(), Some("QQ 官方机器人"));
+    assert_eq!(
+        managed_host.adapter_platforms(),
+        vec!["qqofficial".to_string()]
+    );
+    assert_eq!(
+        managed_host.adapter_display_name().as_deref(),
+        Some("QQ 官方机器人")
+    );
 
     // 6. Test outbound delivery hook while QQ client is disconnected
     let deliver_req = DeliverMessageRequest {
@@ -110,7 +127,10 @@ async fn test_qqofficial_adapter_supervisor_lifecycle() {
         .expect("deliver_message RPC must succeed");
 
     // The QQ client is disconnected in test mode (missing credentials), so success is false with explicit error
-    assert!(!deliver_resp.success, "Delivery without active QQ client must report failure");
+    assert!(
+        !deliver_resp.success,
+        "Delivery without active QQ client must report failure"
+    );
     assert!(
         deliver_resp.error_message.contains("disconnected")
             || deliver_resp.error_message.contains("not running"),

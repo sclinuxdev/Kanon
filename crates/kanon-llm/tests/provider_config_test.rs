@@ -51,7 +51,10 @@ fn build_provider_rejects_unknown_protocol_and_blank_base_url() {
     let err = build_provider("grpc-ish", "https://example.invalid/v1", None, "m")
         .err()
         .expect("unknown protocol must be rejected");
-    assert!(err.contains("Unsupported protocol"), "unexpected error: {err}");
+    assert!(
+        err.contains("Unsupported protocol"),
+        "unexpected error: {err}"
+    );
 
     let err = build_provider("openai", "   ", None, "m")
         .err()

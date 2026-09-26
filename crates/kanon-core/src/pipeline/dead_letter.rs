@@ -181,7 +181,13 @@ fn segment_to_json(segment: &MessageSegment) -> Value {
 /// Replaces invalid filesystem characters in platform identifiers.
 fn sanitize_filename(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 

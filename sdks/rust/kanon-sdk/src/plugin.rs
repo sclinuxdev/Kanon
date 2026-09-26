@@ -3,12 +3,12 @@
 //! Provides the primary interface for defining plugin lifecycle hooks,
 //! command dispatchers, pre-filters, and LLM tools.
 
+use crate::context::PluginContext;
 use async_trait::async_trait;
 use kanon_proto::v1::{
     CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse,
     PipelineEventRequest, PluginMeta, PreFilterResult, ToolCallRequest, ToolCallResponse,
 };
-use crate::context::PluginContext;
 
 /// Result alias for plugin operations.
 pub type PluginResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -33,12 +33,18 @@ pub trait Plugin: Send + Sync + 'static {
     }
 
     /// Intercepts inbound events before command dispatch or LLM reasoning.
-    async fn on_pre_filter(&self, _req: PipelineEventRequest) -> PluginResult<Option<PreFilterResult>> {
+    async fn on_pre_filter(
+        &self,
+        _req: PipelineEventRequest,
+    ) -> PluginResult<Option<PreFilterResult>> {
         Ok(None)
     }
 
     /// Executes a registered slash command.
-    async fn on_execute_command(&self, req: CommandExecuteRequest) -> PluginResult<CommandExecuteResponse> {
+    async fn on_execute_command(
+        &self,
+        req: CommandExecuteRequest,
+    ) -> PluginResult<CommandExecuteResponse> {
         Ok(CommandExecuteResponse {
             success: true,
             replies: vec![],
@@ -76,4 +82,3 @@ pub trait Plugin: Send + Sync + 'static {
         })
     }
 }
-

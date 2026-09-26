@@ -13,10 +13,10 @@ use kanon_core::adapter::{AdapterError, AdapterKind, EventIngress, IngestError};
 use kanon_core::pipeline::PipelineEngine;
 use kanon_core::supervisor::Supervisor;
 use kanon_core::{ManagedHost, PluginManifest};
-use kanon_proto::v1::message_segment::Segment;
 use kanon_proto::v1::message_pipeline_service_server::{
     MessagePipelineService, MessagePipelineServiceServer,
 };
+use kanon_proto::v1::message_segment::Segment;
 use kanon_proto::v1::{
     CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse,
     EventAck, EventNotification, IngestEventRequest, MessageSegment, PipelineEventRequest,
@@ -114,10 +114,7 @@ impl MessagePipelineService for RecordingHost {
 }
 
 /// Starts an in-process plugin host serving `MessagePipelineService` on a temporary socket.
-async fn start_recording_host(
-    socket_path: PathBuf,
-    reject_delivery: bool,
-) -> Arc<RecordingHost> {
+async fn start_recording_host(socket_path: PathBuf, reject_delivery: bool) -> Arc<RecordingHost> {
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
     }
@@ -133,7 +130,9 @@ async fn start_recording_host(
 
     tokio::spawn(async move {
         let _ = tonic::transport::Server::builder()
-            .add_service(MessagePipelineServiceServer::new(RecordingHostServer { inner: served }))
+            .add_service(MessagePipelineServiceServer::new(RecordingHostServer {
+                inner: served,
+            }))
             .serve_with_incoming(incoming)
             .await;
     });
@@ -200,7 +199,10 @@ fn outbound_request(platform: &str) -> DeliverMessageRequest {
 }
 
 /// Registers a plugin host whose manifest declares `fixture_platform`.
-async fn register_adapter_host(supervisor: &Supervisor, run_dir: &std::path::Path) -> Arc<RecordingHost> {
+async fn register_adapter_host(
+    supervisor: &Supervisor,
+    run_dir: &std::path::Path,
+) -> Arc<RecordingHost> {
     let socket_path = run_dir.join("host_fixture_adapter.sock");
     let recorded = start_recording_host(socket_path.clone(), false).await;
 
@@ -328,8 +330,14 @@ async fn outbound_is_routed_to_plugin_adapter_host() {
     assert_eq!(catalog[0].platform, "fixture_platform");
     assert_eq!(catalog[0].kind, AdapterKind::Plugin);
     assert_eq!(catalog[0].display_name, "Fixture Platform");
-    assert_eq!(catalog[0].host_id.as_deref(), Some("org_kanon_plugin_adapter_fixture"));
-    assert_eq!(catalog[0].plugin_id.as_deref(), Some("org.kanon.plugin.adapter_fixture"));
+    assert_eq!(
+        catalog[0].host_id.as_deref(),
+        Some("org_kanon_plugin_adapter_fixture")
+    );
+    assert_eq!(
+        catalog[0].plugin_id.as_deref(),
+        Some("org.kanon.plugin.adapter_fixture")
+    );
 
     let engine = PipelineEngine::new(supervisor);
     let outcome = engine
@@ -423,7 +431,10 @@ async fn ingest_handle_reports_backpressure_and_closure() {
     drop(rx);
     assert!(ingress.is_closed());
     assert_eq!(ingress.try_ingest(event("evt-4")), Err(IngestError::Closed));
-    assert_eq!(ingress.ingest(event("evt-5")).await, Err(IngestError::Closed));
+    assert_eq!(
+        ingress.ingest(event("evt-5")).await,
+        Err(IngestError::Closed)
+    );
 }
 
 /// Helper adapter to verify partitioned dispatch concurrency and sequencing.
@@ -551,7 +562,10 @@ struct FailureObserver {
 
 impl kanon_core::PipelineObserver for FailureObserver {
     fn on_stage(&self, stage: &kanon_core::PipelineStage) {
-        if let kanon_core::PipelineStage::OutboundFailed { platform, reason, .. } = stage {
+        if let kanon_core::PipelineStage::OutboundFailed {
+            platform, reason, ..
+        } = stage
+        {
             let mut list = self.failures.try_lock().expect("lock failure list");
             list.push(format!("{platform}:{reason}"));
         }
@@ -761,7 +775,10 @@ async fn platform_circuit_breaker_trips_and_persists_to_dead_letter() {
     // 5. Inspect the dead-letter cold storage files
     assert!(dlq_dir.exists(), "DLQ directory must be created");
     let mut files = std::fs::read_dir(&dlq_dir).expect("read dlq dir");
-    let entry = files.next().expect("at least one dlq file").expect("file entry");
+    let entry = files
+        .next()
+        .expect("at least one dlq file")
+        .expect("file entry");
     let file_name = entry.file_name().to_string_lossy().to_string();
     assert!(
         file_name.starts_with("unstable_im_"),
@@ -773,7 +790,11 @@ async fn platform_circuit_breaker_trips_and_persists_to_dead_letter() {
     );
 
     let content = std::fs::read_to_string(entry.path()).expect("read dlq file");
-    let lines: Vec<&str> = content.trim().split('\n').filter(|s| !s.is_empty()).collect();
+    let lines: Vec<&str> = content
+        .trim()
+        .split('\n')
+        .filter(|s| !s.is_empty())
+        .collect();
     // 5 failed deliveries + 1 short-circuited delivery = 6 dead-letter records
     assert_eq!(lines.len(), 6);
 
@@ -782,7 +803,12 @@ async fn platform_circuit_breaker_trips_and_persists_to_dead_letter() {
     assert_eq!(record1["platform"], "unstable_im");
     assert_eq!(record1["channel_id"], "chan-1");
     assert_eq!(record1["event_id"], "evt-fail-1");
-    assert!(record1["reason"].as_str().unwrap().contains("connection refused"));
+    assert!(
+        record1["reason"]
+            .as_str()
+            .unwrap()
+            .contains("connection refused")
+    );
     assert!(record1["timestamp_ms"].as_u64().unwrap() > 0);
     assert!(record1["iso_time"].as_str().unwrap().contains("T"));
     assert_eq!(record1["segments"][0]["content"], "msg 1");

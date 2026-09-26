@@ -8,10 +8,10 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
+use zip::write::SimpleFileOptions;
 
-use crate::lint::{lint_plugin, LintError, LintReport};
+use crate::lint::{LintError, LintReport, lint_plugin};
 
 /// Errors occurring during plugin bundle packaging.
 #[derive(Debug, Error)]
@@ -20,7 +20,9 @@ pub enum PackError {
     #[error("I/O error during packaging: {0}")]
     Io(#[from] std::io::Error),
     /// Manifest lint validation failed.
-    #[error("Plugin manifest validation failed with {0} error(s). Run 'kanon-dev lint' for details.")]
+    #[error(
+        "Plugin manifest validation failed with {0} error(s). Run 'kanon-dev lint' for details."
+    )]
     ValidationFailed(usize),
     /// Underlying linting failure.
     #[error("Linting failure: {0}")]
@@ -87,10 +89,7 @@ fn should_include_path(rel_path: &Path) -> bool {
 }
 
 /// Packages a plugin project into a standardized `.kpk` distribution archive.
-pub fn pack_plugin(
-    plugin_path: &Path,
-    output_dir: Option<&Path>,
-) -> Result<PackReport, PackError> {
+pub fn pack_plugin(plugin_path: &Path, output_dir: Option<&Path>) -> Result<PackReport, PackError> {
     // 1. Run static validation first; refuse to pack invalid manifests
     let lint_report = lint_plugin(plugin_path)?;
     if !lint_report.is_valid() {

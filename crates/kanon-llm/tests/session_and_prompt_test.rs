@@ -9,15 +9,13 @@ use tokio::sync::RwLock;
 
 use kanon_llm::agent::Agent;
 use kanon_llm::error::GatewayError;
-use kanon_llm::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role};
 use kanon_llm::gateway::LlmProvider;
+use kanon_llm::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role};
 use kanon_llm::memory::SlidingWindowMemory;
 use kanon_llm::prompt::{
     DynamicPromptHook, Persona, PersonaRegistry, PromptComposer, PromptTemplate,
 };
-use kanon_llm::session::{
-    SessionKey, SessionManager, SessionScope, SessionStatus,
-};
+use kanon_llm::session::{SessionKey, SessionManager, SessionScope, SessionStatus};
 
 // =========================================================================
 // 1. Session Management Tests
@@ -67,7 +65,10 @@ async fn test_session_manager_metadata_and_variable_lifecycle() {
     sm.set_variable(key, "timezone", "Asia/Shanghai");
 
     assert_eq!(sm.get_variable(key, "lang").as_deref(), Some("zh-CN"));
-    assert_eq!(sm.get_variable(key, "timezone").as_deref(), Some("Asia/Shanghai"));
+    assert_eq!(
+        sm.get_variable(key, "timezone").as_deref(),
+        Some("Asia/Shanghai")
+    );
 
     let all_vars = sm.get_variables(key);
     assert_eq!(all_vars.len(), 2);
@@ -92,7 +93,10 @@ async fn test_session_manager_metadata_and_variable_lifecycle() {
     assert_eq!(sm.get_persona(key).as_deref(), Some("coder"));
 
     // 5. Reset session clears memory and turn counts, but preserves persona & variables
-    sm.memory().push_message(key, ChatMessage::user("Hello")).await.unwrap();
+    sm.memory()
+        .push_message(key, ChatMessage::user("Hello"))
+        .await
+        .unwrap();
     assert_eq!(sm.memory().get_messages(key).await.unwrap().len(), 1);
 
     sm.reset_session(key).await.expect("Reset should succeed");
@@ -136,7 +140,10 @@ async fn test_session_manager_idle_sweep() {
     // Record turn reactivates session
     sm.record_turn(active_key, 50);
     assert_eq!(sm.active_session_count(), 1);
-    assert_eq!(sm.get_metadata(active_key).unwrap().status, SessionStatus::Active);
+    assert_eq!(
+        sm.get_metadata(active_key).unwrap().status,
+        SessionStatus::Active
+    );
 }
 
 // =========================================================================
@@ -145,7 +152,8 @@ async fn test_session_manager_idle_sweep() {
 
 #[test]
 fn test_prompt_template_parsing_and_rendering() {
-    let template_str = "You are {{bot_name|Kanon}}, an assistant for {{user|friend}}. Mode: {{mode}}.";
+    let template_str =
+        "You are {{bot_name|Kanon}}, an assistant for {{user|friend}}. Mode: {{mode}}.";
     let tmpl = PromptTemplate::parse(template_str);
 
     assert_eq!(tmpl.raw(), template_str);
@@ -163,18 +171,27 @@ fn test_prompt_template_parsing_and_rendering() {
     let mut vars = HashMap::new();
     vars.insert("mode".to_string(), "autonomous".to_string());
     let rendered = tmpl.render(&vars);
-    assert_eq!(rendered, "You are Kanon, an assistant for friend. Mode: autonomous.");
+    assert_eq!(
+        rendered,
+        "You are Kanon, an assistant for friend. Mode: autonomous."
+    );
 
     // 2. Render overriding defaults
     vars.insert("bot_name".to_string(), "Sentinel".to_string());
     vars.insert("user".to_string(), "Commander".to_string());
     let rendered_custom = tmpl.render(&vars);
-    assert_eq!(rendered_custom, "You are Sentinel, an assistant for Commander. Mode: autonomous.");
+    assert_eq!(
+        rendered_custom,
+        "You are Sentinel, an assistant for Commander. Mode: autonomous."
+    );
 
     // 3. Render with missing required slot and custom fallback
     let empty_vars = HashMap::new();
     let fallback_rendered = tmpl.render_with_fallback(&empty_vars, "[UNSET]");
-    assert_eq!(fallback_rendered, "You are Kanon, an assistant for friend. Mode: [UNSET].");
+    assert_eq!(
+        fallback_rendered,
+        "You are Kanon, an assistant for friend. Mode: [UNSET]."
+    );
 }
 
 #[test]
@@ -199,7 +216,10 @@ fn test_prompt_composer_layered_assembly() {
     assert!(prompt.contains("## Tool Guidelines"));
     assert!(prompt.contains("Call diagnostic tools before suggesting manual intervention."));
     assert!(prompt.contains("## Constraints & Safety"));
-    assert!(prompt.contains("- Never execute destructive shell commands without operator confirmation."));
+    assert!(
+        prompt
+            .contains("- Never execute destructive shell commands without operator confirmation.")
+    );
 }
 
 // =========================================================================
@@ -233,7 +253,8 @@ fn test_persona_registry_presets_and_custom() {
         "Site Reliability Engineer",
         "Triages production outages and manages Kubernetes clusters",
         "You are {{bot_name|Kanon}}, an SRE specializing in high-availability distributed systems.",
-    ).with_temperature(0.1);
+    )
+    .with_temperature(0.1);
 
     registry.register(custom);
     assert_eq!(registry.len(), 6);
@@ -292,7 +313,10 @@ async fn test_agent_dynamic_prompt_hook_integration() {
         .run_standalone(session_id, "Hello assistant!")
         .await
         .expect("Agent execution should succeed");
-    assert_eq!(out1.content, "I have processed your request according to my persona.");
+    assert_eq!(
+        out1.content,
+        "I have processed your request according to my persona."
+    );
 
     // Verify first request received rendered "assistant" prompt
     {
@@ -301,7 +325,10 @@ async fn test_agent_dynamic_prompt_hook_integration() {
         let first_msg = &reqs[0].messages[0];
         assert_eq!(first_msg.role, Role::System);
         let content = first_msg.content.as_deref().unwrap();
-        assert!(content.contains("You are KanonAI, a helpful, intelligent, and versatile AI assistant."));
+        assert!(
+            content
+                .contains("You are KanonAI, a helpful, intelligent, and versatile AI assistant.")
+        );
         // Assistant persona default temperature is 0.7
         assert_eq!(reqs[0].temperature, Some(0.7));
     }
@@ -326,7 +353,9 @@ async fn test_agent_dynamic_prompt_hook_integration() {
         let second_sys = &reqs[1].messages[0];
         assert_eq!(second_sys.role, Role::System);
         let content = second_sys.content.as_deref().unwrap();
-        assert!(content.contains("You are KanonAI, an expert software engineer and systems architect."));
+        assert!(
+            content.contains("You are KanonAI, an expert software engineer and systems architect.")
+        );
         // Coder persona default temperature is 0.2
         assert_eq!(reqs[1].temperature, Some(0.2));
     }
@@ -374,10 +403,16 @@ async fn test_dynamic_prompt_hook_with_runtime_context_provider() {
         .hook_arc(hook)
         .build();
 
-    agent.run_standalone("sess_1", "Status report").await.unwrap();
+    agent
+        .run_standalone("sess_1", "Status report")
+        .await
+        .unwrap();
 
     let reqs = captured.read().await;
     let sys_msg = &reqs[0].messages[0];
     let content = sys_msg.content.as_deref().unwrap();
-    assert_eq!(content, "Bot Name: ClusterNode. Server: us-west-prod-1. Current User: admin_carol.");
+    assert_eq!(
+        content,
+        "Bot Name: ClusterNode. Server: us-west-prod-1. Current User: admin_carol."
+    );
 }

@@ -7,8 +7,8 @@
 //! This module avoids hardcoding vendor names, domains, or proprietary endpoints.
 //! All configuration is protocol-level: base URL, auth token/headers, model, and parameters.
 
-use std::time::Duration;
 use async_trait::async_trait;
+use std::time::Duration;
 use tokio_stream::StreamExt;
 
 use crate::error::GatewayError;
@@ -34,7 +34,6 @@ mod wire {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         pub stream: bool,
     }
-
 
     #[derive(Debug, Serialize, Deserialize)]
     pub struct OpenAiMessageWire {
@@ -148,7 +147,6 @@ mod wire {
         pub arguments: Option<String>,
     }
 }
-
 
 /// Generic, protocol-level HTTP client implementing the OpenAI Chat Completions API.
 pub struct OpenAiChatProvider {
@@ -303,11 +301,9 @@ impl LlmProvider for OpenAiChatProvider {
 
         let wire_resp: wire::OpenAiChatResponse = resp.json().await?;
 
-        let choice = wire_resp
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| GatewayError::InvalidResponse("No choices returned in response".to_string()))?;
+        let choice = wire_resp.choices.into_iter().next().ok_or_else(|| {
+            GatewayError::InvalidResponse("No choices returned in response".to_string())
+        })?;
 
         let tool_calls = choice
             .message
@@ -437,8 +433,9 @@ impl LlmProvider for OpenAiChatProvider {
                         return;
                     }
 
-
-                    if let Ok(stream_resp) = serde_json::from_str::<wire::OpenAiStreamResponse>(&ev.data) {
+                    if let Ok(stream_resp) =
+                        serde_json::from_str::<wire::OpenAiStreamResponse>(&ev.data)
+                    {
                         for choice in stream_resp.choices {
                             let finish_reason = choice.finish_reason;
                             let is_done = finish_reason.is_some();
@@ -447,10 +444,8 @@ impl LlmProvider for OpenAiChatProvider {
                             }
 
                             let delta_text = choice.delta.content.unwrap_or_default();
-                            let reasoning_text = choice
-                                .delta
-                                .reasoning_content
-                                .filter(|r| !r.is_empty());
+                            let reasoning_text =
+                                choice.delta.reasoning_content.filter(|r| !r.is_empty());
 
                             let tool_calls: Vec<ToolCall> = choice
                                 .delta
@@ -470,7 +465,7 @@ impl LlmProvider for OpenAiChatProvider {
                                         .and_then(|f| f.arguments.as_ref())
                                         .and_then(|args| serde_json::from_str(args).ok())
                                         .unwrap_or(serde_json::json!({})),
-                                 })
+                                })
                                 .collect();
 
                             let has_content = !delta_text.is_empty()
@@ -510,4 +505,3 @@ impl LlmProvider for OpenAiChatProvider {
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 }
-

@@ -110,7 +110,10 @@ impl EventIngress {
     /// Pull-style adapters (long polling / streaming sockets) use this variant because they own a
     /// dedicated task per platform and can afford to apply backpressure to their own loop.
     pub async fn ingest(&self, request: IngestEventRequest) -> Result<(), IngestError> {
-        self.sender.send(request).await.map_err(|_| IngestError::Closed)
+        self.sender
+            .send(request)
+            .await
+            .map_err(|_| IngestError::Closed)
     }
 
     /// Configured high-watermark of the ingest queue, useful for diagnostics.
@@ -192,7 +195,11 @@ pub trait PlatformAdapter: Send + Sync {
     /// The default implementation accepts all payloads (`Ok(())`). Adapters that enforce cryptographic
     /// signatures (such as Webhook HMAC-SHA256) override this to reject forged payloads before
     /// they enter the core pipeline.
-    fn verify_inbound(&self, _signature: Option<&str>, _payload: &[u8]) -> Result<(), AdapterError> {
+    fn verify_inbound(
+        &self,
+        _signature: Option<&str>,
+        _payload: &[u8],
+    ) -> Result<(), AdapterError> {
         Ok(())
     }
 

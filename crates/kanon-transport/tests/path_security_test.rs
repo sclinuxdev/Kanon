@@ -4,8 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use kanon_transport::path::{
-    core_socket_path, default_run_dir, ensure_parent_dir, ensure_run_dir,
-    host_socket_path,
+    core_socket_path, default_run_dir, ensure_parent_dir, ensure_run_dir, host_socket_path,
 };
 
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());

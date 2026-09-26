@@ -30,7 +30,10 @@ impl ChannelAdapter {
     }
 
     /// Convenience constructor returning the shared adapter handle.
-    pub fn shared(platform: impl Into<String>, sender: mpsc::Sender<DeliverMessageRequest>) -> Arc<Self> {
+    pub fn shared(
+        platform: impl Into<String>,
+        sender: mpsc::Sender<DeliverMessageRequest>,
+    ) -> Arc<Self> {
         Arc::new(Self::new(platform, sender))
     }
 }

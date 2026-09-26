@@ -17,11 +17,11 @@ use kanon_core::supervisor::{ManagedHost, Supervisor, SupervisorError};
 use kanon_proto::prost_types;
 use kanon_proto::v1::message_segment::Segment;
 use kanon_proto::v1::{
-    audio_segment, image_segment, tool_call_request, tool_call_response, CommandExecuteRequest,
-    CommandExecuteResponse, ToolCallRequest, ToolCallResponse,
+    CommandExecuteRequest, CommandExecuteResponse, ToolCallRequest, ToolCallResponse,
+    audio_segment, image_segment, tool_call_request, tool_call_response,
 };
 
-use crate::lint::{find_manifest_path, LintError};
+use crate::lint::{LintError, find_manifest_path};
 
 /// Errors occurring during sandbox execution.
 #[derive(Debug, Error)]
@@ -96,7 +96,9 @@ fn format_segments(segments: &[kanon_proto::v1::MessageSegment]) -> String {
                     None => out.push("[Audio]".to_string()),
                 },
                 Segment::Mention(m) => out.push(format!("@{}", m.target_user_id)),
-                Segment::Reply(r) => out.push(format!("[Reply to {}: {}]", r.target_message_id, r.snippet)),
+                Segment::Reply(r) => {
+                    out.push(format!("[Reply to {}: {}]", r.target_message_id, r.snippet))
+                }
                 Segment::Custom(c) => out.push(format!("[Custom: {}]", c.type_name)),
             }
         }
@@ -119,20 +121,24 @@ fn json_to_prost_value(val: &serde_json::Value) -> prost_types::Value {
     let kind = match val {
         serde_json::Value::Null => Some(prost_types::value::Kind::NullValue(0)),
         serde_json::Value::Bool(b) => Some(prost_types::value::Kind::BoolValue(*b)),
-        serde_json::Value::Number(n) => {
-            Some(prost_types::value::Kind::NumberValue(n.as_f64().unwrap_or(0.0)))
-        }
+        serde_json::Value::Number(n) => Some(prost_types::value::Kind::NumberValue(
+            n.as_f64().unwrap_or(0.0),
+        )),
         serde_json::Value::String(s) => Some(prost_types::value::Kind::StringValue(s.clone())),
         serde_json::Value::Array(arr) => {
             let values = arr.iter().map(json_to_prost_value).collect();
-            Some(prost_types::value::Kind::ListValue(prost_types::ListValue { values }))
+            Some(prost_types::value::Kind::ListValue(
+                prost_types::ListValue { values },
+            ))
         }
         serde_json::Value::Object(map) => {
             let mut fields = std::collections::BTreeMap::new();
             for (k, v) in map {
                 fields.insert(k.clone(), json_to_prost_value(v));
             }
-            Some(prost_types::value::Kind::StructValue(prost_types::Struct { fields }))
+            Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                fields,
+            }))
         }
     };
     prost_types::Value { kind }
@@ -153,7 +159,10 @@ pub async fn run_sandbox(path: &Path, opts: SandboxOptions) -> Result<(), Sandbo
     let core_sock = run_dir.join("core.sock");
 
     // 2. Initialize Supervisor with the isolated runtime directory
-    let supervisor = Arc::new(Supervisor::new(Some(run_dir.clone()), Some(core_sock.clone())));
+    let supervisor = Arc::new(Supervisor::new(
+        Some(run_dir.clone()),
+        Some(core_sock.clone()),
+    ));
 
     // 3. Start Core IPC Server wired with Supervisor
     let (event_tx, _event_rx) = mpsc::channel(DEFAULT_INGEST_QUEUE_CAPACITY);
@@ -172,17 +181,21 @@ pub async fn run_sandbox(path: &Path, opts: SandboxOptions) -> Result<(), Sandbo
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     println!("Spawning plugin host process and completing handshake...");
-    let host = supervisor
-        .spawn_from_manifest(&manifest_path, None)
-        .await?;
+    let host = supervisor.spawn_from_manifest(&manifest_path, None).await?;
 
     println!("\n[Host Connected] ID: {}", host.host_id);
     for meta in &host.meta {
-        println!("Loaded Plugin: {} ({}) v{}", meta.name, meta.id, meta.version);
+        println!(
+            "Loaded Plugin: {} ({}) v{}",
+            meta.name, meta.id, meta.version
+        );
         if !meta.commands.is_empty() {
             println!("Declared Commands:");
             for cmd in &meta.commands {
-                println!("  - /{:<15} Usage: {:<20} ({})", cmd.name, cmd.usage, cmd.description);
+                println!(
+                    "  - /{:<15} Usage: {:<20} ({})",
+                    cmd.name, cmd.usage, cmd.description
+                );
             }
         }
         if !meta.tools.is_empty() {
@@ -279,7 +292,9 @@ pub async fn run_sandbox(path: &Path, opts: SandboxOptions) -> Result<(), Sandbo
                         println!("Error: {}", e);
                     }
                 } else {
-                    println!("Unrecognized input. Start commands with '/' or invoke tools with 'call <name> <json>'. Type 'exit' to quit.");
+                    println!(
+                        "Unrecognized input. Start commands with '/' or invoke tools with 'call <name> <json>'. Type 'exit' to quit."
+                    );
                 }
             }
             Ok(None) => break, // EOF reached (e.g. piped stdin)
@@ -325,7 +340,11 @@ async fn execute_sandbox_command(
     let resp = host.execute_command(req).await?;
     let elapsed = start.elapsed();
 
-    println!("[Response] (Status: {}, RTT: {:.2}ms)", if resp.success { "SUCCESS" } else { "FAILED" }, elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "[Response] (Status: {}, RTT: {:.2}ms)",
+        if resp.success { "SUCCESS" } else { "FAILED" },
+        elapsed.as_secs_f64() * 1000.0
+    );
     if !resp.replies.is_empty() {
         println!("Replies:");
         let rendered = format_segments(&resp.replies);
@@ -363,26 +382,46 @@ async fn execute_sandbox_tool(
 
     let structured_payload = json_to_prost_struct(&parsed_json);
     let req = ToolCallRequest {
-        call_id: format!("test_call_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()),
+        call_id: format!(
+            "test_call_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ),
         tool_name: tool_name.to_string(),
         session_id: "sandbox_session".to_string(),
         payload: structured_payload.map(tool_call_request::Payload::StructuredArgs),
     };
 
-    println!("[Invoking Tool] '{}' with payload: {}", tool_name, parsed_json);
+    println!(
+        "[Invoking Tool] '{}' with payload: {}",
+        tool_name, parsed_json
+    );
     let start = std::time::Instant::now();
     let resp = host.on_call_tool(req).await?;
     let elapsed = start.elapsed();
 
-    println!("[Response] (Status: {}, RTT: {:.2}ms)", if resp.success { "SUCCESS" } else { "FAILED" }, elapsed.as_secs_f64() * 1000.0);
+    println!(
+        "[Response] (Status: {}, RTT: {:.2}ms)",
+        if resp.success { "SUCCESS" } else { "FAILED" },
+        elapsed.as_secs_f64() * 1000.0
+    );
     if let Some(ref payload) = resp.payload {
         match payload {
             tool_call_response::Payload::StructuredResult(s) => {
                 let json_val = kanon_llm::tool_router::prost_struct_to_json(s.clone());
-                println!("Result: {}", serde_json::to_string_pretty(&json_val).unwrap_or_default());
+                println!(
+                    "Result: {}",
+                    serde_json::to_string_pretty(&json_val).unwrap_or_default()
+                );
             }
             tool_call_response::Payload::RawBytes(bytes) => {
-                println!("Raw bytes (len {}): {}", bytes.len(), String::from_utf8_lossy(bytes));
+                println!(
+                    "Raw bytes (len {}): {}",
+                    bytes.len(),
+                    String::from_utf8_lossy(bytes)
+                );
             }
         }
     }

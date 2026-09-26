@@ -5,9 +5,9 @@
 //!
 //! Compatible with OpenAI `/v1/responses` and compatible gateways (e.g. SambaNova, OpenResponses).
 
+use async_trait::async_trait;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use async_trait::async_trait;
 use tokio_stream::StreamExt;
 
 use crate::error::GatewayError;
@@ -38,7 +38,6 @@ mod wire {
         pub stream: bool,
     }
 
-
     #[derive(Debug, Serialize)]
     #[serde(tag = "type")]
     pub enum ResponsesInputItem {
@@ -54,10 +53,7 @@ mod wire {
             arguments: String,
         },
         #[serde(rename = "function_call_output")]
-        FunctionCallOutput {
-            call_id: String,
-            output: String,
-        },
+        FunctionCallOutput { call_id: String, output: String },
     }
 
     #[derive(Debug, Serialize)]
@@ -234,7 +230,9 @@ impl LlmProvider for OpenAiResponsesProvider {
                     {
                         input.push(wire::ResponsesInputItem::Message {
                             role: "assistant".to_string(),
-                            content: vec![wire::ResponsesContentPart::OutputText { text: text.clone() }],
+                            content: vec![wire::ResponsesContentPart::OutputText {
+                                text: text.clone(),
+                            }],
                         });
                     }
                     if let Some(ref calls) = msg.tool_calls {
@@ -316,8 +314,8 @@ impl LlmProvider for OpenAiResponsesProvider {
         }
 
         let raw_bytes = resp.bytes().await.map_err(GatewayError::Http)?;
-        let wire_resp: wire::ResponsesResponseWire =
-            serde_json::from_slice(&raw_bytes).map_err(|e| GatewayError::InvalidResponse(e.to_string()))?;
+        let wire_resp: wire::ResponsesResponseWire = serde_json::from_slice(&raw_bytes)
+            .map_err(|e| GatewayError::InvalidResponse(e.to_string()))?;
 
         if let Some(err) = wire_resp.error {
             return Err(GatewayError::ApiStatus {
@@ -380,9 +378,9 @@ impl LlmProvider for OpenAiResponsesProvider {
         let usage = wire_resp.usage.map(|u| TokenUsage {
             prompt_tokens: u.input_tokens.unwrap_or(0),
             completion_tokens: u.output_tokens.unwrap_or(0),
-            total_tokens: u.total_tokens.unwrap_or_else(|| {
-                u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0)
-            }),
+            total_tokens: u
+                .total_tokens
+                .unwrap_or_else(|| u.input_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0)),
         });
 
         Ok(ChatResponse {
@@ -421,7 +419,9 @@ impl LlmProvider for OpenAiResponsesProvider {
                     {
                         input.push(wire::ResponsesInputItem::Message {
                             role: "assistant".to_string(),
-                            content: vec![wire::ResponsesContentPart::OutputText { text: text.clone() }],
+                            content: vec![wire::ResponsesContentPart::OutputText {
+                                text: text.clone(),
+                            }],
                         });
                     }
                     if let Some(ref calls) = msg.tool_calls {
@@ -518,7 +518,9 @@ impl LlmProvider for OpenAiResponsesProvider {
                 let events = decoder.decode(&chunk);
                 for ev in events {
                     if ev.data.trim() == "[DONE]" {
-                        let _ = tx.send(Ok(ChatChunk::done(Some("completed".to_string())))).await;
+                        let _ = tx
+                            .send(Ok(ChatChunk::done(Some("completed".to_string()))))
+                            .await;
                         return;
                     }
 
@@ -532,15 +534,15 @@ impl LlmProvider for OpenAiResponsesProvider {
                                 return;
                             }
                         } else if let Some("response.completed" | "response.done") = event_type {
-                            let _ = tx.send(Ok(ChatChunk::done(Some("completed".to_string())))).await;
+                            let _ = tx
+                                .send(Ok(ChatChunk::done(Some("completed".to_string()))))
+                                .await;
                             return;
                         } else if let Some(delta) = val.get("delta").and_then(|d| d.as_str())
                             && tx.send(Ok(ChatChunk::delta(delta))).await.is_err()
                         {
                             return;
                         }
-
-
                     }
                 }
             }
@@ -548,8 +550,6 @@ impl LlmProvider for OpenAiResponsesProvider {
             let _ = tx.send(Ok(ChatChunk::done(None))).await;
         });
 
-
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 }
-

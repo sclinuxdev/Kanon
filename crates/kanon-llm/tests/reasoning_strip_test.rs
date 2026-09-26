@@ -9,7 +9,8 @@ use kanon_llm::strip_reasoning_tags;
 
 #[test]
 fn strips_a_complete_reasoning_block() {
-    let completion = "<think>\nThe user greeted me; I should greet back.\n</think>\n\n你好！我是黑猪AI。";
+    let completion =
+        "<think>\nThe user greeted me; I should greet back.\n</think>\n\n你好！我是黑猪AI。";
     assert_eq!(strip_reasoning_tags(completion), "你好！我是黑猪AI。");
 }
 
@@ -22,7 +23,10 @@ fn leaves_a_plain_answer_untouched() {
 #[test]
 fn handles_reasoning_only_and_truncated_blocks() {
     // A reasoning-only completion carries no answer for the user.
-    assert_eq!(strip_reasoning_tags("<think>\nstill thinking\n</think>"), "");
+    assert_eq!(
+        strip_reasoning_tags("<think>\nstill thinking\n</think>"),
+        ""
+    );
 
     // A stream cut off mid-reasoning must not leak the partial chain of thought.
     assert_eq!(strip_reasoning_tags("<think>\nstill thinking"), "");

@@ -7,8 +7,8 @@
 //! Handles translation between Kanon domain types and Anthropic's structured content blocks
 //! (`text`, `tool_use`, `tool_result`), with top-level system prompt separation.
 
-use std::time::Duration;
 use async_trait::async_trait;
+use std::time::Duration;
 use tokio_stream::StreamExt;
 
 use crate::error::GatewayError;
@@ -35,7 +35,6 @@ mod wire {
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         pub stream: bool,
     }
-
 
     #[derive(Debug, Serialize, Deserialize)]
     pub struct AnthropicMessageWire {
@@ -488,8 +487,6 @@ impl LlmProvider for AnthropicMessagesProvider {
                                 return;
                             }
                         } else if let Some("message_delta") = event_type {
-
-
                             if let Some(stop_reason) = val["delta"]["stop_reason"].as_str() {
                                 finish_reason = Some(match stop_reason {
                                     "tool_use" => "tool_calls".to_string(),
@@ -507,8 +504,6 @@ impl LlmProvider for AnthropicMessagesProvider {
             let _ = tx.send(Ok(ChatChunk::done(finish_reason))).await;
         });
 
-
         Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
     }
 }
-

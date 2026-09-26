@@ -262,4 +262,3 @@ async fn install_demo_weather_plugin_end_to_end() {
     let status_str = body["status"].as_str().unwrap();
     assert!(status_str == "running" || status_str == "RuntimeUnavailable");
 }
-

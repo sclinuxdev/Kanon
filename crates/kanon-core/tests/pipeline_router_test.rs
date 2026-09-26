@@ -21,7 +21,9 @@ use kanon_core::pipeline::PipelineEngine;
 use kanon_core::supervisor::Supervisor;
 use kanon_proto::v1::bot_api_service_client::BotApiServiceClient;
 use kanon_proto::v1::message_segment::Segment;
-use kanon_proto::v1::{DeliverMessageRequest, IngestEventRequest, MessageSegment, PipelineEventRequest, TextSegment};
+use kanon_proto::v1::{
+    DeliverMessageRequest, IngestEventRequest, MessageSegment, PipelineEventRequest, TextSegment,
+};
 use kanon_transport::connect_ipc;
 
 /// Locates the compiled `demo-rust-plugin` binary in the target directory.
@@ -71,7 +73,10 @@ async fn test_pipeline_router_end_to_end_lifecycle() {
     assert!(core_sock.exists(), "Core socket file must exist");
 
     // 3. Initialize Supervisor and spawn out-of-process demo-rust-plugin.
-    let supervisor = Arc::new(Supervisor::new(Some(run_dir.clone()), Some(core_sock.clone())));
+    let supervisor = Arc::new(Supervisor::new(
+        Some(run_dir.clone()),
+        Some(core_sock.clone()),
+    ));
     let plugin_bin = find_demo_plugin_bin();
     let managed_host = supervisor
         .spawn_plugin("demo_rust", &plugin_bin, &[])
@@ -129,7 +134,10 @@ async fn test_pipeline_router_end_to_end_lifecycle() {
         .expect("IngestEvent RPC failed")
         .into_inner();
 
-    assert!(fast_ack_1.accepted, "Fast-ACK must immediately accept event");
+    assert!(
+        fast_ack_1.accepted,
+        "Fast-ACK must immediately accept event"
+    );
     assert_eq!(fast_ack_1.event_id, "evt_calc_1");
 
     // Collect outbound response produced by PipelineEngine
@@ -145,7 +153,8 @@ async fn test_pipeline_router_end_to_end_lifecycle() {
 
     if let Some(Segment::Text(text)) = &outbound_reply.segments[0].segment {
         assert!(
-            text.content.contains("Rust calculation result for [10 + 32]: 42 (fast-path)"),
+            text.content
+                .contains("Rust calculation result for [10 + 32]: 42 (fast-path)"),
             "Unexpected reply content: {}",
             text.content
         );
@@ -192,7 +201,8 @@ async fn test_pipeline_router_end_to_end_lifecycle() {
 
     if let Some(Segment::Text(text)) = &outbound_block_reply.segments[0].segment {
         assert!(
-            text.content.contains("blocked by Demo Rust Plugin pre-filter"),
+            text.content
+                .contains("blocked by Demo Rust Plugin pre-filter"),
             "Expected pre-filter block notice, got: {}",
             text.content
         );

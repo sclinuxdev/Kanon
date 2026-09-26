@@ -405,9 +405,14 @@ async fn config_hot_reload_enforces_cas_version_vectors() {
         .reload_plugin_config_cas(plugin_id, &serde_json::json!({"k": 1}), Some(5))
         .await
         .expect_err("mismatched version must be rejected");
-    assert!(
-        matches!(err, SupervisorError::StaleConfigVersion { current_version: 0, requested_version: 5, .. })
-    );
+    assert!(matches!(
+        err,
+        SupervisorError::StaleConfigVersion {
+            current_version: 0,
+            requested_version: 5,
+            ..
+        }
+    ));
 
     // 2. Successful reload with expected_version = 0 increments version to 1
     let v1 = supervisor
@@ -430,11 +435,15 @@ async fn config_hot_reload_enforces_cas_version_vectors() {
         .reload_plugin_config_cas(plugin_id, &serde_json::json!({"k": 3}), Some(1))
         .await
         .expect_err("stale CAS version 1 must be rejected when current is 2");
-    assert!(
-        matches!(err2, SupervisorError::StaleConfigVersion { current_version: 2, requested_version: 1, .. })
-    );
+    assert!(matches!(
+        err2,
+        SupervisorError::StaleConfigVersion {
+            current_version: 2,
+            requested_version: 1,
+            ..
+        }
+    ));
 
     // Version remains 2
     assert_eq!(supervisor.config_version(plugin_id).await, 2);
 }
-

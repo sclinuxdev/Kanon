@@ -144,8 +144,13 @@ async fn fetch_models_rejects_empty_base_url() {
     let payload = serde_json::json!({
         "base_url": "   "
     });
-    let (status, body) =
-        send_json(&app, Method::POST, "/api/v1/providers/models", Some(payload)).await;
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        "/api/v1/providers/models",
+        Some(payload),
+    )
+    .await;
 
     assert_eq!(status, 400);
     assert_eq!(common::error_code(&body), "bad_request");
@@ -179,8 +184,13 @@ async fn fetch_models_queries_endpoint_and_extracts_models() {
         "protocol": "openai",
         "base_url": format!("http://{addr}/v1")
     });
-    let (status, body) =
-        send_json(&app, Method::POST, "/api/v1/providers/models", Some(payload)).await;
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        "/api/v1/providers/models",
+        Some(payload),
+    )
+    .await;
 
     assert_eq!(status, 200);
     let models = body["models"].as_array().expect("models array");
@@ -200,7 +210,9 @@ async fn fetch_models_anthropic_queries_endpoint_with_headers() {
                 Some("sk-ant-test")
             );
             assert_eq!(
-                headers.get("anthropic-version").and_then(|v| v.to_str().ok()),
+                headers
+                    .get("anthropic-version")
+                    .and_then(|v| v.to_str().ok()),
                 Some("2023-06-01")
             );
             axum::Json(serde_json::json!({
@@ -225,13 +237,16 @@ async fn fetch_models_anthropic_queries_endpoint_with_headers() {
         "base_url": format!("http://{addr}/v1"),
         "api_key": "sk-ant-test"
     });
-    let (status, body) =
-        send_json(&app, Method::POST, "/api/v1/providers/models", Some(payload)).await;
+    let (status, body) = send_json(
+        &app,
+        Method::POST,
+        "/api/v1/providers/models",
+        Some(payload),
+    )
+    .await;
 
     assert_eq!(status, 200);
     let models = body["models"].as_array().expect("models array");
     assert_eq!(models.len(), 1);
     assert_eq!(models[0], "claude-test-custom");
 }
-
-

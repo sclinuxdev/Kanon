@@ -1,8 +1,8 @@
 //! Tests for PreFilter execution chain, priority scheduling, modification, and deadline timeout.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tonic::{Request, Response, Status};
@@ -16,8 +16,8 @@ use kanon_proto::v1::message_segment::Segment;
 use kanon_proto::v1::pre_filter_result::Action;
 use kanon_proto::v1::{
     CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse,
-    EventAck, EventNotification, MessageSegment, PipelineEventRequest, PreFilterResult, TextSegment,
-    ToolCallRequest, ToolCallResponse,
+    EventAck, EventNotification, MessageSegment, PipelineEventRequest, PreFilterResult,
+    TextSegment, ToolCallRequest, ToolCallResponse,
 };
 
 struct MockPipeline {
@@ -200,14 +200,8 @@ async fn test_pre_filter_priority_order_and_modify() {
 
 #[tokio::test]
 async fn test_pre_filter_blocking_short_circuit() {
-    let (host_block, count_block) = spawn_mock_host(
-        "host_block",
-        100,
-        Action::Block as i32,
-        String::new(),
-        None,
-    )
-    .await;
+    let (host_block, count_block) =
+        spawn_mock_host("host_block", 100, Action::Block as i32, String::new(), None).await;
     let (host_pass, count_pass) =
         spawn_mock_host("host_pass", 200, Action::Pass as i32, String::new(), None).await;
 

@@ -6,9 +6,9 @@
 pub mod providers;
 pub mod types;
 
+use async_trait::async_trait;
 use std::pin::Pin;
 use std::sync::Arc;
-use async_trait::async_trait;
 use tokio_stream::Stream;
 
 use crate::error::GatewayError;
@@ -81,7 +81,6 @@ impl std::fmt::Debug for LlmGateway {
     }
 }
 
-
 impl LlmGateway {
     /// Creates a new `LlmGateway` instance wrapping the given provider.
     pub fn new(provider: Arc<dyn LlmProvider>, default_model: impl Into<String>) -> Self {
@@ -111,7 +110,10 @@ impl LlmGateway {
     }
 
     /// Dispatches a streaming chat completion request to the active provider.
-    pub async fn chat_stream(&self, request: &ChatRequest) -> Result<ChatChunkStream, GatewayError> {
+    pub async fn chat_stream(
+        &self,
+        request: &ChatRequest,
+    ) -> Result<ChatChunkStream, GatewayError> {
         let mut req = request.clone();
         if req.model.is_empty() {
             req.model = self.default_model.clone();
@@ -189,9 +191,8 @@ pub fn provider_from_env() -> Result<Option<ProviderSetup>, String> {
         .filter(|s| !s.trim().is_empty());
     let protocol = std::env::var("KANON_LLM_PROTOCOL").unwrap_or_else(|_| "openai".to_string());
 
-    let provider = build_provider(&protocol, base_url, api_key, model.clone()).map_err(|err| {
-        format!("{err} (from KANON_LLM_PROTOCOL)")
-    })?;
+    let provider = build_provider(&protocol, base_url, api_key, model.clone())
+        .map_err(|err| format!("{err} (from KANON_LLM_PROTOCOL)"))?;
 
     Ok(Some((provider, model)))
 }
@@ -217,4 +218,3 @@ pub fn strip_reasoning_tags(text: &str) -> &str {
         None => "",
     }
 }
-

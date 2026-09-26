@@ -274,8 +274,6 @@ async fn plugin_config_rejects_path_traversal_identifier() {
 /// Config update endpoint PUT /api/v1/plugins/{id}/config enforces CAS version token.
 #[tokio::test]
 async fn plugin_config_cas_version_enforcement() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use kanon_core::ManagedHost;
     use kanon_proto::v1::plugin_host_service_server::{PluginHostService, PluginHostServiceServer};
     use kanon_proto::v1::{
@@ -283,6 +281,8 @@ async fn plugin_config_cas_version_enforcement() {
         PluginActionRequest, PluginActionResponse, ReloadPluginConfigRequest,
         ReloadPluginConfigResponse,
     };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tonic::{Request, Response, Status};
 
     struct CasMockHost {
@@ -348,7 +348,10 @@ async fn plugin_config_cas_version_enforcement() {
 
     let dir = tempfile::tempdir().expect("temp dir");
     let config_dir = PathBuf::from(dir.path());
-    let supervisor = Arc::new(kanon_core::Supervisor::new(Some(config_dir.join("run")), None));
+    let supervisor = Arc::new(kanon_core::Supervisor::new(
+        Some(config_dir.join("run")),
+        None,
+    ));
 
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
         .unwrap()
@@ -456,7 +459,6 @@ async fn plugin_tool_call_reports_upstream_failure() {
     assert_eq!(error_code(&body), "internal_error");
 }
 
-
 /// An unknown plugin is a 404 for management actions too, not an internal error.
 #[tokio::test]
 async fn plugin_action_unknown_plugin_returns_404() {
@@ -495,7 +497,6 @@ async fn plugin_action_reports_upstream_failure() {
 /// A live host answers management actions with its structured result.
 #[tokio::test]
 async fn plugin_action_returns_host_result() {
-    use std::sync::Arc;
     use kanon_core::ManagedHost;
     use kanon_proto::v1::plugin_host_service_server::{PluginHostService, PluginHostServiceServer};
     use kanon_proto::v1::{
@@ -503,6 +504,7 @@ async fn plugin_action_returns_host_result() {
         PluginActionRequest, PluginActionResponse, ReloadPluginConfigRequest,
         ReloadPluginConfigResponse,
     };
+    use std::sync::Arc;
     use tonic::{Request, Response, Status};
 
     struct ActionMockHost;
@@ -536,10 +538,7 @@ async fn plugin_action_returns_host_result() {
             }))
         }
 
-        async fn ping(
-            &self,
-            req: Request<PingRequest>,
-        ) -> Result<Response<PingResponse>, Status> {
+        async fn ping(&self, req: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
             Ok(Response::new(PingResponse {
                 timestamp: req.into_inner().timestamp,
             }))
@@ -578,7 +577,10 @@ async fn plugin_action_returns_host_result() {
 
     let dir = tempfile::tempdir().expect("temp dir");
     let config_dir = PathBuf::from(dir.path());
-    let supervisor = Arc::new(kanon_core::Supervisor::new(Some(config_dir.join("run")), None));
+    let supervisor = Arc::new(kanon_core::Supervisor::new(
+        Some(config_dir.join("run")),
+        None,
+    ));
 
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
         .unwrap()

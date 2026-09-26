@@ -14,8 +14,8 @@ use kanon_proto::v1::{
     PingRequest, PingResponse, RegisterHostRequest, RegisterHostResponse, SendMessageRequest,
     SendMessageResponse, SetStorageRequest, SetStorageResponse,
 };
-use kanon_sdk::watchdog::{CoreWatchdogConfig, StopReason, watch_core};
 use kanon_sdk::CoreHandle;
+use kanon_sdk::watchdog::{CoreWatchdogConfig, StopReason, watch_core};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response, Status};
@@ -64,13 +64,16 @@ impl BotApiService for StubCore {
         }))
     }
 
-    type RequestLLMStream = tokio_stream::wrappers::ReceiverStream<Result<kanon_proto::v1::LlmChunk, Status>>;
+    type RequestLLMStream =
+        tokio_stream::wrappers::ReceiverStream<Result<kanon_proto::v1::LlmChunk, Status>>;
 
     async fn request_llm(
         &self,
         _request: Request<LlmRequest>,
     ) -> Result<Response<Self::RequestLLMStream>, Status> {
-        Err(Status::unimplemented("stub core does not serve LLM requests"))
+        Err(Status::unimplemented(
+            "stub core does not serve LLM requests",
+        ))
     }
 
     async fn set_storage(

@@ -106,7 +106,10 @@ async fn activate_persists_and_applies_without_restart() {
 
     // The choice survives a restart because it is on disk, not in a browser.
     let store = SystemConfigStore::new(config_dir.path().join("system.json"));
-    let persisted = store.load().expect("load persisted config").expect("provider persisted");
+    let persisted = store
+        .load()
+        .expect("load persisted config")
+        .expect("provider persisted");
     assert_eq!(persisted.model, "unit-test-model");
     assert_eq!(persisted.api_key.as_deref(), Some("sk-unit-test"));
 
@@ -155,7 +158,10 @@ async fn invalid_protocol_is_rejected_before_anything_is_persisted() {
         !config_dir.path().join("system.json").exists(),
         "a rejected provider must not reach disk"
     );
-    assert!(state.agent().is_none(), "a rejected provider must not be applied");
+    assert!(
+        state.agent().is_none(),
+        "a rejected provider must not be applied"
+    );
 }
 
 #[tokio::test]
@@ -201,12 +207,16 @@ async fn clear_removes_persisted_provider_and_disables_chat() {
     .await;
     assert!(state.agent().is_some());
 
-    let (status, body) = common::send_json(&app, Method::DELETE, "/api/v1/providers/active", None).await;
+    let (status, body) =
+        common::send_json(&app, Method::DELETE, "/api/v1/providers/active", None).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["active"]["configured"], json!(false));
     assert_eq!(body["active"]["source"], json!("none"));
-    assert!(state.agent().is_none(), "cleared provider must leave the node");
+    assert!(
+        state.agent().is_none(),
+        "cleared provider must leave the node"
+    );
 
     let store = SystemConfigStore::new(config_dir.path().join("system.json"));
     assert!(

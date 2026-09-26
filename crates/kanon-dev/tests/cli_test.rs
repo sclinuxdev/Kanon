@@ -11,9 +11,7 @@ use std::path::PathBuf;
 use tempfile::tempdir;
 use zip::ZipArchive;
 
-use kanon_dev::{
-    create_plugin_project, lint_plugin, pack_plugin, run_sandbox, SandboxOptions,
-};
+use kanon_dev::{SandboxOptions, create_plugin_project, lint_plugin, pack_plugin, run_sandbox};
 
 fn find_workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -30,7 +28,11 @@ fn test_plugin_scaffold_rust() {
     let out_dir = tmp.path().join("my_rust_plugin");
 
     let result = create_plugin_project("my_rust_plugin", "rust", Some(&out_dir));
-    assert!(result.is_ok(), "Failed to scaffold Rust plugin: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to scaffold Rust plugin: {:?}",
+        result.err()
+    );
 
     assert!(out_dir.join("plugin.toml").exists());
     assert!(out_dir.join("Cargo.toml").exists());
@@ -54,7 +56,11 @@ fn test_plugin_scaffold_python() {
     let out_dir = tmp.path().join("my_py_plugin");
 
     let result = create_plugin_project("my_py_plugin", "python", Some(&out_dir));
-    assert!(result.is_ok(), "Failed to scaffold Python plugin: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to scaffold Python plugin: {:?}",
+        result.err()
+    );
 
     assert!(out_dir.join("plugin.toml").exists());
     assert!(out_dir.join("pyproject.toml").exists());
@@ -77,7 +83,11 @@ fn test_plugin_scaffold_typescript() {
     let out_dir = tmp.path().join("my_ts_plugin");
 
     let result = create_plugin_project("my_ts_plugin", "ts", Some(&out_dir));
-    assert!(result.is_ok(), "Failed to scaffold TypeScript plugin: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Failed to scaffold TypeScript plugin: {:?}",
+        result.err()
+    );
 
     assert!(out_dir.join("plugin.toml").exists());
     assert!(out_dir.join("package.json").exists());
@@ -107,7 +117,10 @@ fn test_plugin_lint_demo_plugins() {
         "Python demo plugin lint failed: {:?}",
         py_report.errors
     );
-    assert_eq!(py_report.plugin_id.as_deref(), Some("org.kanon.plugin.demo_py"));
+    assert_eq!(
+        py_report.plugin_id.as_deref(),
+        Some("org.kanon.plugin.demo_py")
+    );
 
     // 2. TypeScript demo plugin
     let ts_dir = root.join("sdks/typescript/plugins/demo_ts_plugin");
@@ -117,7 +130,10 @@ fn test_plugin_lint_demo_plugins() {
         "TypeScript demo plugin lint failed: {:?}",
         ts_report.errors
     );
-    assert_eq!(ts_report.plugin_id.as_deref(), Some("org.kanon.plugin.demo_ts"));
+    assert_eq!(
+        ts_report.plugin_id.as_deref(),
+        Some("org.kanon.plugin.demo_ts")
+    );
 
     // 3. Rust demo plugin
     let rust_dir = root.join("sdks/rust/plugins/demo_rust_plugin");
@@ -127,7 +143,10 @@ fn test_plugin_lint_demo_plugins() {
         "Rust demo plugin lint failed: {:?}",
         rust_report.errors
     );
-    assert_eq!(rust_report.plugin_id.as_deref(), Some("org.kanon.plugin.demo_rust"));
+    assert_eq!(
+        rust_report.plugin_id.as_deref(),
+        Some("org.kanon.plugin.demo_rust")
+    );
 }
 
 #[test]
@@ -165,15 +184,42 @@ parameters = "not an object"
 
     // Check specific caught violations
     let err_str = report.errors.join("\n");
-    assert!(err_str.contains("reverse domain notation"), "Must catch bad ID");
-    assert!(err_str.contains("Plugin 'name' must not be empty"), "Must catch empty name");
-    assert!(err_str.contains("not a valid Semantic Version"), "Must catch bad version");
-    assert!(err_str.contains("Unsupported runtime 'golang'"), "Must catch unsupported runtime");
-    assert!(err_str.contains("Plugin priority 9999 is outside valid range"), "Must catch bad priority");
-    assert!(err_str.contains("must not include a leading slash"), "Must catch slash in command");
-    assert!(err_str.contains("Duplicate command declaration: command 'duplicate'"), "Must catch duplicate command");
-    assert!(err_str.contains("bad tool space"), "Must catch space in tool name");
-    assert!(err_str.contains("parameters schema must be a JSON Schema Object"), "Must catch non-object schema");
+    assert!(
+        err_str.contains("reverse domain notation"),
+        "Must catch bad ID"
+    );
+    assert!(
+        err_str.contains("Plugin 'name' must not be empty"),
+        "Must catch empty name"
+    );
+    assert!(
+        err_str.contains("not a valid Semantic Version"),
+        "Must catch bad version"
+    );
+    assert!(
+        err_str.contains("Unsupported runtime 'golang'"),
+        "Must catch unsupported runtime"
+    );
+    assert!(
+        err_str.contains("Plugin priority 9999 is outside valid range"),
+        "Must catch bad priority"
+    );
+    assert!(
+        err_str.contains("must not include a leading slash"),
+        "Must catch slash in command"
+    );
+    assert!(
+        err_str.contains("Duplicate command declaration: command 'duplicate'"),
+        "Must catch duplicate command"
+    );
+    assert!(
+        err_str.contains("bad tool space"),
+        "Must catch space in tool name"
+    );
+    assert!(
+        err_str.contains("parameters schema must be a JSON Schema Object"),
+        "Must catch non-object schema"
+    );
 }
 
 #[test]
@@ -238,7 +284,11 @@ async fn test_sandbox_offline_non_interactive_and_command() {
         non_interactive: true,
     };
     let probe_res = run_sandbox(&manifest_path, probe_opts).await;
-    assert!(probe_res.is_ok(), "Sandbox non-interactive probe failed: {:?}", probe_res.err());
+    assert!(
+        probe_res.is_ok(),
+        "Sandbox non-interactive probe failed: {:?}",
+        probe_res.err()
+    );
 
     // 2. Direct command execution test
     let cmd_opts = SandboxOptions {
@@ -248,7 +298,11 @@ async fn test_sandbox_offline_non_interactive_and_command() {
         non_interactive: false,
     };
     let cmd_res = run_sandbox(&manifest_path, cmd_opts).await;
-    assert!(cmd_res.is_ok(), "Sandbox command execution failed: {:?}", cmd_res.err());
+    assert!(
+        cmd_res.is_ok(),
+        "Sandbox command execution failed: {:?}",
+        cmd_res.err()
+    );
 
     // 3. Direct tool call execution test
     let tool_opts = SandboxOptions {
@@ -258,5 +312,9 @@ async fn test_sandbox_offline_non_interactive_and_command() {
         non_interactive: false,
     };
     let tool_res = run_sandbox(&manifest_path, tool_opts).await;
-    assert!(tool_res.is_ok(), "Sandbox tool call execution failed: {:?}", tool_res.err());
+    assert!(
+        tool_res.is_ok(),
+        "Sandbox tool call execution failed: {:?}",
+        tool_res.err()
+    );
 }

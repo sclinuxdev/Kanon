@@ -2,16 +2,16 @@
 
 mod common;
 
-use std::path::PathBuf;
-use axum::extract::Json;
-use axum::routing::post;
 use axum::Router;
+use axum::extract::Json;
 use axum::http::Method;
-use kanon_api::app;
-use serde_json::{json, Value};
-use common::{adapter_state, send_json};
-use ring::aead::{AES_256_GCM, LessSafeKey, Nonce, UnboundKey};
+use axum::routing::post;
 use base64::Engine;
+use common::{adapter_state, send_json};
+use kanon_api::app;
+use ring::aead::{AES_256_GCM, LessSafeKey, Nonce, UnboundKey};
+use serde_json::{Value, json};
+use std::path::PathBuf;
 
 /// Helper to encrypt secret with AES-256-GCM mimicking QQ OpenClaw backend.
 fn encrypt_test_secret(secret: &str, bind_key_b64: &str) -> String {
@@ -80,7 +80,9 @@ async fn qqofficial_qr_and_poll_flow_end_to_end() {
             }),
         );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind listener");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
     let bind_host = format!("127.0.0.1:{}", addr.port());
 
@@ -106,7 +108,10 @@ async fn qqofficial_qr_and_poll_flow_end_to_end() {
 
     assert_eq!(status, 200);
     assert_eq!(body["task_id"], "test-task-abc-123");
-    let bind_key = body["bind_key"].as_str().expect("bind_key string").to_string();
+    let bind_key = body["bind_key"]
+        .as_str()
+        .expect("bind_key string")
+        .to_string();
     let qrcode_url = body["qrcode_url"].as_str().expect("qrcode_url string");
     assert!(qrcode_url.contains("test-task-abc-123"));
 
@@ -133,7 +138,9 @@ async fn qqofficial_qr_and_poll_flow_end_to_end() {
             }
         }),
     );
-    let poll_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("poll listener");
+    let poll_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("poll listener");
     let poll_addr = poll_listener.local_addr().expect("poll addr");
     let poll_bind_host = format!("127.0.0.1:{}", poll_addr.port());
 
@@ -161,7 +168,10 @@ async fn qqofficial_qr_and_poll_flow_end_to_end() {
     assert_eq!(body["saved"], true);
 
     // 5. Verify persistence in PluginConfigStore
-    let stored = state.config_store().load("org.kanon.adapter.qqofficial").expect("load config");
+    let stored = state
+        .config_store()
+        .load("org.kanon.adapter.qqofficial")
+        .expect("load config");
     assert_eq!(stored["appid"], "102888999");
     assert_eq!(stored["secret"], "my_super_secret_token_123");
 }

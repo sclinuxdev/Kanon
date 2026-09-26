@@ -221,4 +221,3 @@ impl PreFilterChain {
         PreFilterOutcome::Passed(current_event)
     }
 }
-

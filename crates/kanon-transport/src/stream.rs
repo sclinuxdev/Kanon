@@ -3,10 +3,10 @@
 //! Provides helper functions to connect to local IPC endpoints (Unix domain sockets
 //! or TCP loopback) and produce a Tonic [`tonic::transport::Channel`] for gRPC clients.
 
+use crate::IpcStream;
 use std::path::PathBuf;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
-use crate::IpcStream;
 
 /// Connects to a Unix domain socket at the specified path and returns a Tonic [`Channel`].
 ///
@@ -32,11 +32,9 @@ pub async fn connect_unix(path: impl Into<PathBuf>) -> Result<Channel, tonic::tr
 #[cfg(windows)]
 pub async fn connect_tcp(addr: std::net::SocketAddr) -> Result<Channel, tonic::transport::Error> {
     Endpoint::try_from(format!("http://{addr}"))?
-        .connect_with_connector(service_fn(move |_: Uri| {
-            async move {
-                let stream = tokio::net::TcpStream::connect(addr).await?;
-                Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(IpcStream::new(stream)))
-            }
+        .connect_with_connector(service_fn(move |_: Uri| async move {
+            let stream = tokio::net::TcpStream::connect(addr).await?;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(IpcStream::new(stream)))
         }))
         .await
 }
@@ -52,12 +50,12 @@ pub async fn connect_ipc(path: impl Into<PathBuf>) -> Result<Channel, tonic::tra
     #[cfg(windows)]
     {
         let path = path.into();
-        let addr_str = std::fs::read_to_string(&path)
-            .map_err(|e| tonic::transport::Error::from(std::io::Error::new(std::io::ErrorKind::NotFound, e)))?;
-        let addr: std::net::SocketAddr = addr_str
-            .trim()
-            .parse()
-            .map_err(|e| tonic::transport::Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)))?;
+        let addr_str = std::fs::read_to_string(&path).map_err(|e| {
+            tonic::transport::Error::from(std::io::Error::new(std::io::ErrorKind::NotFound, e))
+        })?;
+        let addr: std::net::SocketAddr = addr_str.trim().parse().map_err(|e| {
+            tonic::transport::Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
         connect_tcp(addr).await
     }
 }

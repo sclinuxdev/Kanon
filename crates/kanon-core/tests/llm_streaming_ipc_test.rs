@@ -3,15 +3,14 @@
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
-use tonic::{async_trait, Request};
-
+use tonic::{Request, async_trait};
 
 use kanon_core::ipc::CoreApiService;
 use kanon_llm::error::GatewayError;
 use kanon_llm::gateway::types::{ChatChunk, ChatRequest, ChatResponse};
 use kanon_llm::gateway::{ChatChunkStream, LlmGateway, LlmProvider};
-use kanon_proto::v1::bot_api_service_server::BotApiService;
 use kanon_proto::v1::LlmRequest;
+use kanon_proto::v1::bot_api_service_server::BotApiService;
 
 struct MockStreamingProvider;
 
@@ -110,7 +109,10 @@ async fn test_core_request_llm_streaming_with_parameters() {
             unimplemented!()
         }
 
-        async fn chat_stream(&self, request: &ChatRequest) -> Result<ChatChunkStream, GatewayError> {
+        async fn chat_stream(
+            &self,
+            request: &ChatRequest,
+        ) -> Result<ChatChunkStream, GatewayError> {
             *self.captured.lock().await = Some(request.clone());
             let (tx, rx) = mpsc::channel(2);
             tokio::spawn(async move {
@@ -175,14 +177,26 @@ async fn test_core_request_llm_streaming_with_parameters() {
     assert_eq!(accumulated, "Captured ");
 
     // Verify parameter extraction in captured ChatRequest
-    let req = captured.lock().await.clone().expect("Request was not captured");
+    let req = captured
+        .lock()
+        .await
+        .clone()
+        .expect("Request was not captured");
     assert_eq!(req.model, "custom-model");
     assert_eq!(req.temperature, Some(0.7));
     assert_eq!(req.max_tokens, Some(256));
     assert_eq!(req.messages.len(), 2);
-    assert_eq!(req.messages[0].role, kanon_llm::gateway::types::Role::System);
-    assert_eq!(req.messages[0].content.as_deref(), Some("You are an assistant"));
+    assert_eq!(
+        req.messages[0].role,
+        kanon_llm::gateway::types::Role::System
+    );
+    assert_eq!(
+        req.messages[0].content.as_deref(),
+        Some("You are an assistant")
+    );
     assert_eq!(req.messages[1].role, kanon_llm::gateway::types::Role::User);
-    assert_eq!(req.messages[1].content.as_deref(), Some("Hello with params"));
+    assert_eq!(
+        req.messages[1].content.as_deref(),
+        Some("Hello with params")
+    );
 }
-

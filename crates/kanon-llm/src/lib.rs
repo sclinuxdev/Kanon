@@ -25,8 +25,8 @@ pub mod token;
 pub mod tool_router;
 
 pub use agent::{
-    Agent, AgentBuilder, AgentConfig, AgentHook, AgentOutput, AgentTool, NativeTool,
-    NativeToolFn, NoopHost,
+    Agent, AgentBuilder, AgentConfig, AgentHook, AgentOutput, AgentTool, NativeTool, NativeToolFn,
+    NoopHost,
 };
 pub use error::{AgentError, GatewayError, MemoryError, ToolRouterError};
 pub use factory::AgentFactory;
@@ -40,9 +40,7 @@ pub use gateway::{
     provider_from_env, strip_reasoning_tags,
 };
 pub use memory::{ConversationManager, Memory, SessionMemory, SlidingWindowMemory};
-pub use prompt::{
-    DynamicPromptHook, Persona, PersonaRegistry, PromptComposer, PromptTemplate,
-};
+pub use prompt::{DynamicPromptHook, Persona, PersonaRegistry, PromptComposer, PromptTemplate};
 pub use session::{
     RuntimeSessionMetadata, SessionKey, SessionManager, SessionMetadata, SessionScope,
     SessionStatus,
@@ -53,6 +51,4 @@ pub use summary::{ContextSummarizer, SummaryConfig, SummaryHook};
 pub use token::{
     estimate_conversation_tokens, estimate_message_tokens, estimate_text_tokens, estimate_tokens,
 };
-pub use tool_router::{aggregate_tools, ToolHost, ToolRouter, ToolRouterOutput};
-
-
+pub use tool_router::{ToolHost, ToolRouter, ToolRouterOutput, aggregate_tools};

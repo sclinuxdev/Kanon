@@ -109,7 +109,9 @@ async fn ingest_event(
         .resolve_adapter(&platform)
         .await
         .ok_or_else(|| {
-            ApiError::NotFound(format!("No adapter is registered for platform '{platform}'"))
+            ApiError::NotFound(format!(
+                "No adapter is registered for platform '{platform}'"
+            ))
         })?;
 
     // Extract signature header if present (supports X-Hub-Signature-256, X-Kanon-Signature, X-Signature-256)
@@ -121,18 +123,19 @@ async fn ingest_event(
 
     // Verify inbound authentication if the adapter enforces it (e.g. HMAC-SHA256)
     if let AdapterRoute::Builtin(ref adapter) = route {
-        adapter.verify_inbound(signature, &body_bytes).map_err(|err| match err {
-            kanon_core::AdapterError::Authentication { reason, .. } => {
-                ApiError::Unauthorized(reason)
-            }
-            other => ApiError::BadRequest(other.to_string()),
-        })?;
+        adapter
+            .verify_inbound(signature, &body_bytes)
+            .map_err(|err| match err {
+                kanon_core::AdapterError::Authentication { reason, .. } => {
+                    ApiError::Unauthorized(reason)
+                }
+                other => ApiError::BadRequest(other.to_string()),
+            })?;
     }
 
     // Parse the JSON request body
-    let body: IngestRequest = serde_json::from_slice(&body_bytes).map_err(|err| {
-        ApiError::BadRequest(format!("Failed to parse request JSON body: {err}"))
-    })?;
+    let body: IngestRequest = serde_json::from_slice(&body_bytes)
+        .map_err(|err| ApiError::BadRequest(format!("Failed to parse request JSON body: {err}")))?;
 
     if body.channel_id.trim().is_empty() {
         return Err(ApiError::BadRequest(
@@ -301,7 +304,9 @@ async fn qqofficial_login_qr(
         let req = kanon_proto::v1::PluginActionRequest {
             plugin_id: QQ_PLUGIN_ID.to_string(),
             action: "qq_request_login_qr".to_string(),
-            parameters: Some(kanon_llm::tool_router::json_to_prost_struct(&args).unwrap_or_default()),
+            parameters: Some(
+                kanon_llm::tool_router::json_to_prost_struct(&args).unwrap_or_default(),
+            ),
         };
         if let Ok(resp) = host.invoke_action(req).await {
             if resp.success {
@@ -409,7 +414,9 @@ async fn qqofficial_login_poll(
         let req = kanon_proto::v1::PluginActionRequest {
             plugin_id: QQ_PLUGIN_ID.to_string(),
             action: "qq_poll_login_result".to_string(),
-            parameters: Some(kanon_llm::tool_router::json_to_prost_struct(&args).unwrap_or_default()),
+            parameters: Some(
+                kanon_llm::tool_router::json_to_prost_struct(&args).unwrap_or_default(),
+            ),
         };
         if let Ok(resp) = host.invoke_action(req).await {
             if resp.success {
@@ -420,8 +427,7 @@ async fn qqofficial_login_poll(
                             if let (Some(appid), Some(secret)) =
                                 (&poll_resp.appid, &poll_resp.secret)
                             {
-                                let _ =
-                                    save_and_reload_qq_credentials(&state, appid, secret).await;
+                                let _ = save_and_reload_qq_credentials(&state, appid, secret).await;
                                 poll_resp.saved = Some(true);
                             }
                         }
@@ -610,7 +616,11 @@ async fn save_and_reload_qq_credentials(
     // Check if the host process is running. If running, hot-reload its config;
     // if not running, spawn it from the plugin manifest so it connects to QQ immediately.
     let supervisor = state.supervisor();
-    if supervisor.find_host_for_plugin(QQ_PLUGIN_ID).await.is_some() {
+    if supervisor
+        .find_host_for_plugin(QQ_PLUGIN_ID)
+        .await
+        .is_some()
+    {
         if let Err(e) = supervisor.reload_plugin_config(QQ_PLUGIN_ID, &config).await {
             tracing::warn!(error = %e, "Failed to hot-reload QQ Official plugin config; attempting host restart");
             let host_id = format!("host_{}", QQ_PLUGIN_ID.replace('.', "_"));
@@ -629,4 +639,3 @@ async fn save_and_reload_qq_credentials(
 
     Ok(())
 }
-

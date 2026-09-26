@@ -14,13 +14,13 @@
 //! - Batch inserts within transactional boundaries;
 //! - Filesystem directory integration (compatible with `kanon-storage`).
 
+use async_trait::async_trait;
+use dashmap::DashMap;
+use rusqlite::{Connection, params};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use async_trait::async_trait;
-use dashmap::DashMap;
-use rusqlite::{params, Connection};
 use tokio::sync::Mutex;
 
 use crate::error::MemoryError;
@@ -228,9 +228,8 @@ impl SqliteMemory {
             let conn = self.conn.lock().await;
 
             // Query session system prompt
-            let mut session_stmt = conn.prepare(
-                "SELECT system_prompt FROM sessions WHERE session_key = ?1",
-            )?;
+            let mut session_stmt =
+                conn.prepare("SELECT system_prompt FROM sessions WHERE session_key = ?1")?;
             let mut session_rows = session_stmt.query(params![session_key])?;
             let system_prompt: Option<String> = if let Some(row) = session_rows.next()? {
                 row.get(0)?
@@ -263,8 +262,8 @@ impl SqliteMemory {
                     _ => Role::User,
                 };
 
-                let tool_calls: Option<Vec<ToolCall>> = tool_calls_json
-                    .and_then(|s| serde_json::from_str(&s).ok());
+                let tool_calls: Option<Vec<ToolCall>> =
+                    tool_calls_json.and_then(|s| serde_json::from_str(&s).ok());
 
                 loaded_messages.push(ChatMessage {
                     role,
@@ -278,7 +277,8 @@ impl SqliteMemory {
             (system_prompt, loaded_messages)
         };
 
-        let mut session_mem = SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens);
+        let mut session_mem =
+            SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens);
         if let Some(prompt) = system_prompt {
             session_mem.set_system_prompt(prompt);
         }
@@ -290,7 +290,11 @@ impl SqliteMemory {
     }
 
     /// Internal helper pruning physical SQLite messages when in-memory window evicts old items.
-    async fn sync_prune_sqlite(&self, session_key: &str, retain_limit: usize) -> Result<(), MemoryError> {
+    async fn sync_prune_sqlite(
+        &self,
+        session_key: &str,
+        retain_limit: usize,
+    ) -> Result<(), MemoryError> {
         let conn = self.conn.lock().await;
         conn.execute(
             "DELETE FROM messages 
@@ -313,7 +317,11 @@ fn current_timestamp() -> i64 {
 
 #[async_trait]
 impl Memory for SqliteMemory {
-    async fn push_message(&self, session_key: &str, message: ChatMessage) -> Result<(), MemoryError> {
+    async fn push_message(
+        &self,
+        session_key: &str,
+        message: ChatMessage,
+    ) -> Result<(), MemoryError> {
         let lock = self.session_lock(session_key);
         let _guard = lock.lock().await;
 
@@ -363,7 +371,9 @@ impl Memory for SqliteMemory {
             let mut session = self
                 .cache
                 .entry(session_key.to_string())
-                .or_insert_with(|| SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens));
+                .or_insert_with(|| {
+                    SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens)
+                });
             session.push_message(message);
             session.len()
         };
@@ -375,7 +385,11 @@ impl Memory for SqliteMemory {
         Ok(())
     }
 
-    async fn extend_messages(&self, session_key: &str, messages: Vec<ChatMessage>) -> Result<(), MemoryError> {
+    async fn extend_messages(
+        &self,
+        session_key: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Result<(), MemoryError> {
         let lock = self.session_lock(session_key);
         let _guard = lock.lock().await;
 
@@ -426,7 +440,9 @@ impl Memory for SqliteMemory {
             let mut session = self
                 .cache
                 .entry(session_key.to_string())
-                .or_insert_with(|| SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens));
+                .or_insert_with(|| {
+                    SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens)
+                });
             session.extend_messages(messages);
             session.len()
         };
@@ -436,7 +452,11 @@ impl Memory for SqliteMemory {
         Ok(())
     }
 
-    async fn set_system_prompt(&self, session_key: &str, prompt: String) -> Result<(), MemoryError> {
+    async fn set_system_prompt(
+        &self,
+        session_key: &str,
+        prompt: String,
+    ) -> Result<(), MemoryError> {
         let lock = self.session_lock(session_key);
         let _guard = lock.lock().await;
 
@@ -460,7 +480,9 @@ impl Memory for SqliteMemory {
         // 2. Update in-memory read cache
         self.cache
             .entry(session_key.to_string())
-            .or_insert_with(|| SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens))
+            .or_insert_with(|| {
+                SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens)
+            })
             .set_system_prompt(prompt);
 
         self.touch_lru(session_key).await;
@@ -472,7 +494,8 @@ impl Memory for SqliteMemory {
         let _guard = lock.lock().await;
 
         self.ensure_session_cached(session_key).await?;
-        Ok(self.cache
+        Ok(self
+            .cache
             .get(session_key)
             .and_then(|s| s.system_prompt().map(|p| p.to_string())))
     }
@@ -482,7 +505,8 @@ impl Memory for SqliteMemory {
         let _guard = lock.lock().await;
 
         self.ensure_session_cached(session_key).await?;
-        Ok(self.cache
+        Ok(self
+            .cache
             .get(session_key)
             .map(|s| s.get_messages())
             .unwrap_or_default())
@@ -495,8 +519,14 @@ impl Memory for SqliteMemory {
         {
             let mut conn = self.conn.lock().await;
             let tx = conn.transaction()?;
-            tx.execute("DELETE FROM messages WHERE session_key = ?1", params![session_key])?;
-            tx.execute("DELETE FROM sessions WHERE session_key = ?1", params![session_key])?;
+            tx.execute(
+                "DELETE FROM messages WHERE session_key = ?1",
+                params![session_key],
+            )?;
+            tx.execute(
+                "DELETE FROM sessions WHERE session_key = ?1",
+                params![session_key],
+            )?;
             tx.commit()?;
         }
         self.cache.remove(session_key);
@@ -534,7 +564,10 @@ impl Memory for SqliteMemory {
             let mut conn = self.conn.lock().await;
             let tx = conn.transaction()?;
 
-            tx.execute("DELETE FROM messages WHERE session_key = ?1", params![session_key])?;
+            tx.execute(
+                "DELETE FROM messages WHERE session_key = ?1",
+                params![session_key],
+            )?;
 
             tx.execute(
                 "INSERT INTO sessions (session_key, system_prompt, updated_at)
@@ -580,7 +613,9 @@ impl Memory for SqliteMemory {
             let mut session = self
                 .cache
                 .entry(session_key.to_string())
-                .or_insert_with(|| SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens));
+                .or_insert_with(|| {
+                    SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens)
+                });
             session.clear_messages();
             if let Some(prompt) = system_prompt {
                 session.set_system_prompt(prompt);

@@ -150,4 +150,3 @@ pub fn ensure_parent_dir(path: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
-

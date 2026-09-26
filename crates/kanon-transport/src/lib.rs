@@ -18,10 +18,10 @@ pub use path::{
     core_socket_path, default_run_dir, ensure_parent_dir, ensure_run_dir, host_socket_path,
 };
 pub use stream::connect_ipc;
-#[cfg(unix)]
-pub use stream::connect_unix;
 #[cfg(windows)]
 pub use stream::connect_tcp;
+#[cfg(unix)]
+pub use stream::connect_unix;
 
 /// Header key used for Windows TCP loopback token-based authentication.
 pub const AUTH_HEADER_KEY: &str = "x-kanon-auth-token";

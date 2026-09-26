@@ -38,7 +38,11 @@ async fn static_or_not_found(uri: Uri) -> Response {
     }
 
     let trimmed = path.trim_start_matches('/');
-    let target = if trimmed.is_empty() { "index.html" } else { trimmed };
+    let target = if trimmed.is_empty() {
+        "index.html"
+    } else {
+        trimmed
+    };
 
     if let Some(asset) = WebUiAssets::get(target) {
         let mime = mime_guess::from_path(target).first_or_octet_stream();

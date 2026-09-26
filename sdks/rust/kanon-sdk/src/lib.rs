@@ -5,20 +5,20 @@
 //! [`Plugin::on_deliver_message`] for outbound delivery, and push inbound messages back through
 //! the [`CoreHandle`] exposed on [`PluginContext::core`].
 
-pub mod plugin;
 pub mod context;
 pub mod host;
+pub mod plugin;
 pub mod watchdog;
 
 pub use context::CoreHandle;
 pub use host::KanonHost;
-pub use watchdog::{CoreWatchdogConfig, StopReason, watch_core};
 pub use kanon_proto as proto;
+pub use watchdog::{CoreWatchdogConfig, StopReason, watch_core};
 
 pub mod prelude {
-    pub use super::plugin::*;
     pub use super::context::*;
     pub use super::host::KanonHost;
+    pub use super::plugin::*;
     pub use super::watchdog::{CoreWatchdogConfig, StopReason, watch_core};
     pub use async_trait::async_trait;
     pub use kanon_proto::v1::*;

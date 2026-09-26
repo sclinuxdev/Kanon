@@ -3,10 +3,10 @@
 //! Provides [`IpcListener`] and [`IpcIncoming`], which integrate seamlessly
 //! with Tonic's gRPC server (`serve_with_incoming`).
 
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use crate::IpcStream;
 use crate::path::ensure_parent_dir;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// A cross-platform listener for incoming IPC connections.
 ///

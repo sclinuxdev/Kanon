@@ -15,7 +15,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use kanon_core::{AdapterError, EventIngress, PlatformAdapter};
 use kanon_proto::v1::message_segment::Segment;
-use kanon_proto::v1::{DeliverMessageRequest, DeliverMessageResponse, audio_segment, image_segment};
+use kanon_proto::v1::{
+    DeliverMessageRequest, DeliverMessageResponse, audio_segment, image_segment,
+};
 use serde::Serialize;
 
 /// Timeout applied to callback deliveries.
@@ -168,7 +170,9 @@ impl PlatformAdapter for WebhookAdapter {
         let Some(sig) = signature.filter(|s| !s.trim().is_empty()) else {
             return Err(AdapterError::Authentication {
                 platform: self.platform.clone(),
-                reason: "missing signature header (expected X-Hub-Signature-256 or X-Kanon-Signature)".to_string(),
+                reason:
+                    "missing signature header (expected X-Hub-Signature-256 or X-Kanon-Signature)"
+                        .to_string(),
             });
         };
 
@@ -242,7 +246,8 @@ impl PlatformAdapter for WebhookAdapter {
                     }
 
                     // 4xx client errors (except 429 Too Many Requests) are permanent faults: do NOT retry
-                    let is_transient = status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                    let is_transient = status.is_server_error()
+                        || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
                     let body = response.text().await.unwrap_or_default();
                     let excerpt: String = body.chars().take(256).collect();
 
@@ -307,7 +312,10 @@ impl PlatformAdapter for WebhookAdapter {
 ///
 /// Strips optional `sha256=` prefix and compares in constant time using `ring::hmac::verify`.
 pub fn verify_hmac_sha256(secret: &[u8], payload: &[u8], signature: &str) -> bool {
-    let raw_hex = signature.trim().strip_prefix("sha256=").unwrap_or(signature.trim());
+    let raw_hex = signature
+        .trim()
+        .strip_prefix("sha256=")
+        .unwrap_or(signature.trim());
     let Ok(sig_bytes) = decode_hex(raw_hex) else {
         return false;
     };

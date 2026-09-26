@@ -11,7 +11,7 @@ use kanon_core::supervisor::Supervisor;
 use kanon_proto::prost_types;
 use kanon_proto::v1::message_segment::Segment;
 use kanon_proto::v1::{
-    pre_filter_result::Action, CommandExecuteRequest, PipelineEventRequest, ToolCallRequest,
+    CommandExecuteRequest, PipelineEventRequest, ToolCallRequest, pre_filter_result::Action,
 };
 
 fn find_workspace_root() -> PathBuf {

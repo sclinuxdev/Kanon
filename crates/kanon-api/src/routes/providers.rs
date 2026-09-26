@@ -16,8 +16,8 @@ use axum::extract::State;
 use axum::routing::{get, post, put};
 use serde::{Deserialize, Serialize};
 
-use kanon_llm::gateway::types::{ChatMessage, ChatRequest};
 use kanon_llm::gateway::LlmProvider;
+use kanon_llm::gateway::types::{ChatMessage, ChatRequest};
 
 use crate::error::ApiError;
 use crate::llm_config::LlmProviderConfig;
@@ -163,11 +163,10 @@ pub struct TestProviderResponse {
 /// Precedence: a provider persisted by the console wins over the `KANON_LLM_*` environment
 /// bootstrap, because the console is how an operator changes the node after it started. When
 /// neither exists the node reports `none` rather than inventing a default.
-pub(crate) fn effective_provider(state: &ApiState) -> Result<(LlmProviderConfig, &'static str), ApiError> {
-    let persisted = state
-        .system_config()
-        .load()
-        .map_err(ApiError::Internal)?;
+pub(crate) fn effective_provider(
+    state: &ApiState,
+) -> Result<(LlmProviderConfig, &'static str), ApiError> {
+    let persisted = state.system_config().load().map_err(ApiError::Internal)?;
 
     if let Some(config) = persisted {
         return Ok((config, "console"));
@@ -248,7 +247,9 @@ pub(crate) fn active_provider_info(state: &ApiState) -> Result<ActiveProviderInf
 }
 
 /// Handler for `GET /api/v1/providers`.
-async fn list_providers(State(state): State<ApiState>) -> Result<Json<ProvidersCatalogResponse>, ApiError> {
+async fn list_providers(
+    State(state): State<ApiState>,
+) -> Result<Json<ProvidersCatalogResponse>, ApiError> {
     let active = active_provider_info(&state)?;
 
     let available_protocols = vec![
@@ -396,20 +397,16 @@ async fn test_provider(
 ) -> Result<Json<TestProviderResponse>, ApiError> {
     let prompt = payload.prompt.unwrap_or_else(|| "ping".to_string());
 
-    let (provider, model): (Arc<dyn LlmProvider>, String) = match (payload.protocol, payload.base_url) {
+    let (provider, model): (Arc<dyn LlmProvider>, String) = match (
+        payload.protocol,
+        payload.base_url,
+    ) {
         (Some(proto), Some(url)) => {
-            let model = payload
-                .model
-                .unwrap_or_else(|| "gpt-4o-mini".to_string());
+            let model = payload.model.unwrap_or_else(|| "gpt-4o-mini".to_string());
             // Built through the shared factory so a protocol accepted at activation time is
             // accepted here too, with identical wire semantics.
-            let provider = kanon_llm::build_provider(
-                &proto,
-                url,
-                payload.api_key,
-                model.clone(),
-            )
-            .map_err(ApiError::BadRequest)?;
+            let provider = kanon_llm::build_provider(&proto, url, payload.api_key, model.clone())
+                .map_err(ApiError::BadRequest)?;
             (provider, model)
         }
         _ => {
@@ -497,7 +494,9 @@ async fn fetch_models(
     let protocol = payload.protocol.as_deref().unwrap_or("openai");
     let base_url = payload.base_url.trim().trim_end_matches('/').to_string();
     if base_url.is_empty() {
-        return Err(ApiError::BadRequest("base_url must not be empty".to_string()));
+        return Err(ApiError::BadRequest(
+            "base_url must not be empty".to_string(),
+        ));
     }
 
     let client = reqwest::Client::builder()
@@ -524,7 +523,9 @@ async fn fetch_models(
         }
 
         let resp = req.send().await.map_err(|e| {
-            ApiError::Internal(format!("Failed to connect to Anthropic provider at {models_url}: {e}"))
+            ApiError::Internal(format!(
+                "Failed to connect to Anthropic provider at {models_url}: {e}"
+            ))
         })?;
 
         if !resp.status().is_success() {
@@ -532,9 +533,13 @@ async fn fetch_models(
             let text = resp.text().await.unwrap_or_default();
             let msg = if status == reqwest::StatusCode::UNAUTHORIZED {
                 if payload.api_key.as_deref().unwrap_or("").trim().is_empty() {
-                    format!("Anthropic provider returned HTTP 401 Unauthorized: API key is required but was not provided. Upstream: {text}")
+                    format!(
+                        "Anthropic provider returned HTTP 401 Unauthorized: API key is required but was not provided. Upstream: {text}"
+                    )
                 } else {
-                    format!("Anthropic provider returned HTTP 401 Unauthorized: Authentication failed (check API key credentials). Upstream: {text}")
+                    format!(
+                        "Anthropic provider returned HTTP 401 Unauthorized: Authentication failed (check API key credentials). Upstream: {text}"
+                    )
                 }
             } else {
                 format!("Anthropic provider returned HTTP {status}: {text}")
@@ -565,7 +570,9 @@ async fn fetch_models(
         }
 
         let resp = req.send().await.map_err(|e| {
-            ApiError::Internal(format!("Failed to connect to provider at {models_url}: {e}"))
+            ApiError::Internal(format!(
+                "Failed to connect to provider at {models_url}: {e}"
+            ))
         })?;
 
         if !resp.status().is_success() {
@@ -573,9 +580,13 @@ async fn fetch_models(
             let text = resp.text().await.unwrap_or_default();
             let msg = if status == reqwest::StatusCode::UNAUTHORIZED {
                 if payload.api_key.as_deref().unwrap_or("").trim().is_empty() {
-                    format!("Provider returned HTTP 401 Unauthorized: API key is required but was not provided. Upstream: {text}")
+                    format!(
+                        "Provider returned HTTP 401 Unauthorized: API key is required but was not provided. Upstream: {text}"
+                    )
                 } else {
-                    format!("Provider returned HTTP 401 Unauthorized: Authentication failed (check API key credentials). Upstream: {text}")
+                    format!(
+                        "Provider returned HTTP 401 Unauthorized: Authentication failed (check API key credentials). Upstream: {text}"
+                    )
                 }
             } else {
                 format!("Provider returned HTTP {status}: {text}")

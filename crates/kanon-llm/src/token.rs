@@ -28,14 +28,13 @@ pub fn estimate_text_tokens(text: &str) -> usize {
         }
     }
 
-// ASCII tokenization approximation: ~4 characters per token
+    // ASCII tokenization approximation: ~4 characters per token
     let ascii_tokens = ascii_chars.div_ceil(4);
     (cjk_count + ascii_tokens).max(1)
 }
 
 /// Backward-compatible alias for [`estimate_text_tokens`].
 pub use estimate_text_tokens as estimate_tokens;
-
 
 /// Estimates the token cost of an individual conversational message,
 /// including role framing overhead (~4 tokens) and optional tool calls.

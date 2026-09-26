@@ -1,13 +1,13 @@
 //! Integration tests for token budget estimation and context summary compression.
 
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use kanon_llm::agent::Agent;
 use kanon_llm::error::GatewayError;
 
-use kanon_llm::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role, ToolCall};
 use kanon_llm::gateway::LlmProvider;
+use kanon_llm::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role, ToolCall};
 use kanon_llm::memory::{Memory, SlidingWindowMemory};
 use kanon_llm::summary::{ContextSummarizer, SummaryConfig, SummaryHook};
 use kanon_llm::token::{
@@ -20,7 +20,11 @@ struct MockSummarizingProvider;
 #[async_trait]
 impl LlmProvider for MockSummarizingProvider {
     async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, GatewayError> {
-        let first_msg = request.messages.first().and_then(|m| m.content.as_deref()).unwrap_or_default();
+        let first_msg = request
+            .messages
+            .first()
+            .and_then(|m| m.content.as_deref())
+            .unwrap_or_default();
         if first_msg.contains("Provide a concise, factual summary") {
             Ok(ChatResponse {
                 content: Some("User asked for multiple calculation operations.".to_string()),
@@ -93,14 +97,18 @@ async fn test_context_summarizer_compression_lifecycle() {
         memory
             .push_message(
                 session_id,
-                ChatMessage::user(format!("Can you please solve problem equation number {i} in detail?")),
+                ChatMessage::user(format!(
+                    "Can you please solve problem equation number {i} in detail?"
+                )),
             )
             .await
             .unwrap();
         memory
             .push_message(
                 session_id,
-                ChatMessage::assistant(format!("Here is the step by step detailed solution for {i}.")),
+                ChatMessage::assistant(format!(
+                    "Here is the step by step detailed solution for {i}."
+                )),
             )
             .await
             .unwrap();
@@ -145,7 +153,13 @@ async fn test_context_summarizer_compression_lifecycle() {
     assert!(summary_content.contains("User asked for multiple calculation operations."));
 
     // Check that recent messages are indeed the latest ones
-    assert!(compressed_msgs[5].content.as_deref().unwrap().contains("solution for 8"));
+    assert!(
+        compressed_msgs[5]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("solution for 8")
+    );
 }
 
 #[tokio::test]
@@ -174,7 +188,11 @@ async fn test_summary_hook_with_agent_integration() {
         summary_model: None,
         custom_instruction: None,
     };
-    let summarizer = Arc::new(ContextSummarizer::new(config, provider.clone(), memory.clone()));
+    let summarizer = Arc::new(ContextSummarizer::new(
+        config,
+        provider.clone(),
+        memory.clone(),
+    ));
     let summary_hook = Arc::new(SummaryHook::new(summarizer));
 
     let agent = Agent::builder("test_agent", provider)
@@ -193,11 +211,12 @@ async fn test_summary_hook_with_agent_integration() {
 
     // Memory should contain compressed summary block + recent messages + latest query & response
     let msgs = memory.get_messages(session_id).await.unwrap();
-    assert!(msgs.iter().any(|m| m
-        .content
-        .as_deref()
-        .map(|c| c.contains("Context Summary of Previous Conversation"))
-        .unwrap_or(false)));
+    assert!(msgs.iter().any(|m| {
+        m.content
+            .as_deref()
+            .map(|c| c.contains("Context Summary of Previous Conversation"))
+            .unwrap_or(false)
+    }));
 }
 
 #[tokio::test]
@@ -239,11 +258,12 @@ async fn test_agent_builder_summary_config_fluent_api() {
     assert_eq!(output.content, "Final assistant answer.");
 
     let msgs = memory.get_messages(session_id).await.unwrap();
-    assert!(msgs.iter().any(|m| m
-        .content
-        .as_deref()
-        .map(|c| c.contains("Context Summary of Previous Conversation"))
-        .unwrap_or(false)));
+    assert!(msgs.iter().any(|m| {
+        m.content
+            .as_deref()
+            .map(|c| c.contains("Context Summary of Previous Conversation"))
+            .unwrap_or(false)
+    }));
 }
 
 /// Verifies that `SummaryHook` modifies the in-flight `ChatRequest.messages` on the very
@@ -260,7 +280,11 @@ async fn test_summary_hook_modifies_inflight_request_on_first_overbudget_turn() 
     #[async_trait]
     impl LlmProvider for InFlightCapturingProvider {
         async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, GatewayError> {
-            let first_msg = request.messages.first().and_then(|m| m.content.as_deref()).unwrap_or_default();
+            let first_msg = request
+                .messages
+                .first()
+                .and_then(|m| m.content.as_deref())
+                .unwrap_or_default();
             if first_msg.contains("Provide a concise, factual summary") {
                 Ok(ChatResponse {
                     content: Some("Summary of items 1 to 6.".to_string()),
@@ -270,7 +294,10 @@ async fn test_summary_hook_modifies_inflight_request_on_first_overbudget_turn() 
                 })
             } else {
                 // Record the actual messages passed to the main model call
-                self.captured_messages.lock().await.push(request.messages.clone());
+                self.captured_messages
+                    .lock()
+                    .await
+                    .push(request.messages.clone());
                 Ok(ChatResponse {
                     content: Some("Answer after compression.".to_string()),
                     tool_calls: vec![],
@@ -297,11 +324,17 @@ async fn test_summary_hook_modifies_inflight_request_on_first_overbudget_turn() 
     // Populate with 6 long dialogue turns so token budget is exceeded
     for i in 1..=6 {
         memory
-            .push_message(session_id, ChatMessage::user(format!("Lengthy user prompt {i} with lots of tokens")))
+            .push_message(
+                session_id,
+                ChatMessage::user(format!("Lengthy user prompt {i} with lots of tokens")),
+            )
             .await
             .unwrap();
         memory
-            .push_message(session_id, ChatMessage::assistant(format!("Lengthy assistant response {i} with tokens")))
+            .push_message(
+                session_id,
+                ChatMessage::assistant(format!("Lengthy assistant response {i} with tokens")),
+            )
             .await
             .unwrap();
     }
@@ -326,7 +359,11 @@ async fn test_summary_hook_modifies_inflight_request_on_first_overbudget_turn() 
     assert_eq!(output.content, "Answer after compression.");
 
     let recorded = captured.lock().await;
-    assert_eq!(recorded.len(), 1, "Expected exactly 1 main chat request to be captured");
+    assert_eq!(
+        recorded.len(),
+        1,
+        "Expected exactly 1 main chat request to be captured"
+    );
 
     let inflight_messages = &recorded[0];
     // Check that the in-flight request was compressed:
@@ -334,7 +371,10 @@ async fn test_summary_hook_modifies_inflight_request_on_first_overbudget_turn() 
     // (Instead of the uncompressed 1 System + 12 history turns + 1 latest user = 14 messages!)
     assert_eq!(inflight_messages.len(), 4);
     assert_eq!(inflight_messages[0].role, Role::System);
-    assert_eq!(inflight_messages[0].content.as_deref(), Some("System persona"));
+    assert_eq!(
+        inflight_messages[0].content.as_deref(),
+        Some("System persona")
+    );
 
     // Second message in request must be the injected summary block
     assert_eq!(inflight_messages[1].role, Role::System);
@@ -347,7 +387,8 @@ async fn test_summary_hook_modifies_inflight_request_on_first_overbudget_turn() 
 
     // Last message in request must be the latest user input
     assert_eq!(inflight_messages[3].role, Role::User);
-    assert_eq!(inflight_messages[3].content.as_deref(), Some("Latest inbound user message"));
+    assert_eq!(
+        inflight_messages[3].content.as_deref(),
+        Some("Latest inbound user message")
+    );
 }
-
-

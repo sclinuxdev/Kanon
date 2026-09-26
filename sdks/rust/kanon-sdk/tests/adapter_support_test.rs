@@ -12,11 +12,17 @@ use std::time::Duration;
 use kanon_proto::v1::bot_api_service_server::{BotApiService, BotApiServiceServer};
 use kanon_proto::v1::message_pipeline_service_client::MessagePipelineServiceClient;
 use kanon_proto::v1::message_segment::Segment;
-use kanon_proto::v1::{CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse, GetPluginMetaRequest, GetStorageRequest, GetStorageResponse, IngestEventRequest, IngestEventResponse, LlmChunk, LlmRequest, PingRequest, PingResponse, PipelineEventRequest, PluginMeta, RegisterHostRequest, RegisterHostResponse, SendMessageRequest, SendMessageResponse, SetStorageRequest, SetStorageResponse, TextSegment};
+use kanon_proto::v1::{
+    CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse,
+    GetPluginMetaRequest, GetStorageRequest, GetStorageResponse, IngestEventRequest,
+    IngestEventResponse, LlmChunk, LlmRequest, PingRequest, PingResponse, PipelineEventRequest,
+    PluginMeta, RegisterHostRequest, RegisterHostResponse, SendMessageRequest, SendMessageResponse,
+    SetStorageRequest, SetStorageResponse, TextSegment,
+};
+use kanon_sdk::KanonHost;
 use kanon_sdk::context::{CoreHandle, PluginContext};
 use kanon_sdk::plugin::{Plugin, PluginResult};
-use kanon_sdk::KanonHost;
-use kanon_transport::{connect_ipc, IpcListener};
+use kanon_transport::{IpcListener, connect_ipc};
 use tokio::sync::{Mutex, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -79,10 +85,7 @@ struct CoreStub {
 #[tonic::async_trait]
 impl BotApiService for CoreStub {
     /// Liveness probe: hosts use it to notice that their core is gone.
-    async fn ping(
-        &self,
-        request: Request<PingRequest>,
-    ) -> Result<Response<PingResponse>, Status> {
+    async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         Ok(Response::new(PingResponse {
             timestamp: request.into_inner().timestamp,
         }))
@@ -178,10 +181,7 @@ struct CoreStubServer {
 
 #[tonic::async_trait]
 impl BotApiService for CoreStubServer {
-    async fn ping(
-        &self,
-        request: Request<PingRequest>,
-    ) -> Result<Response<PingResponse>, Status> {
+    async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingResponse>, Status> {
         self.inner.ping(request).await
     }
 
@@ -295,7 +295,10 @@ async fn core_handle_ingests_events_into_the_core() {
     let ingested = stub.ingested.lock().await;
     assert_eq!(ingested.len(), 2);
     assert_eq!(
-        ingested[1].event.as_ref().map(|event| event.channel_id.as_str()),
+        ingested[1]
+            .event
+            .as_ref()
+            .map(|event| event.channel_id.as_str()),
         Some("chan-2")
     );
 
@@ -418,7 +421,9 @@ async fn non_adapter_plugin_refuses_delivery() {
 
     assert!(!response.success);
     assert!(
-        response.error_message.contains("does not implement on_deliver_message"),
+        response
+            .error_message
+            .contains("does not implement on_deliver_message"),
         "unexpected message: {}",
         response.error_message
     );
@@ -462,7 +467,8 @@ async fn plugin_meta_is_reported() {
     });
 
     let channel = connect_with_retry(&host_socket).await;
-    let mut client = kanon_proto::v1::plugin_host_service_client::PluginHostServiceClient::new(channel);
+    let mut client =
+        kanon_proto::v1::plugin_host_service_client::PluginHostServiceClient::new(channel);
     let response = client
         .get_plugin_meta(GetPluginMetaRequest {})
         .await

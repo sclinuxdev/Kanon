@@ -10,22 +10,19 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
 
+use crate::context::{CoreHandle, PluginContext};
+use crate::plugin::Plugin;
 use kanon_proto::v1::message_pipeline_service_server::{
     MessagePipelineService, MessagePipelineServiceServer,
 };
-use kanon_proto::v1::plugin_host_service_server::{
-    PluginHostService, PluginHostServiceServer,
-};
+use kanon_proto::v1::plugin_host_service_server::{PluginHostService, PluginHostServiceServer};
 use kanon_proto::v1::{
-    CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest,
-    DeliverMessageResponse, EventAck, EventNotification, GetPluginMetaRequest,
-    GetPluginMetaResponse, PipelineEventRequest, PreFilterResult, RegisterHostRequest,
-    ReloadPluginConfigRequest, ReloadPluginConfigResponse, ToolCallRequest,
-    ToolCallResponse,
+    CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse,
+    EventAck, EventNotification, GetPluginMetaRequest, GetPluginMetaResponse, PipelineEventRequest,
+    PreFilterResult, RegisterHostRequest, ReloadPluginConfigRequest, ReloadPluginConfigResponse,
+    ToolCallRequest, ToolCallResponse,
 };
-use kanon_transport::{connect_ipc, IpcListener};
-use crate::context::{CoreHandle, PluginContext};
-use crate::plugin::Plugin;
+use kanon_transport::{IpcListener, connect_ipc};
 
 /// Out-of-process gRPC host for a Kanon plugin.
 pub struct KanonHost<P: Plugin> {
@@ -47,9 +44,7 @@ impl<P: Plugin> KanonHost<P> {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("./run/host_rust.sock"));
 
-        let core_sock = std::env::var("KANON_CORE_SOCK")
-            .ok()
-            .map(PathBuf::from);
+        let core_sock = std::env::var("KANON_CORE_SOCK").ok().map(PathBuf::from);
 
         Self {
             plugin: Arc::new(RwLock::new(plugin)),
@@ -80,7 +75,10 @@ impl<P: Plugin> KanonHost<P> {
     }
 
     /// Runs the plugin host until the provided `shutdown` future resolves.
-    pub async fn run_with_shutdown<F>(self, shutdown: F) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    pub async fn run_with_shutdown<F>(
+        self,
+        shutdown: F,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -133,7 +131,8 @@ impl<P: Plugin> KanonHost<P> {
         //    starts, double-handle every message. Exiting is safe: the new core spawns its own
         //    hosts from the plugin directory.
         let (stop_tx, stop_rx) = tokio::sync::mpsc::channel::<()>(1);
-        let (reason_tx, mut reason_rx) = tokio::sync::oneshot::channel::<crate::watchdog::StopReason>();
+        let (reason_tx, mut reason_rx) =
+            tokio::sync::oneshot::channel::<crate::watchdog::StopReason>();
 
         let requested_tx = stop_tx.clone();
         let requested = async move {

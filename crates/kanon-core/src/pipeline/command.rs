@@ -57,10 +57,7 @@ impl CommandRouter {
     /// If multiple plugins register identical command names, candidates are sorted
     /// by command priority ascending, host priority ascending, and finally `host_id`
     /// to guarantee deterministic routing.
-    pub fn resolve(
-        command_name: &str,
-        hosts: &[Arc<ManagedHost>],
-    ) -> Option<MatchedCommand> {
+    pub fn resolve(command_name: &str, hosts: &[Arc<ManagedHost>]) -> Option<MatchedCommand> {
         let target_name = command_name.trim_start_matches('/');
         let mut candidates = Vec::new();
 
@@ -115,4 +112,3 @@ impl CommandRouter {
         target.host.execute_command(req).await
     }
 }
-

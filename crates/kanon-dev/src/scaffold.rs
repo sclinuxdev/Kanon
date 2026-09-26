@@ -14,10 +14,14 @@ pub enum ScaffoldError {
     #[error("I/O error during project creation: {0}")]
     Io(#[from] std::io::Error),
     /// Invalid or unsupported programming language.
-    #[error("Unsupported plugin language '{0}'. Supported languages: rust, python, typescript (ts)")]
+    #[error(
+        "Unsupported plugin language '{0}'. Supported languages: rust, python, typescript (ts)"
+    )]
     UnsupportedLanguage(String),
     /// Invalid plugin name.
-    #[error("Invalid plugin name '{0}'. Must be a valid identifier containing only alphanumeric characters, underscores, and hyphens")]
+    #[error(
+        "Invalid plugin name '{0}'. Must be a valid identifier containing only alphanumeric characters, underscores, and hyphens"
+    )]
     InvalidPluginName(String),
     /// Target directory already exists and is not empty.
     #[error("Target directory '{0}' already exists and is not empty")]

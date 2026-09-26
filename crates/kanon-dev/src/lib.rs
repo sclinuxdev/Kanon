@@ -8,7 +8,7 @@ pub mod pack;
 pub mod sandbox;
 pub mod scaffold;
 
-pub use lint::{lint_plugin, LintError, LintReport};
-pub use pack::{pack_plugin, PackError, PackReport};
-pub use sandbox::{run_sandbox, SandboxError, SandboxOptions};
-pub use scaffold::{create_plugin_project, ScaffoldError};
+pub use lint::{LintError, LintReport, lint_plugin};
+pub use pack::{PackError, PackReport, pack_plugin};
+pub use sandbox::{SandboxError, SandboxOptions, run_sandbox};
+pub use scaffold::{ScaffoldError, create_plugin_project};

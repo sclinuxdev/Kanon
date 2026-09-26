@@ -6,16 +6,18 @@
 //! - `test [path]`: Offline terminal sandbox for commands and tool calling
 //! - `pack [path]`: Standard `.kpk` bundle distribution packager
 
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use clap::{Parser, Subcommand};
 
-use kanon_dev::{
-    create_plugin_project, lint_plugin, pack_plugin, run_sandbox, SandboxOptions,
-};
+use kanon_dev::{SandboxOptions, create_plugin_project, lint_plugin, pack_plugin, run_sandbox};
 
 #[derive(Parser)]
-#[command(name = "kanon-dev", version, about = "Official developer toolchain and CLI for Kanon plugins")]
+#[command(
+    name = "kanon-dev",
+    version,
+    about = "Official developer toolchain and CLI for Kanon plugins"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -124,9 +126,7 @@ async fn main() -> ExitCode {
 
     match cli.command {
         Commands::Plugin { action } => handle_plugin_action(action).await,
-        Commands::Create { name, lang, output } => {
-            handle_create(&name, &lang, output.as_deref())
-        }
+        Commands::Create { name, lang, output } => handle_create(&name, &lang, output.as_deref()),
         Commands::Lint { path } => handle_lint(path.as_deref()),
         Commands::Test {
             path,
@@ -135,9 +135,7 @@ async fn main() -> ExitCode {
             args,
             non_interactive,
         } => handle_test(path.as_deref(), command, tool, args, non_interactive).await,
-        Commands::Pack { path, output } => {
-            handle_pack(path.as_deref(), output.as_deref())
-        }
+        Commands::Pack { path, output } => handle_pack(path.as_deref(), output.as_deref()),
         Commands::Dev => {
             println!("Starting Kanon dev server with file watcher and hot reload...");
             println!("(Press Ctrl+C to stop)");
@@ -152,9 +150,7 @@ async fn handle_plugin_action(action: PluginAction) -> ExitCode {
             handle_create(&name, &lang, output.as_deref())
         }
         PluginAction::Lint { path } => handle_lint(path.as_deref()),
-        PluginAction::Pack { path, output } => {
-            handle_pack(path.as_deref(), output.as_deref())
-        }
+        PluginAction::Pack { path, output } => handle_pack(path.as_deref(), output.as_deref()),
         PluginAction::Test {
             path,
             command,
@@ -168,7 +164,11 @@ async fn handle_plugin_action(action: PluginAction) -> ExitCode {
 fn handle_create(name: &str, lang: &str, output: Option<&std::path::Path>) -> ExitCode {
     match create_plugin_project(name, lang, output) {
         Ok(dir) => {
-            println!("✓ Successfully created {} plugin in '{}'", lang, dir.display());
+            println!(
+                "✓ Successfully created {} plugin in '{}'",
+                lang,
+                dir.display()
+            );
             println!("  Next steps:");
             println!("    cd {}", dir.display());
             if lang == "rust" {
@@ -192,9 +192,16 @@ fn handle_lint(path: Option<&std::path::Path>) -> ExitCode {
     let target = path.unwrap_or_else(|| std::path::Path::new("."));
     match lint_plugin(target) {
         Ok(report) => {
-            println!("Linting plugin manifest: {}", report.manifest_path.display());
+            println!(
+                "Linting plugin manifest: {}",
+                report.manifest_path.display()
+            );
             if let Some(ref id) = report.plugin_id {
-                println!("  Plugin: {} ({})", report.plugin_name.as_deref().unwrap_or_default(), id);
+                println!(
+                    "  Plugin: {} ({})",
+                    report.plugin_name.as_deref().unwrap_or_default(),
+                    id
+                );
             }
             if let Some(ref runtime) = report.runtime {
                 println!("  Runtime: {}", runtime);
@@ -205,13 +212,19 @@ fn handle_lint(path: Option<&std::path::Path>) -> ExitCode {
             }
 
             if report.is_valid() {
-                println!("✓ Manifest validation PASSED with 0 errors ({} warnings)", report.warnings.len());
+                println!(
+                    "✓ Manifest validation PASSED with 0 errors ({} warnings)",
+                    report.warnings.len()
+                );
                 ExitCode::SUCCESS
             } else {
                 for err in &report.errors {
                     eprintln!("  [ERROR] {}", err);
                 }
-                eprintln!("✗ Manifest validation FAILED with {} error(s)", report.errors.len());
+                eprintln!(
+                    "✗ Manifest validation FAILED with {} error(s)",
+                    report.errors.len()
+                );
                 ExitCode::FAILURE
             }
         }
@@ -231,7 +244,10 @@ fn handle_pack(path: Option<&std::path::Path>, output: Option<&std::path::Path>)
             println!("  Checksum: {}", report.checksum_path.display());
             println!("  SHA-256:  {}", report.sha256_hex);
             println!("  Files:    {}", report.file_count);
-            println!("  Size:     {:.2} KB", report.bundle_size_bytes as f64 / 1024.0);
+            println!(
+                "  Size:     {:.2} KB",
+                report.bundle_size_bytes as f64 / 1024.0
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {

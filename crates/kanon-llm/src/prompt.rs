@@ -114,7 +114,11 @@ impl PromptTemplate {
     }
 
     /// Renders the template with a custom fallback string for unresolved slots without defaults.
-    pub fn render_with_fallback(&self, variables: &HashMap<String, String>, fallback: &str) -> String {
+    pub fn render_with_fallback(
+        &self,
+        variables: &HashMap<String, String>,
+        fallback: &str,
+    ) -> String {
         // Re-compile segments if deserialized without segments
         let segs = if self.segments.is_empty() && !self.raw.is_empty() {
             Self::compile_segments(&self.raw)
@@ -126,7 +130,10 @@ impl PromptTemplate {
         for seg in &segs {
             match seg {
                 TemplateSegment::Literal(lit) => output.push_str(lit),
-                TemplateSegment::Slot { name, default_value } => {
+                TemplateSegment::Slot {
+                    name,
+                    default_value,
+                } => {
                     if let Some(val) = variables.get(name) {
                         output.push_str(val);
                     } else if let Some(def) = default_value {
@@ -160,7 +167,11 @@ impl PromptTemplate {
     pub fn required_variables(&self) -> Vec<String> {
         let mut set = HashSet::new();
         for seg in &self.segments {
-            if let TemplateSegment::Slot { name, default_value: None } = seg {
+            if let TemplateSegment::Slot {
+                name,
+                default_value: None,
+            } = seg
+            {
                 set.insert(name.clone());
             }
         }
@@ -375,33 +386,42 @@ impl Default for PersonaRegistry {
         };
 
         // 1. General Assistant
-        registry.register(Persona::new(
-            "assistant",
-            "General Assistant",
-            "Helpful, friendly, and reliable conversational assistant",
-            "You are {{bot_name|Kanon}}, a helpful, intelligent, and versatile AI assistant. \
+        registry.register(
+            Persona::new(
+                "assistant",
+                "General Assistant",
+                "Helpful, friendly, and reliable conversational assistant",
+                "You are {{bot_name|Kanon}}, a helpful, intelligent, and versatile AI assistant. \
              Respond clearly, thoughtfully, and concisely.",
-        ).with_temperature(0.7));
+            )
+            .with_temperature(0.7),
+        );
 
         // 2. Coder / Software Architect
-        registry.register(Persona::new(
-            "coder",
-            "Code Architect",
-            "Senior systems architect and programmer providing idiomatic, robust code",
-            "You are {{bot_name|Kanon}}, an expert software engineer and systems architect. \
+        registry.register(
+            Persona::new(
+                "coder",
+                "Code Architect",
+                "Senior systems architect and programmer providing idiomatic, robust code",
+                "You are {{bot_name|Kanon}}, an expert software engineer and systems architect. \
              Provide correct, idiomatic, and highly efficient code. Always explain non-obvious \
              trade-offs and handle edge cases thoroughly.",
-        ).with_temperature(0.2));
+            )
+            .with_temperature(0.2),
+        );
 
         // 3. Translator
-        registry.register(Persona::new(
-            "translator",
-            "Multilingual Translator",
-            "Professional translator preserving tone, cultural nuance, and technical precision",
-            "You are a professional multilingual translator. Translate text accurately while \
+        registry.register(
+            Persona::new(
+                "translator",
+                "Multilingual Translator",
+                "Professional translator preserving tone, cultural nuance, and technical precision",
+                "You are a professional multilingual translator. Translate text accurately while \
              preserving the original tone, context, and domain-specific terminology. Output only \
              the clean translation without conversational filler.",
-        ).with_temperature(0.3));
+            )
+            .with_temperature(0.3),
+        );
 
         // 4. Concise / Minimalist
         registry.register(Persona::new(
@@ -413,13 +433,16 @@ impl Default for PersonaRegistry {
         ).with_temperature(0.2));
 
         // 5. Creative Companion
-        registry.register(Persona::new(
-            "creative",
-            "Creative Companion",
-            "Imaginative ideation and creative writing partner",
-            "You are {{bot_name|Kanon}}, an imaginative and expressive creative partner. \
+        registry.register(
+            Persona::new(
+                "creative",
+                "Creative Companion",
+                "Imaginative ideation and creative writing partner",
+                "You are {{bot_name|Kanon}}, an imaginative and expressive creative partner. \
              Embrace novelty, vivid metaphors, and diverse viewpoints to inspire the user.",
-        ).with_temperature(0.9));
+            )
+            .with_temperature(0.9),
+        );
 
         registry
     }
@@ -478,7 +501,10 @@ pub struct DynamicPromptHook {
 
 impl DynamicPromptHook {
     /// Constructs a new `DynamicPromptHook`.
-    pub fn new(session_manager: Arc<SessionManager>, persona_registry: Arc<PersonaRegistry>) -> Self {
+    pub fn new(
+        session_manager: Arc<SessionManager>,
+        persona_registry: Arc<PersonaRegistry>,
+    ) -> Self {
         Self {
             session_manager,
             persona_registry,
@@ -505,7 +531,11 @@ impl DynamicPromptHook {
 
 #[async_trait]
 impl AgentHook for DynamicPromptHook {
-    async fn on_llm_request(&self, session_id: &str, request: &mut ChatRequest) -> Result<(), AgentError> {
+    async fn on_llm_request(
+        &self,
+        session_id: &str,
+        request: &mut ChatRequest,
+    ) -> Result<(), AgentError> {
         let persona_id = self
             .session_manager
             .get_persona(session_id)
@@ -533,10 +563,14 @@ impl AgentHook for DynamicPromptHook {
                 if first_msg.role == Role::System {
                     first_msg.content = Some(rendered_system_prompt);
                 } else {
-                    request.messages.insert(0, ChatMessage::system(rendered_system_prompt));
+                    request
+                        .messages
+                        .insert(0, ChatMessage::system(rendered_system_prompt));
                 }
             } else {
-                request.messages.push(ChatMessage::system(rendered_system_prompt));
+                request
+                    .messages
+                    .push(ChatMessage::system(rendered_system_prompt));
             }
         }
 

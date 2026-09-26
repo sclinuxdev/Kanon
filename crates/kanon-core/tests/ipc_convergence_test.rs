@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tonic::Code;
 
 use kanon_core::adapter::{AdapterError, PlatformAdapter};
@@ -22,13 +22,12 @@ use kanon_proto::v1::plugin_host_service_server::{PluginHostService, PluginHostS
 use kanon_proto::v1::{
     CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse,
     EventAck, EventNotification, GetPluginMetaRequest, GetPluginMetaResponse, GetStorageRequest,
-    PingRequest, PingResponse, PipelineEventRequest, PluginActionRequest,
-    PluginActionResponse, PluginMeta, PreFilterResult,
-    RegisterHostRequest, ReloadPluginConfigRequest, ReloadPluginConfigResponse,
-    SendMessageRequest, SetStorageRequest, TextSegment, ToolCallRequest, ToolCallResponse,
-    MessageSegment,
+    MessageSegment, PingRequest, PingResponse, PipelineEventRequest, PluginActionRequest,
+    PluginActionResponse, PluginMeta, PreFilterResult, RegisterHostRequest,
+    ReloadPluginConfigRequest, ReloadPluginConfigResponse, SendMessageRequest, SetStorageRequest,
+    TextSegment, ToolCallRequest, ToolCallResponse,
 };
-use kanon_transport::{connect_ipc, IpcListener};
+use kanon_transport::{IpcListener, connect_ipc};
 
 /// Mock platform adapter capturing outbound deliveries.
 struct MockAdapter {
@@ -302,7 +301,10 @@ async fn test_send_message_dispatches_to_platform_adapter() {
         .into_inner();
 
     assert!(send_resp.success, "SendMessage must report success");
-    assert!(send_resp.accepted, "SendMessage must explicitly report accepted=true for outbound queue admission");
+    assert!(
+        send_resp.accepted,
+        "SendMessage must explicitly report accepted=true for outbound queue admission"
+    );
     assert!(!send_resp.message_id.is_empty());
 
     // Wait for the outbound dispatcher and platform worker to process the delivery

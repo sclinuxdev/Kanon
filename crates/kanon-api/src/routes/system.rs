@@ -96,8 +96,7 @@ async fn system_config(
         .filter(|s| !s.trim().is_empty());
 
     let webhook = WebhookConfigSection {
-        platform: std::env::var("KANON_WEBHOOK_PLATFORM")
-            .unwrap_or_else(|_| "webhook".to_string()),
+        platform: std::env::var("KANON_WEBHOOK_PLATFORM").unwrap_or_else(|_| "webhook".to_string()),
         callback_configured: webhook_adapter
             .as_ref()
             .map(|w| w.is_connected())
@@ -141,7 +140,11 @@ async fn system_config(
             .to_string_lossy()
             .to_string(),
         run_dir: state.supervisor().run_dir().to_string_lossy().to_string(),
-        data_dir: state.config_store().base_dir().to_string_lossy().to_string(),
+        data_dir: state
+            .config_store()
+            .base_dir()
+            .to_string_lossy()
+            .to_string(),
         memory_window: 40,
         webhook,
         llm,

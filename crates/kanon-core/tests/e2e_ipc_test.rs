@@ -108,7 +108,9 @@ async fn test_core_plugin_ipc_handshake_and_pipeline() {
 
     if let Some(Segment::Text(text_seg)) = &cmd_response.replies[0].segment {
         assert!(
-            text_seg.content.contains("Rust calculation result for [2 + 2]: 42"),
+            text_seg
+                .content
+                .contains("Rust calculation result for [2 + 2]: 42"),
             "Unexpected command reply content: {}",
             text_seg.content
         );
@@ -164,10 +166,7 @@ async fn test_core_plugin_ipc_handshake_and_pipeline() {
 
     // Verify that event was placed onto the asynchronous ingest queue
     let received_event = event_rx.recv().await.expect("Expected event on queue");
-    assert_eq!(
-        received_event.event.unwrap().event_id,
-        "evt_fast_ack_1"
-    );
+    assert_eq!(received_event.event.unwrap().event_id, "evt_fast_ack_1");
 
     // 9. Graceful shutdown and cleanup verification
     supervisor

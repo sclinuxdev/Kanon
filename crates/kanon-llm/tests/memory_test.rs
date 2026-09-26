@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use kanon_llm::gateway::types::{ChatMessage, Role};
 use kanon_llm::memory::{Memory, SessionMemory, SlidingWindowMemory};
+use std::sync::Arc;
 
 #[test]
 fn test_session_sliding_window_pruning() {
@@ -22,7 +22,10 @@ fn test_session_sliding_window_pruning() {
     // System prompt is always prepended at index 0
     assert_eq!(msgs.len(), 5);
     assert_eq!(msgs[0].role, Role::System);
-    assert_eq!(msgs[0].content.as_deref(), Some("You are a helpful assistant."));
+    assert_eq!(
+        msgs[0].content.as_deref(),
+        Some("You are a helpful assistant.")
+    );
     assert_eq!(msgs[1].content.as_deref(), Some("reply 1"));
     assert_eq!(msgs[4].content.as_deref(), Some("msg 3"));
 }
@@ -32,8 +35,14 @@ async fn test_memory_trait_interface() {
     let memory: Arc<dyn Memory> = Arc::new(SlidingWindowMemory::new(10));
     let key = SlidingWindowMemory::make_session_key("chan_1", "user_alice");
 
-    memory.push_message(&key, ChatMessage::user("Hello")).await.unwrap();
-    memory.push_message(&key, ChatMessage::assistant("Hi Alice!")).await.unwrap();
+    memory
+        .push_message(&key, ChatMessage::user("Hello"))
+        .await
+        .unwrap();
+    memory
+        .push_message(&key, ChatMessage::assistant("Hi Alice!"))
+        .await
+        .unwrap();
 
     let history = memory.get_messages(&key).await.unwrap();
     assert_eq!(history.len(), 2);

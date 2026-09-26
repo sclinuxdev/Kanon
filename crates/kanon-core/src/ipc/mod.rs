@@ -5,8 +5,8 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
@@ -17,7 +17,7 @@ use kanon_proto::v1::{
     IngestEventResponse, LlmChunk, LlmRequest, RegisterHostRequest, RegisterHostResponse,
     SendMessageRequest, SendMessageResponse, SetStorageRequest, SetStorageResponse,
 };
-use kanon_transport::{core_socket_path, IpcListener};
+use kanon_transport::{IpcListener, core_socket_path};
 
 use crate::adapter::{EventIngress, IngestError};
 use crate::supervisor::Supervisor;
@@ -110,7 +110,6 @@ impl CoreApiService {
     }
 }
 
-
 #[tonic::async_trait]
 impl BotApiService for CoreApiService {
     /// Registers a newly initialized plugin host with the Core microkernel,
@@ -186,12 +185,10 @@ impl BotApiService for CoreApiService {
 
         // Non-blocking enqueue to guarantee Fast-ACK (< 50µs).
         match self.ingress.try_ingest(req) {
-            Ok(()) => {
-                Ok(Response::new(IngestEventResponse {
-                    accepted: true,
-                    event_id,
-                }))
-            }
+            Ok(()) => Ok(Response::new(IngestEventResponse {
+                accepted: true,
+                event_id,
+            })),
             Err(IngestError::QueueFull) => {
                 // High watermark reached: report backpressure but acknowledge failure quickly.
                 tracing::warn!(
@@ -203,9 +200,9 @@ impl BotApiService for CoreApiService {
                     event_id,
                 }))
             }
-            Err(IngestError::Closed) => {
-                Err(Status::unavailable("Microkernel event queue has been closed"))
-            }
+            Err(IngestError::Closed) => Err(Status::unavailable(
+                "Microkernel event queue has been closed",
+            )),
         }
     }
 
@@ -235,7 +232,11 @@ impl BotApiService for CoreApiService {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or_default();
-        let event_id = format!("send-{:x}-{:x}", now_ms, MSG_SEQ.fetch_add(1, Ordering::Relaxed));
+        let event_id = format!(
+            "send-{:x}-{:x}",
+            now_ms,
+            MSG_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
 
         let deliver_req = DeliverMessageRequest {
             platform: req.platform.clone(),
@@ -306,18 +307,24 @@ impl BotApiService for CoreApiService {
         let mut max_tokens = None;
 
         if let Some(ref params) = req.parameters {
-            if let Some(kanon_proto::prost_types::value::Kind::StringValue(s)) =
-                params.fields.get("system_prompt").and_then(|v| v.kind.as_ref())
+            if let Some(kanon_proto::prost_types::value::Kind::StringValue(s)) = params
+                .fields
+                .get("system_prompt")
+                .and_then(|v| v.kind.as_ref())
             {
                 messages.push(ChatMessage::system(s));
             }
-            if let Some(kanon_proto::prost_types::value::Kind::NumberValue(n)) =
-                params.fields.get("temperature").and_then(|v| v.kind.as_ref())
+            if let Some(kanon_proto::prost_types::value::Kind::NumberValue(n)) = params
+                .fields
+                .get("temperature")
+                .and_then(|v| v.kind.as_ref())
             {
                 temperature = Some(*n as f32);
             }
-            if let Some(kanon_proto::prost_types::value::Kind::NumberValue(n)) =
-                params.fields.get("max_tokens").and_then(|v| v.kind.as_ref())
+            if let Some(kanon_proto::prost_types::value::Kind::NumberValue(n)) = params
+                .fields
+                .get("max_tokens")
+                .and_then(|v| v.kind.as_ref())
             {
                 max_tokens = Some(*n as u32);
             }
@@ -333,9 +340,10 @@ impl BotApiService for CoreApiService {
             max_tokens,
         };
 
-        let stream = gateway.chat_stream(&chat_req).await.map_err(|e| {
-            Status::internal(format!("LLM Gateway error: {e}"))
-        })?;
+        let stream = gateway
+            .chat_stream(&chat_req)
+            .await
+            .map_err(|e| Status::internal(format!("LLM Gateway error: {e}")))?;
 
         let (tx, rx) = mpsc::channel(32);
         tokio::spawn(async move {
@@ -361,9 +369,10 @@ impl BotApiService for CoreApiService {
             }
         });
 
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
-
 
     /// Sets an embedded KV key-value pair.
     ///
@@ -425,7 +434,10 @@ impl CoreIpcServer {
     ///
     /// Binds to the designated socket path via [`IpcListener`] and registers
     /// the [`BotApiServiceServer`]. On graceful termination, the socket file is cleaned up.
-    pub async fn run<F>(self, shutdown_signal: F) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    pub async fn run<F>(
+        self,
+        shutdown_signal: F,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         F: Future<Output = ()> + Send + 'static,
     {

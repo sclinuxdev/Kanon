@@ -1,16 +1,16 @@
 //! Integration tests for streaming LLM provider protocol implementations (SSE).
 
-use std::net::SocketAddr;
+use axum::Router;
 use axum::response::IntoResponse;
 use axum::routing::post;
-use axum::Router;
+use std::net::SocketAddr;
 use tokio_stream::StreamExt;
 
+use kanon_llm::gateway::LlmProvider;
 use kanon_llm::gateway::providers::{
     AnthropicMessagesProvider, OpenAiChatProvider, OpenAiResponsesProvider,
 };
 use kanon_llm::gateway::types::{ChatMessage, ChatRequest};
-use kanon_llm::gateway::LlmProvider;
 
 #[tokio::test]
 async fn test_openai_chat_streaming_sse() {
@@ -46,7 +46,10 @@ async fn test_openai_chat_streaming_sse() {
         max_tokens: None,
     };
 
-    let mut stream = provider.chat_stream(&request).await.expect("Failed to start stream");
+    let mut stream = provider
+        .chat_stream(&request)
+        .await
+        .expect("Failed to start stream");
 
     let mut accumulated = String::new();
     let mut finished = false;
@@ -86,8 +89,8 @@ async fn test_openai_responses_streaming_sse() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let provider = OpenAiResponsesProvider::new("test_key")
-        .with_base_url(format!("http://{addr}/v1"));
+    let provider =
+        OpenAiResponsesProvider::new("test_key").with_base_url(format!("http://{addr}/v1"));
 
     let request = ChatRequest {
         model: "gpt-4o".to_string(),
@@ -97,7 +100,10 @@ async fn test_openai_responses_streaming_sse() {
         max_tokens: None,
     };
 
-    let mut stream = provider.chat_stream(&request).await.expect("Failed to start stream");
+    let mut stream = provider
+        .chat_stream(&request)
+        .await
+        .expect("Failed to start stream");
 
     let mut accumulated = String::new();
     let mut finished = false;
@@ -152,7 +158,10 @@ async fn test_anthropic_messages_streaming_sse() {
         max_tokens: None,
     };
 
-    let mut stream = provider.chat_stream(&request).await.expect("Failed to start stream");
+    let mut stream = provider
+        .chat_stream(&request)
+        .await
+        .expect("Failed to start stream");
 
     let mut accumulated = String::new();
     let mut finished = false;
@@ -172,13 +181,13 @@ async fn test_anthropic_messages_streaming_sse() {
 
 #[tokio::test]
 async fn test_agent_run_standalone_stream() {
-    use std::sync::Arc;
     use async_trait::async_trait;
     use kanon_llm::agent::Agent;
     use kanon_llm::error::GatewayError;
-    use kanon_llm::gateway::types::{ChatChunk, ChatResponse};
     use kanon_llm::gateway::ChatChunkStream;
+    use kanon_llm::gateway::types::{ChatChunk, ChatResponse};
     use kanon_llm::memory::SlidingWindowMemory;
+    use std::sync::Arc;
 
     struct MockAgentStreamProvider;
 
@@ -193,7 +202,10 @@ async fn test_agent_run_standalone_stream() {
             })
         }
 
-        async fn chat_stream(&self, _request: &ChatRequest) -> Result<ChatChunkStream, GatewayError> {
+        async fn chat_stream(
+            &self,
+            _request: &ChatRequest,
+        ) -> Result<ChatChunkStream, GatewayError> {
             let (tx, rx) = tokio::sync::mpsc::channel(4);
             tokio::spawn(async move {
                 let _ = tx.send(Ok(ChatChunk::delta("Token 1, "))).await;
@@ -240,7 +252,10 @@ async fn test_agent_run_standalone_stream() {
     assert_eq!(messages[1].role, kanon_llm::gateway::types::Role::User);
     assert_eq!(messages[1].content.as_deref(), Some("Tell me something"));
     assert_eq!(messages[2].role, kanon_llm::gateway::types::Role::Assistant);
-    assert_eq!(messages[2].content.as_deref(), Some("Token 1, Token 2, Token 3"));
+    assert_eq!(
+        messages[2].content.as_deref(),
+        Some("Token 1, Token 2, Token 3")
+    );
 }
 
 /// Verifies that OpenAI-compatible streaming decodes reasoning_content alongside text content.
@@ -279,7 +294,10 @@ async fn test_openai_chat_streaming_reasoning_sse() {
         max_tokens: None,
     };
 
-    let mut stream = provider.chat_stream(&request).await.expect("Failed to start stream");
+    let mut stream = provider
+        .chat_stream(&request)
+        .await
+        .expect("Failed to start stream");
 
     let mut accumulated_content = String::new();
     let mut accumulated_reasoning = String::new();
@@ -301,4 +319,3 @@ async fn test_openai_chat_streaming_reasoning_sse() {
     assert_eq!(accumulated_reasoning, "I think therefore ");
     assert_eq!(accumulated_content, "The answer is 42.");
 }
-

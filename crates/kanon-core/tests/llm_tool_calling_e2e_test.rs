@@ -18,14 +18,14 @@
 
 mod common;
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::{mpsc, oneshot};
 
@@ -37,7 +37,9 @@ use kanon_llm::memory::ConversationManager;
 use kanon_llm::tool_router::ToolRouter;
 use kanon_proto::v1::bot_api_service_client::BotApiServiceClient;
 use kanon_proto::v1::message_segment::Segment;
-use kanon_proto::v1::{DeliverMessageRequest, IngestEventRequest, MessageSegment, PipelineEventRequest, TextSegment};
+use kanon_proto::v1::{
+    DeliverMessageRequest, IngestEventRequest, MessageSegment, PipelineEventRequest, TextSegment,
+};
 use kanon_transport::connect_ipc;
 
 /// Locates the compiled `demo-rust-plugin` binary in the target directory.
@@ -120,7 +122,10 @@ async fn mock_chat_completions(
         Json(response)
     } else {
         // Turn 1: Model receives tool result and produces the final natural language answer
-        let messages = payload.get("messages").and_then(|m| m.as_array()).expect("Messages array");
+        let messages = payload
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .expect("Messages array");
 
         // Verify that the conversation history includes the tool response message
         let has_tool_response = messages.iter().any(|m| {
@@ -155,9 +160,7 @@ async fn mock_chat_completions(
 }
 
 /// Spawns the lightweight Mock LLM HTTP server on a local ephemeral port.
-async fn start_mock_llm_server(
-    state: MockServerState,
-) -> (SocketAddr, oneshot::Sender<()>) {
+async fn start_mock_llm_server(state: MockServerState) -> (SocketAddr, oneshot::Sender<()>) {
     let app = Router::new()
         .route("/v1/chat/completions", post(mock_chat_completions))
         .with_state(state);
@@ -206,7 +209,10 @@ async fn test_llm_tool_calling_e2e_lifecycle() {
     assert!(core_sock.exists(), "Core socket file must exist");
 
     // 3. Initialize Supervisor and spawn out-of-process demo-rust-plugin
-    let supervisor = Arc::new(Supervisor::new(Some(run_dir.clone()), Some(core_sock.clone())));
+    let supervisor = Arc::new(Supervisor::new(
+        Some(run_dir.clone()),
+        Some(core_sock.clone()),
+    ));
     let plugin_bin = find_demo_plugin_bin();
     let managed_host = supervisor
         .spawn_plugin("demo_rust", &plugin_bin, &[])
@@ -239,9 +245,7 @@ async fn test_llm_tool_calling_e2e_lifecycle() {
         .await
         .expect("adapter registration");
 
-    let engine = Arc::new(
-        PipelineEngine::new(supervisor.clone()).with_tool_router(tool_router),
-    );
+    let engine = Arc::new(PipelineEngine::new(supervisor.clone()).with_tool_router(tool_router));
     let worker_handle = engine.clone().start_worker(event_rx);
     let dispatcher_handle = engine
         .start_outbound_dispatcher()
@@ -316,7 +320,11 @@ async fn test_llm_tool_calling_e2e_lifecycle() {
     // Verify conversation memory contains the entire multi-turn trajectory
     let session_key = ConversationManager::make_session_key("chan_chat", "alice");
     let history = memory.get_messages(&session_key);
-    assert_eq!(history.len(), 4, "Expected User -> Assistant (tools) -> Tool -> Assistant");
+    assert_eq!(
+        history.len(),
+        4,
+        "Expected User -> Assistant (tools) -> Tool -> Assistant"
+    );
 
     // =========================================================================
     // Clean Shutdown and Resource Teardown
@@ -332,5 +340,8 @@ async fn test_llm_tool_calling_e2e_lifecycle() {
     let _ = core_shutdown_tx.send(());
     let _ = server_task.await;
 
-    assert!(!core_sock.exists(), "Core socket must be removed on shutdown");
+    assert!(
+        !core_sock.exists(),
+        "Core socket must be removed on shutdown"
+    );
 }

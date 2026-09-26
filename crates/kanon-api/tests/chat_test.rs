@@ -252,9 +252,20 @@ async fn chat_stream_with_reasoning_yields_reasoning_and_delta() {
     .await;
 
     assert_eq!(status, 200);
-    assert!(content_type.starts_with("text/event-stream"), "content_type: {content_type}");
-    assert!(body.contains("Thinking step 1..."), "body missing reasoning: {body}");
-    assert!(body.contains("Final answer text."), "body missing delta: {body}");
-    assert!(body.contains("\"type\":\"done\""), "body missing done event: {body}");
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "content_type: {content_type}"
+    );
+    assert!(
+        body.contains("Thinking step 1..."),
+        "body missing reasoning: {body}"
+    );
+    assert!(
+        body.contains("Final answer text."),
+        "body missing delta: {body}"
+    );
+    assert!(
+        body.contains("\"type\":\"done\""),
+        "body missing done event: {body}"
+    );
 }
-

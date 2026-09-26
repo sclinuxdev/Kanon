@@ -6,10 +6,10 @@
 //! Ships with [`SlidingWindowMemory`] (also aliased as [`ConversationManager`]) as the
 //! default high-performance in-memory implementation backed by a lock-free sharded [`DashMap`].
 
-use std::collections::VecDeque;
-use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::error::MemoryError;
 use crate::gateway::types::{ChatMessage, Role};
@@ -21,10 +21,18 @@ use crate::gateway::types::{ChatMessage, Role};
 #[async_trait]
 pub trait Memory: Send + Sync {
     /// Appends a message to the specified session history.
-    async fn push_message(&self, session_key: &str, message: ChatMessage) -> Result<(), MemoryError>;
+    async fn push_message(
+        &self,
+        session_key: &str,
+        message: ChatMessage,
+    ) -> Result<(), MemoryError>;
 
     /// Appends multiple messages in sequence.
-    async fn extend_messages(&self, session_key: &str, messages: Vec<ChatMessage>) -> Result<(), MemoryError> {
+    async fn extend_messages(
+        &self,
+        session_key: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Result<(), MemoryError> {
         for msg in messages {
             self.push_message(session_key, msg).await?;
         }
@@ -32,7 +40,8 @@ pub trait Memory: Send + Sync {
     }
 
     /// Sets or updates the system persona prompt for a session.
-    async fn set_system_prompt(&self, session_key: &str, prompt: String) -> Result<(), MemoryError>;
+    async fn set_system_prompt(&self, session_key: &str, prompt: String)
+    -> Result<(), MemoryError>;
 
     /// Returns the active system prompt for a session if configured.
     async fn get_system_prompt(&self, session_key: &str) -> Result<Option<String>, MemoryError>;
@@ -176,7 +185,8 @@ impl SessionMemory {
 
         if let Some(budget) = self.max_tokens_budget {
             while !self.messages.is_empty() {
-                let current_tokens = crate::token::estimate_conversation_tokens(&self.get_messages());
+                let current_tokens =
+                    crate::token::estimate_conversation_tokens(&self.get_messages());
                 if current_tokens <= budget {
                     break;
                 }
@@ -254,7 +264,9 @@ impl SlidingWindowMemory {
     pub fn push_message_sync(&self, session_key: &str, message: ChatMessage) {
         self.sessions
             .entry(session_key.to_string())
-            .or_insert_with(|| SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens))
+            .or_insert_with(|| {
+                SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens)
+            })
             .push_message(message);
     }
 
@@ -270,7 +282,9 @@ impl SlidingWindowMemory {
     pub fn set_system_prompt_sync(&self, session_key: &str, prompt: impl Into<String>) {
         self.sessions
             .entry(session_key.to_string())
-            .or_insert_with(|| SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens))
+            .or_insert_with(|| {
+                SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens)
+            })
             .set_system_prompt(prompt);
     }
 
@@ -312,18 +326,27 @@ impl SlidingWindowMemory {
 
 #[async_trait]
 impl Memory for SlidingWindowMemory {
-    async fn push_message(&self, session_key: &str, message: ChatMessage) -> Result<(), MemoryError> {
+    async fn push_message(
+        &self,
+        session_key: &str,
+        message: ChatMessage,
+    ) -> Result<(), MemoryError> {
         self.push_message_sync(session_key, message);
         Ok(())
     }
 
-    async fn set_system_prompt(&self, session_key: &str, prompt: String) -> Result<(), MemoryError> {
+    async fn set_system_prompt(
+        &self,
+        session_key: &str,
+        prompt: String,
+    ) -> Result<(), MemoryError> {
         self.set_system_prompt_sync(session_key, prompt);
         Ok(())
     }
 
     async fn get_system_prompt(&self, session_key: &str) -> Result<Option<String>, MemoryError> {
-        Ok(self.sessions
+        Ok(self
+            .sessions
             .get(session_key)
             .and_then(|s| s.system_prompt().map(|p| p.to_string())))
     }
@@ -350,7 +373,9 @@ impl Memory for SlidingWindowMemory {
         let mut session = self
             .sessions
             .entry(session_key.to_string())
-            .or_insert_with(|| SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens));
+            .or_insert_with(|| {
+                SessionMemory::with_budget(self.default_max_messages, self.default_max_tokens)
+            });
         session.clear_messages();
         if let Some(prompt) = system_prompt {
             session.set_system_prompt(prompt);
@@ -362,15 +387,27 @@ impl Memory for SlidingWindowMemory {
 
 #[async_trait]
 impl Memory for Arc<dyn Memory> {
-    async fn push_message(&self, session_key: &str, message: ChatMessage) -> Result<(), MemoryError> {
+    async fn push_message(
+        &self,
+        session_key: &str,
+        message: ChatMessage,
+    ) -> Result<(), MemoryError> {
         (**self).push_message(session_key, message).await
     }
 
-    async fn extend_messages(&self, session_key: &str, messages: Vec<ChatMessage>) -> Result<(), MemoryError> {
+    async fn extend_messages(
+        &self,
+        session_key: &str,
+        messages: Vec<ChatMessage>,
+    ) -> Result<(), MemoryError> {
         (**self).extend_messages(session_key, messages).await
     }
 
-    async fn set_system_prompt(&self, session_key: &str, prompt: String) -> Result<(), MemoryError> {
+    async fn set_system_prompt(
+        &self,
+        session_key: &str,
+        prompt: String,
+    ) -> Result<(), MemoryError> {
         (**self).set_system_prompt(session_key, prompt).await
     }
 
@@ -396,7 +433,8 @@ impl Memory for Arc<dyn Memory> {
         system_prompt: Option<String>,
         messages: Vec<ChatMessage>,
     ) -> Result<(), MemoryError> {
-        (**self).replace_history(session_key, system_prompt, messages).await
+        (**self)
+            .replace_history(session_key, system_prompt, messages)
+            .await
     }
 }
-

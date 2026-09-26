@@ -58,7 +58,9 @@ async fn create_reports_live_adapter_status() {
 
     let instance = &body["instance"];
     assert_eq!(instance["enabled"], json!(true));
-    let adapters = instance["adapter_status"].as_array().expect("adapter status");
+    let adapters = instance["adapter_status"]
+        .as_array()
+        .expect("adapter status");
     assert_eq!(adapters.len(), 1);
     assert_eq!(adapters[0]["known"], json!(true));
     assert_eq!(adapters[0]["kind"], json!("plugin"));

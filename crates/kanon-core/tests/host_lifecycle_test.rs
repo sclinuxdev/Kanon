@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use kanon_core::supervisor::{HOST_SHUTDOWN_GRACE, terminate_child};
-use tokio::io::{AsyncBufReadExt, BufReader};
 use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 /// Spawns a shell child that has *already installed* its signal disposition.

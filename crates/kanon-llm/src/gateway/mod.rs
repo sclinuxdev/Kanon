@@ -196,4 +196,25 @@ pub fn provider_from_env() -> Result<Option<ProviderSetup>, String> {
     Ok(Some((provider, model)))
 }
 
+/// Returns the part of a model response that may be shown to an end user.
+///
+/// OpenAI-compatible backends that expose a reasoning channel (DeepSeek `reasoning_content`,
+/// and compatible gateways) have that channel folded into the response text by
+/// [`providers::OpenAiChatProvider`] as a leading `<think>…</think>` block, so the management
+/// console can render reasoning separately from the answer. That encoding is a *display*
+/// convention: anything sent to a chat platform must be stripped first, otherwise users read
+/// the model's internal chain of thought. This function is the single decoder for that
+/// convention; text without a block is returned unchanged and borrows the input.
+pub fn strip_reasoning_tags(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix("<think>") else {
+        return text;
+    };
+    // A truncated block (stream cut off before `</think>`) carries no user-visible answer at
+    // all, so it collapses to an empty reply rather than leaking the partial reasoning.
+    match rest.split_once("</think>") {
+        Some((_, answer)) => answer.trim_start(),
+        None => "",
+    }
+}
 

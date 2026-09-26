@@ -35,7 +35,7 @@ pub use gateway::providers::{
 pub use gateway::{
     ChatChunk, ChatChunkStream, ChatMessage, ChatRequest, ChatResponse, LlmGateway, LlmProvider,
     ProviderSetup, Role, SUPPORTED_PROTOCOLS, TokenUsage, ToolCall, ToolDefinition, build_provider,
-    provider_from_env,
+    provider_from_env, strip_reasoning_tags,
 };
 pub use memory::{ConversationManager, Memory, SessionMemory, SlidingWindowMemory};
 pub use prompt::{

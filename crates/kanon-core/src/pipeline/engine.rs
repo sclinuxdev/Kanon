@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::task::JoinHandle;
 
 use kanon_llm::tool_router::ToolRouter;
-use kanon_llm::AgentSlot;
+use kanon_llm::{AgentSlot, strip_reasoning_tags};
 use kanon_proto::v1::message_segment::Segment;
 use kanon_proto::v1::{
     DeliverMessageRequest, IngestEventRequest, MessageSegment, PipelineEventRequest,
@@ -687,24 +687,30 @@ impl PipelineEngine {
             }
 
             match router.execute(&session_id, &text_candidate, &active_hosts).await {
-                Ok(output) if !output.content.is_empty() => {
+                Ok(output) => {
+                    // The model's reasoning channel arrives folded into the completion text as a
+                    // `<think>` block (a console display convention). Chat platforms must never
+                    // receive it, so the delivered answer is stripped to the visible part only.
+                    let answer = strip_reasoning_tags(&output.content);
+                    if answer.is_empty() {
+                        tracing::debug!("LLM produced no user-visible answer; passing downstream");
+                        return PipelineResult::Passed(filtered_event);
+                    }
+
                     let reply = MessageSegment {
                         segment: Some(Segment::Text(kanon_proto::v1::TextSegment {
-                            content: output.content.clone(),
+                            content: answer.to_string(),
                         })),
                     };
                     self.observe(PipelineStage::LlmReplied {
                         event_id,
                         session_id,
-                        content_length: output.content.chars().count(),
+                        content_length: answer.chars().count(),
                     });
                     return PipelineResult::LlmReplied {
-                        content: output.content,
+                        content: answer.to_string(),
                         replies: vec![reply],
                     };
-                }
-                Ok(_) => {
-                    tracing::debug!("LLM returned empty completion; passing downstream");
                 }
                 Err(e) => {
                     tracing::error!(

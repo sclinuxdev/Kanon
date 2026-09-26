@@ -566,7 +566,13 @@ Rust 核心全权主导 LLM 的生命周期与推理编排，确保高并发下�
   - 支持 Token 预算感知滑动窗口：自动估算历史 Token，超出限制时自动进行首尾修剪或调用轻量模型生成摘要压缩。
   - 支持 System Persona（人设提示词）动态装配。
 
-### 8.2 Tool Calling 跨语言执行状态机闭环
+### 8.2 模型推理通道的可见性边界 (Reasoning Visibility)
+
+- OpenAI 兼容后端（如 DeepSeek 的 `reasoning_content`）返回的推理内容会被 provider 折叠为响应文本前置的 `<think>…</think>` 块，仅供管理控制台（Playground）拆分展示；**该编码只是显示约定，绝不可作为回复下发**。
+- 因此出站路径（`PipelineEngine` 的 LLM 分支）在构造平台回复前必须调用 `kanon_llm::strip_reasoning_tags` 剥离推理块，只投递用户可见答案；推理块被截断（流式未闭合）时答案视为空，宁可不回复也不泄露思维链。
+- 该解码器与 provider 的编码器成对维护，禁止在适配器/插件内各自实现标签解析。
+
+### 8.3 Tool Calling 跨语言执行状态机闭环
 
 ```mermaid
 sequenceDiagram

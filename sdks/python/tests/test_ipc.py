@@ -219,3 +219,47 @@ class TestCoreWatchdog(unittest.IsolatedAsyncioTestCase):
         await watchdog.stop()
 
         self.assertEqual(reasons, [])
+
+
+class TestBoundedShutdown(unittest.IsolatedAsyncioTestCase):
+    """A hung plugin teardown must never keep a host alive as a ghost bot.
+
+    The failure mode is real: closing a platform WebSocket can wait for a handshake that never
+    arrives, and a host that stays alive after its core is gone keeps serving the platform — the
+    next core then answers every message twice.
+    """
+
+    async def test_a_hung_step_is_abandoned_within_the_timeout(self) -> None:
+        from kanon_host.main import _bounded
+
+        cancelled = asyncio.Event()
+
+        async def hangs() -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        await _bounded("hung step", hangs(), 0.05)
+        self.assertTrue(cancelled.is_set(), "the hung step must be cancelled")
+
+    async def test_a_failing_step_does_not_abort_shutdown(self) -> None:
+        from kanon_host.main import _bounded
+
+        async def fails() -> None:
+            raise RuntimeError("gateway already closed")
+
+        # Returning at all is the assertion: shutdown must continue past a broken step.
+        await _bounded("failing step", fails(), 1.0)
+
+    async def test_a_fast_step_completes(self) -> None:
+        from kanon_host.main import _bounded
+
+        done = asyncio.Event()
+
+        async def quick() -> None:
+            done.set()
+
+        await _bounded("quick step", quick(), 1.0)
+        self.assertTrue(done.is_set())

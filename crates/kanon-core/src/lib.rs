@@ -11,6 +11,7 @@ pub mod ipc;
 pub mod manifest;
 pub mod mcp;
 pub mod pipeline;
+pub mod shutdown;
 pub mod skill;
 pub mod supervisor;
 pub mod toggle;
@@ -38,6 +39,7 @@ pub use pipeline::{
     NEW_SESSION_COMMAND, PipelineEngine, PipelineObserver, PipelineResult, PipelineStage,
     PreFilterChain, PreFilterOutcome,
 };
+pub use shutdown::shutdown_signal;
 pub use skill::{
     DEFAULT_SKILLS_DIR, MAX_SKILL_BYTES, ReadSkillTool, SkillCatalogHook, SkillError, SkillMeta,
     SkillStore, allowed_skills, catalog_prompt,

@@ -13,7 +13,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Optional, Type
+from typing import Any, Awaitable, Optional, Type
 
 import grpc
 from google.protobuf.json_format import MessageToDict
@@ -28,6 +28,10 @@ from kanon_sdk.context import CoreHandle, PluginContext
 from kanon_sdk.ipc import CoreWatchdog, connect_core_channel
 from kanon_sdk.plugin import Plugin
 from kanon_sdk.proto import pb, pb_grpc
+
+# Deadline for one shutdown step. Long enough for a healthy teardown (a WebSocket close, a gRPC
+# drain), short enough that a hung plugin cannot keep this host alive as a ghost.
+SHUTDOWN_STEP_TIMEOUT = 5.0
 
 
 class HostServiceImpl(pb_grpc.PluginHostServiceServicer):
@@ -337,18 +341,43 @@ async def main() -> None:
     if watchdog is not None:
         await watchdog.stop()
 
-    # Graceful shutdown
-    await plugin.on_unload()
-    await server.stop(grace=1.0)
+    # Graceful shutdown, every step bounded.
+    #
+    # A plugin's own teardown can block indefinitely: closing a platform WebSocket may wait for a
+    # close handshake that never arrives. That is precisely the situation this host must survive —
+    # the core is already gone, and a host stuck in teardown keeps its platform connection open,
+    # so the next core double-serves every message. Each step therefore has a deadline and the
+    # process exits regardless of whether it completed.
+    await _bounded("plugin teardown", plugin.on_unload(), SHUTDOWN_STEP_TIMEOUT)
+    await _bounded("gRPC server stop", server.stop(grace=1.0), SHUTDOWN_STEP_TIMEOUT)
     if core_channel is not None:
         # Closed last, after on_unload() has had the chance to stop adapter tasks
         # that may still hold the shared handle for an in-flight ingest call.
-        await core_channel.close()
+        await _bounded("core channel close", core_channel.close(), SHUTDOWN_STEP_TIMEOUT)
     if socket_path.exists():
         try:
             socket_path.unlink()
         except OSError:
             pass
+
+    print("[kanon-host] shutdown complete", flush=True)
+
+
+async def _bounded(label: str, awaitable: Awaitable[Any], timeout: float) -> None:
+    """Awaits one shutdown step, never longer than ``timeout`` seconds.
+
+    Cancelling on timeout is deliberate: a half-closed platform connection is already gone from
+    the core's point of view, and letting the step run forever would leave a ghost host behind.
+    """
+    try:
+        await asyncio.wait_for(awaitable, timeout=timeout)
+    except asyncio.TimeoutError:
+        print(
+            f"[kanon-host] {label} did not finish within {timeout}s; exiting anyway",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - shutdown continues even if a step fails
+        print(f"[kanon-host] {label} failed: {exc}", flush=True)
 
 
 if __name__ == "__main__":

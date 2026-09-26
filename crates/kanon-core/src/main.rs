@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     server
         .run(async {
-            let _ = tokio::signal::ctrl_c().await;
+            kanon_core::shutdown_signal().await;
         })
         .await?;
 

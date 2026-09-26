@@ -270,8 +270,10 @@ async fn main() -> StartupResult<()> {
 
     tracing::info!(address = %bound_addr, "Kanon node started");
 
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("Shutdown signal received; draining background tasks");
+    // SIGINT or SIGTERM: both must run the shutdown path below, which stops every plugin host.
+    // Exiting without it leaves hosts alive with their platform connections open, and the next
+    // start would serve each message twice.
+    kanon_core::shutdown_signal().await;
 
     let _ = core_shutdown_tx.send(());
     let _ = api_shutdown_tx.send(());

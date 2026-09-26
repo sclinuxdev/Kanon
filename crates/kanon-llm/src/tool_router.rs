@@ -6,27 +6,31 @@
 //! redundant string serialization, dispatches tool execution over IPC, and feeds
 //! execution results back to the model with loop recursion protection.
 
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use kanon_proto::v1::{PluginMeta, ToolCallRequest, ToolCallResponse};
 
 use crate::agent::Agent;
 use crate::error::{AgentError, ToolRouterError};
-use crate::gateway::types::ToolDefinition;
 use crate::gateway::LlmProvider;
+use crate::gateway::types::ToolDefinition;
 use crate::memory::Memory;
 
 /// Abstract interface for a plugin host capable of executing tool calls.
 ///
 /// Implemented by `ManagedHost` in `kanon-core` and mock hosts in unit tests.
 #[async_trait]
+#[async_trait::async_trait]
 pub trait ToolHost: Send + Sync {
     /// Unique identifier of the host process (e.g. `host_demo_rust`).
     fn host_id(&self) -> &str;
 
-    /// Metadata descriptors of all plugins running on this host.
-    fn plugin_metas(&self) -> &[PluginMeta];
+    /// Metadata descriptors of all plugins (or MCP servers) reachable through this host.
+    ///
+    /// Returned by value: a host whose tool list is refreshed at runtime (an MCP server whose
+    /// connection is re-established) cannot hand out a borrowed slice of lock-guarded state.
+    fn plugin_metas(&self) -> Vec<PluginMeta>;
 
     /// Invokes a declared tool on this host via gRPC IPC.
     async fn call_tool(&self, req: ToolCallRequest) -> Result<ToolCallResponse, tonic::Status>;
@@ -60,7 +64,13 @@ pub struct ToolRouterOutput {
 /// Both OpenAI and Anthropic require tool names to adhere to `^[a-zA-Z0-9_-]{1,64}$`.
 pub fn sanitize_tool_identifier(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -74,11 +84,13 @@ pub fn namespaced_tool_name(plugin_id: &str, tool_name: &str) -> String {
 ///
 /// Prevents name collision: if multiple plugins declare tools with identical names,
 /// they are automatically disambiguated with namespacing (`<plugin_id>__<tool_name>`).
-pub fn aggregate_tools<H: ToolHost>(hosts: &[Arc<H>]) -> Vec<ToolDefinition> {
+pub fn aggregate_tools(hosts: &[Arc<dyn ToolHost>]) -> Vec<ToolDefinition> {
     // 1. First pass: count tool name occurrences across all plugins
-    let mut name_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut name_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for host in hosts {
-        for plugin in host.plugin_metas() {
+        let metas = host.plugin_metas();
+        for plugin in &metas {
             for tool in &plugin.tools {
                 *name_counts.entry(tool.name.clone()).or_insert(0) += 1;
             }
@@ -88,7 +100,8 @@ pub fn aggregate_tools<H: ToolHost>(hosts: &[Arc<H>]) -> Vec<ToolDefinition> {
     // 2. Second pass: build definitions, namespacing any collided names
     let mut definitions = Vec::new();
     for host in hosts {
-        for plugin in host.plugin_metas() {
+        let metas = host.plugin_metas();
+        for plugin in &metas {
             for tool in &plugin.tools {
                 let parameters = match &tool.parameters {
                     Some(s) => prost_struct_to_json(s.clone()),
@@ -213,11 +226,11 @@ impl ToolRouter {
     }
 
     /// Executes the tool calling loop for an incoming conversational message.
-    pub async fn execute<H: ToolHost>(
+    pub async fn execute(
         &self,
         session_id: &str,
         user_input: &str,
-        hosts: &[Arc<H>],
+        hosts: &[Arc<dyn ToolHost>],
     ) -> Result<ToolRouterOutput, ToolRouterError> {
         match self.agent.run(session_id, user_input, hosts).await {
             Ok(output) => Ok(ToolRouterOutput {
@@ -227,9 +240,9 @@ impl ToolRouter {
             Err(AgentError::Gateway(e)) => Err(ToolRouterError::Gateway(e)),
             Err(AgentError::Rpc(s)) => Err(ToolRouterError::Rpc(s)),
             Err(AgentError::ToolNotFound(name)) => Err(ToolRouterError::ToolNotFound(name)),
-            Err(AgentError::Memory(m)) => {
-                Err(ToolRouterError::Gateway(crate::error::GatewayError::InvalidResponse(m)))
-            }
+            Err(AgentError::Memory(m)) => Err(ToolRouterError::Gateway(
+                crate::error::GatewayError::InvalidResponse(m),
+            )),
         }
     }
 }
@@ -282,22 +295,25 @@ pub fn json_to_prost_value(val: &serde_json::Value) -> prost_types::Value {
     let kind = match val {
         serde_json::Value::Null => Some(prost_types::value::Kind::NullValue(0)),
         serde_json::Value::Bool(b) => Some(prost_types::value::Kind::BoolValue(*b)),
-        serde_json::Value::Number(n) => {
-            Some(prost_types::value::Kind::NumberValue(n.as_f64().unwrap_or(0.0)))
-        }
+        serde_json::Value::Number(n) => Some(prost_types::value::Kind::NumberValue(
+            n.as_f64().unwrap_or(0.0),
+        )),
         serde_json::Value::String(s) => Some(prost_types::value::Kind::StringValue(s.clone())),
         serde_json::Value::Array(arr) => {
             let values = arr.iter().map(json_to_prost_value).collect();
-            Some(prost_types::value::Kind::ListValue(prost_types::ListValue { values }))
+            Some(prost_types::value::Kind::ListValue(
+                prost_types::ListValue { values },
+            ))
         }
         serde_json::Value::Object(map) => {
             let mut fields = std::collections::BTreeMap::new();
             for (k, v) in map {
                 fields.insert(k.clone(), json_to_prost_value(v));
             }
-            Some(prost_types::value::Kind::StructValue(prost_types::Struct { fields }))
+            Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                fields,
+            }))
         }
     };
     prost_types::Value { kind }
 }
-

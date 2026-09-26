@@ -9,7 +9,7 @@ mod common;
 use std::path::PathBuf;
 
 use axum::http::{Method, StatusCode};
-use kanon_api::{ApiState, PluginStateStore};
+use kanon_api::{ApiState, ToggleStore};
 use serde_json::{Value, json};
 
 /// Manifest written to the scratch plugin directory so the catalog can rediscover a stopped host.
@@ -27,15 +27,13 @@ priority = 120
 
 /// Builds gateway state whose plugin directory mirrors what the supervisor is running, plus a
 /// persisted state store the test can inspect.
-async fn plugin_state_fixture(
-    config_dir: PathBuf,
-) -> (ApiState, std::sync::Arc<PluginStateStore>) {
+async fn plugin_state_fixture(config_dir: PathBuf) -> (ApiState, std::sync::Arc<ToggleStore>) {
     let plugins_dir = config_dir.join("plugins").join("fixture");
     std::fs::create_dir_all(&plugins_dir).expect("create plugin dir");
     std::fs::write(plugins_dir.join("plugin.toml"), MANIFEST).expect("write manifest");
 
     let store = std::sync::Arc::new(
-        PluginStateStore::open(config_dir.join("plugins_state.json"))
+        ToggleStore::open(config_dir.join("toggles.json"))
             .await
             .expect("open state store"),
     );
@@ -103,7 +101,11 @@ async fn disabling_stops_the_host_and_keeps_the_plugin_listed() {
         "disabling must stop the host process"
     );
     // …the choice is persisted…
-    assert!(!store.is_enabled(common::FIXTURE_PLUGIN_ID).await);
+    assert!(
+        !store
+            .is_enabled(kanon_core::PLUGIN_SECTION, common::FIXTURE_PLUGIN_ID)
+            .await
+    );
     // …and the catalog still lists it as disabled, so the console can re-enable it.
     let (_, body) = common::send_json(&app, Method::GET, "/api/v1/plugins", None).await;
     let view = plugin_entry(&body, common::FIXTURE_PLUGIN_ID);
@@ -128,22 +130,12 @@ async fn disabling_twice_reports_that_nothing_changed() {
     let app = kanon_api::app(state);
 
     let uri = format!("/api/v1/plugins/{}/enabled", common::FIXTURE_PLUGIN_ID);
-    let (status, _) = common::send_json(
-        &app,
-        Method::PUT,
-        &uri,
-        Some(json!({ "enabled": false })),
-    )
-    .await;
+    let (status, _) =
+        common::send_json(&app, Method::PUT, &uri, Some(json!({ "enabled": false }))).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, body) = common::send_json(
-        &app,
-        Method::PUT,
-        &uri,
-        Some(json!({ "enabled": false })),
-    )
-    .await;
+    let (status, body) =
+        common::send_json(&app, Method::PUT, &uri, Some(json!({ "enabled": false }))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["applied"], json!(false), "idempotent call: {body}");
 }
@@ -195,7 +187,11 @@ async fn enabling_a_stopped_plugin_reports_a_start_failure_instead_of_pretending
 
     // Intent is recorded even though the launch failed: the operator asked for this plugin to be
     // enabled, and a transient cause (missing runtime, not yet built) must not silently erase that.
-    assert!(store.is_enabled(common::FIXTURE_PLUGIN_ID).await);
+    assert!(
+        store
+            .is_enabled(kanon_core::PLUGIN_SECTION, common::FIXTURE_PLUGIN_ID)
+            .await
+    );
 
     // The catalog reflects the mismatch honestly: enabled, but without a running host.
     let (_, catalog) = common::send_json(&app, Method::GET, "/api/v1/plugins", None).await;

@@ -11,21 +11,21 @@
 //! - Extensible lifecycle hooks via [`AgentHook`] for RAG, guardrails, and tracing;
 //! - Standalone execution mode via [`Agent::run_standalone`].
 
+use async_trait::async_trait;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use async_trait::async_trait;
 
-use kanon_proto::v1::{
-    tool_call_request, tool_call_response, ToolCallRequest,
-};
+use kanon_proto::v1::{ToolCallRequest, tool_call_request, tool_call_response};
 
 use crate::error::AgentError;
-use crate::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role, ToolCall, ToolDefinition};
+use crate::gateway::types::{
+    ChatMessage, ChatRequest, ChatResponse, Role, ToolCall, ToolDefinition,
+};
 use crate::gateway::{ChatChunk, ChatChunkStream, LlmProvider};
 use crate::memory::{Memory, SlidingWindowMemory};
 use crate::tool_router::{
-    aggregate_tools, json_to_prost_struct, prost_struct_to_json, ExecutedToolCall, ToolHost,
+    ExecutedToolCall, ToolHost, aggregate_tools, json_to_prost_struct, prost_struct_to_json,
 };
 use tokio_stream::StreamExt;
 
@@ -84,10 +84,7 @@ pub trait AgentTool: Send + Sync {
 
 /// Helper type for asynchronous native tool closures.
 pub type NativeToolFn = Arc<
-    dyn Fn(
-        &str,
-        serde_json::Value,
-    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
+    dyn Fn(&str, serde_json::Value) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send>>
         + Send
         + Sync,
 >;
@@ -132,19 +129,31 @@ impl AgentTool for NativeTool {
 #[async_trait]
 pub trait AgentHook: Send + Sync {
     /// Invoked immediately before transmitting the request payload to the model provider.
-    async fn on_llm_request(&self, _session_id: &str, _request: &mut ChatRequest) -> Result<(), AgentError> {
+    async fn on_llm_request(
+        &self,
+        _session_id: &str,
+        _request: &mut ChatRequest,
+    ) -> Result<(), AgentError> {
         Ok(())
     }
 
     /// Invoked immediately upon receiving a completion response from the model.
-    async fn on_llm_response(&self, _session_id: &str, _response: &mut ChatResponse) -> Result<(), AgentError> {
+    async fn on_llm_response(
+        &self,
+        _session_id: &str,
+        _response: &mut ChatResponse,
+    ) -> Result<(), AgentError> {
         Ok(())
     }
 
     /// Invoked before dispatching a tool execution.
     ///
     /// Return `Ok(true)` to permit execution, or `Ok(false)` to veto / reject execution.
-    async fn on_before_tool_call(&self, _session_id: &str, _call: &ToolCall) -> Result<bool, AgentError> {
+    async fn on_before_tool_call(
+        &self,
+        _session_id: &str,
+        _call: &ToolCall,
+    ) -> Result<bool, AgentError> {
         Ok(true)
     }
 
@@ -165,20 +174,23 @@ pub trait AgentHook: Send + Sync {
 pub struct NoopHost;
 
 #[async_trait]
+#[async_trait::async_trait]
 impl ToolHost for NoopHost {
     fn host_id(&self) -> &str {
         "noop"
     }
 
-    fn plugin_metas(&self) -> &[kanon_proto::v1::PluginMeta] {
-        &[]
+    fn plugin_metas(&self) -> Vec<kanon_proto::v1::PluginMeta> {
+        Vec::new()
     }
 
     async fn call_tool(
         &self,
         _req: ToolCallRequest,
     ) -> Result<kanon_proto::v1::ToolCallResponse, tonic::Status> {
-        Err(tonic::Status::not_found("No external plugin host available"))
+        Err(tonic::Status::not_found(
+            "No external plugin host available",
+        ))
     }
 }
 
@@ -259,8 +271,7 @@ impl Agent {
         session_id: &str,
         user_input: &str,
     ) -> Result<AgentOutput, AgentError> {
-        let empty_hosts: [Arc<NoopHost>; 0] = [];
-        self.run(session_id, user_input, &empty_hosts).await
+        self.run(session_id, user_input, &[]).await
     }
 
     /// Executes the agent reasoning loop for an inbound message.
@@ -273,17 +284,19 @@ impl Agent {
     /// 5. Invokes lifecycle hooks around LLM requests, tool authorizations, and completions;
     /// 6. Dispatches tool calls (in-process for native tools, gRPC IPC for plugin tools);
     /// 7. Stores assistant reply in memory and returns [`AgentOutput`].
-    pub async fn run<H: ToolHost>(
+    pub async fn run(
         &self,
         session_id: &str,
         user_input: &str,
-        hosts: &[Arc<H>],
+        hosts: &[Arc<dyn ToolHost>],
     ) -> Result<AgentOutput, AgentError> {
         // 1. Ensure system prompt is established for this session if configured
         if let Some(ref prompt) = self.system_prompt
             && self.memory.get_system_prompt(session_id).await?.is_none()
         {
-            self.memory.set_system_prompt(session_id, prompt.clone()).await?;
+            self.memory
+                .set_system_prompt(session_id, prompt.clone())
+                .await?;
         }
 
         // 2. Push user message to memory
@@ -411,7 +424,8 @@ impl Agent {
                 }
                 if !permitted {
                     tracing::info!(agent = %self.name, tool = %call.name, "Tool call was vetoed by agent hook");
-                    let veto_msg = format!("Tool '{}' execution was denied by agent policy", call.name);
+                    let veto_msg =
+                        format!("Tool '{}' execution was denied by agent policy", call.name);
                     self.memory
                         .push_message(session_id, ChatMessage::tool_response(&call.id, &veto_msg))
                         .await?;
@@ -426,12 +440,15 @@ impl Agent {
                 }
 
                 // Branch A: Check registered native in-process tools
-                if let Some(native_tool) = self.tools.iter().find(|t| t.definition().name == call.name) {
+                if let Some(native_tool) =
+                    self.tools.iter().find(|t| t.definition().name == call.name)
+                {
                     tracing::debug!(agent = %self.name, tool = %call.name, "Executing native tool in-process");
-                    let (result_str, is_success) = match native_tool.call(session_id, call.arguments.clone()).await {
-                        Ok(res) => (res, true),
-                        Err(err) => (format!("Error: {err}"), false),
-                    };
+                    let (result_str, is_success) =
+                        match native_tool.call(session_id, call.arguments.clone()).await {
+                            Ok(res) => (res, true),
+                            Err(err) => (format!("Error: {err}"), false),
+                        };
 
                     executed_tools.push(ExecutedToolCall {
                         call_id: call.id.clone(),
@@ -442,15 +459,22 @@ impl Agent {
                     });
 
                     for hook in &self.hooks {
-                        hook.on_after_tool_call(session_id, &call, &result_str, is_success).await?;
+                        hook.on_after_tool_call(session_id, &call, &result_str, is_success)
+                            .await?;
                     }
 
                     self.memory
-                        .push_message(session_id, ChatMessage::tool_response(&call.id, &result_str))
+                        .push_message(
+                            session_id,
+                            ChatMessage::tool_response(&call.id, &result_str),
+                        )
                         .await?;
 
                     if !is_success && self.config.stop_on_tool_failure {
-                        return Err(AgentError::Memory(format!("Native tool '{}' failed: {result_str}", call.name)));
+                        return Err(AgentError::Memory(format!(
+                            "Native tool '{}' failed: {result_str}",
+                            call.name
+                        )));
                     }
                     continue;
                 }
@@ -530,7 +554,8 @@ impl Agent {
                         };
 
                         for hook in &self.hooks {
-                            hook.on_after_tool_call(session_id, &call, &result_str, is_success).await?;
+                            hook.on_after_tool_call(session_id, &call, &result_str, is_success)
+                                .await?;
                         }
 
                         self.memory
@@ -585,22 +610,23 @@ impl Agent {
         session_id: &str,
         user_input: &str,
     ) -> Result<ChatChunkStream, AgentError> {
-        let empty_hosts: [Arc<NoopHost>; 0] = [];
-        self.run_stream(session_id, user_input, &empty_hosts).await
+        self.run_stream(session_id, user_input, &[]).await
     }
 
     /// Executes the agent reasoning loop with tool resolution, streaming the final assistant response.
-    pub async fn run_stream<H: ToolHost>(
+    pub async fn run_stream(
         &self,
         session_id: &str,
         user_input: &str,
-        hosts: &[Arc<H>],
+        hosts: &[Arc<dyn ToolHost>],
     ) -> Result<ChatChunkStream, AgentError> {
         // 1. Ensure system prompt is established
         if let Some(ref prompt) = self.system_prompt
             && self.memory.get_system_prompt(session_id).await?.is_none()
         {
-            self.memory.set_system_prompt(session_id, prompt.clone()).await?;
+            self.memory
+                .set_system_prompt(session_id, prompt.clone())
+                .await?;
         }
 
         // 2. Push user message to memory
@@ -676,23 +702,31 @@ impl Agent {
                     }
                 }
                 if !permitted {
-                    let veto_msg = format!("Tool '{}' execution was denied by agent policy", call.name);
+                    let veto_msg =
+                        format!("Tool '{}' execution was denied by agent policy", call.name);
                     self.memory
                         .push_message(session_id, ChatMessage::tool_response(&call.id, &veto_msg))
                         .await?;
                     continue;
                 }
 
-                if let Some(native_tool) = self.tools.iter().find(|t| t.definition().name == call.name) {
-                    let (result_str, is_success) = match native_tool.call(session_id, call.arguments.clone()).await {
-                        Ok(res) => (res, true),
-                        Err(err) => (format!("Error: {err}"), false),
-                    };
+                if let Some(native_tool) =
+                    self.tools.iter().find(|t| t.definition().name == call.name)
+                {
+                    let (result_str, is_success) =
+                        match native_tool.call(session_id, call.arguments.clone()).await {
+                            Ok(res) => (res, true),
+                            Err(err) => (format!("Error: {err}"), false),
+                        };
                     for hook in &self.hooks {
-                        hook.on_after_tool_call(session_id, &call, &result_str, is_success).await?;
+                        hook.on_after_tool_call(session_id, &call, &result_str, is_success)
+                            .await?;
                     }
                     self.memory
-                        .push_message(session_id, ChatMessage::tool_response(&call.id, &result_str))
+                        .push_message(
+                            session_id,
+                            ChatMessage::tool_response(&call.id, &result_str),
+                        )
                         .await?;
                     continue;
                 }
@@ -703,7 +737,10 @@ impl Agent {
                     None => {
                         let err_msg = format!("Tool '{}' not registered", call.name);
                         self.memory
-                            .push_message(session_id, ChatMessage::tool_response(&call.id, &err_msg))
+                            .push_message(
+                                session_id,
+                                ChatMessage::tool_response(&call.id, &err_msg),
+                            )
                             .await?;
                         continue;
                     }
@@ -745,16 +782,23 @@ impl Agent {
                             }
                         };
                         for hook in &self.hooks {
-                            hook.on_after_tool_call(session_id, &call, &result_str, is_success).await?;
+                            hook.on_after_tool_call(session_id, &call, &result_str, is_success)
+                                .await?;
                         }
                         self.memory
-                            .push_message(session_id, ChatMessage::tool_response(&call.id, result_str))
+                            .push_message(
+                                session_id,
+                                ChatMessage::tool_response(&call.id, result_str),
+                            )
                             .await?;
                     }
                     Err(st) => {
                         let err_msg = format!("Tool RPC failed: {st}");
                         self.memory
-                            .push_message(session_id, ChatMessage::tool_response(&call.id, &err_msg))
+                            .push_message(
+                                session_id,
+                                ChatMessage::tool_response(&call.id, &err_msg),
+                            )
                             .await?;
                     }
                 }
@@ -796,16 +840,23 @@ impl Agent {
                         let _ = tx.send(Ok(chunk)).await;
                         if is_fin {
                             if !accumulated.is_empty()
-                                && let Err(e) = memory.push_message(&sid, ChatMessage::assistant(&accumulated)).await
+                                && let Err(e) = memory
+                                    .push_message(&sid, ChatMessage::assistant(&accumulated))
+                                    .await
                             {
                                 tracing::error!(session_id = %sid, error = %e, "Failed to persist streaming assistant response to memory");
                             }
                             if let Some(ref sm) = sm_opt {
-                                let tokens = user_toks + crate::token::estimate_text_tokens(&accumulated);
+                                let tokens =
+                                    user_toks + crate::token::estimate_text_tokens(&accumulated);
                                 sm.record_turn(&sid, tokens);
                             }
                             let mut resp = crate::gateway::ChatResponse {
-                                content: if accumulated.is_empty() { None } else { Some(accumulated.clone()) },
+                                content: if accumulated.is_empty() {
+                                    None
+                                } else {
+                                    Some(accumulated.clone())
+                                },
                                 tool_calls: Vec::new(),
                                 finish_reason: fin_reason,
                                 usage: None,
@@ -824,7 +875,9 @@ impl Agent {
             }
 
             if !accumulated.is_empty()
-                && let Err(e) = memory.push_message(&sid, ChatMessage::assistant(&accumulated)).await
+                && let Err(e) = memory
+                    .push_message(&sid, ChatMessage::assistant(&accumulated))
+                    .await
             {
                 tracing::error!(session_id = %sid, error = %e, "Failed to persist streaming assistant response to memory");
             }
@@ -833,7 +886,11 @@ impl Agent {
                 sm.record_turn(&sid, tokens);
             }
             let mut resp = crate::gateway::ChatResponse {
-                content: if accumulated.is_empty() { None } else { Some(accumulated.clone()) },
+                content: if accumulated.is_empty() {
+                    None
+                } else {
+                    Some(accumulated.clone())
+                },
                 tool_calls: Vec::new(),
                 finish_reason: None,
                 usage: None,
@@ -855,14 +912,19 @@ impl Agent {
 ///
 /// If multiple plugins offer the same bare name and an ambiguous invocation is received,
 /// returns `None` and logs an error to prevent silent, non-deterministic routing.
-fn find_tool_target<H: ToolHost>(
+fn find_tool_target(
     tool_name: &str,
-    hosts: &[Arc<H>],
-) -> Option<(Arc<H>, String, String)> {
+    hosts: &[Arc<dyn ToolHost>],
+) -> Option<(Arc<dyn ToolHost>, String, String)> {
     // 1. Check for exact namespaced match first: <plugin_id>__<tool_name>
     for host in hosts {
-        for plugin in host.plugin_metas() {
-            let prefix = format!("{}__{}", crate::tool_router::sanitize_tool_identifier(&plugin.id), "");
+        let metas = host.plugin_metas();
+        for plugin in &metas {
+            let prefix = format!(
+                "{}__{}",
+                crate::tool_router::sanitize_tool_identifier(&plugin.id),
+                ""
+            );
             if tool_name.starts_with(&prefix) {
                 let base_name = &tool_name[prefix.len()..];
                 for tool in &plugin.tools {
@@ -877,7 +939,8 @@ fn find_tool_target<H: ToolHost>(
     // 2. Search for bare tool name across all plugins
     let mut matches = Vec::new();
     for host in hosts {
-        for plugin in host.plugin_metas() {
+        let metas = host.plugin_metas();
+        for plugin in &metas {
             for tool in &plugin.tools {
                 if tool.name == tool_name {
                     matches.push((host.clone(), plugin.id.clone(), tool.name.clone()));
@@ -1026,10 +1089,11 @@ impl AgentBuilder {
         if let Some(ref session_mgr) = self.session_manager
             && let Some(ref persona_reg) = self.persona_registry
         {
-            self.hooks.push(Arc::new(crate::prompt::DynamicPromptHook::new(
-                session_mgr.clone(),
-                persona_reg.clone(),
-            )));
+            self.hooks
+                .push(Arc::new(crate::prompt::DynamicPromptHook::new(
+                    session_mgr.clone(),
+                    persona_reg.clone(),
+                )));
         }
 
         if let Some(summary_cfg) = self.summary_config
@@ -1040,7 +1104,8 @@ impl AgentBuilder {
                 self.provider.clone(),
                 memory.clone(),
             ));
-            self.hooks.push(Arc::new(crate::summary::SummaryHook::new(summarizer)));
+            self.hooks
+                .push(Arc::new(crate::summary::SummaryHook::new(summarizer)));
         }
 
         Agent {

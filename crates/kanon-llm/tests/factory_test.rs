@@ -43,7 +43,8 @@ fn factory() -> (
         memory.clone(),
         sessions.clone(),
         personas.clone(),
-        None,
+        Vec::new(),
+        Vec::new(),
     );
 
     (factory, provider, memory, sessions, personas)

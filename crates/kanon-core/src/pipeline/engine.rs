@@ -25,12 +25,14 @@ use kanon_proto::v1::{
 
 use crate::adapter::{AdapterDescriptor, AdapterError, AdapterKind};
 use crate::instance::InstanceRegistry;
+use crate::mcp::McpPool;
 use crate::pipeline::command::CommandRouter;
 use crate::pipeline::dead_letter::DeadLetterWriter;
 use crate::pipeline::observer::{PipelineObserver, PipelineStage};
 use crate::pipeline::pre_filter::{PreFilterChain, PreFilterOutcome};
 use crate::supervisor::circuit_breaker::{CircuitBreaker, CircuitState};
 use crate::supervisor::{AdapterRoute, Supervisor};
+use crate::toggle::{PLUGIN_SECTION, ToggleStore};
 
 /// Default depth of the outbound delivery queue.
 ///
@@ -148,6 +150,10 @@ pub struct PipelineEngine {
     /// Optional for the same reason: an unpartitioned pipeline (tests, embedded cores) processes
     /// every event exactly as before.
     instances: Option<Arc<InstanceRegistry>>,
+    /// Global enable switches shared with the control plane.
+    toggles: Option<Arc<ToggleStore>>,
+    /// MCP servers contributing tools alongside plugin hosts.
+    mcp: Option<Arc<McpPool>>,
     /// Optional lifecycle observer used by the management control plane for tracing.
     observer: Option<Arc<dyn PipelineObserver>>,
     /// Persistent dead-letter queue writer for failed or dropped outbound messages.
@@ -172,6 +178,8 @@ impl PipelineEngine {
             agent: Arc::new(AgentSlot::new()),
             agent_factory: None,
             instances: None,
+            toggles: None,
+            mcp: None,
             observer: None,
             dead_letter: Arc::new(DeadLetterWriter::default()),
             outbound_sender,
@@ -221,6 +229,18 @@ impl PipelineEngine {
     /// Returns the instance catalog backing this pipeline, when one is attached.
     pub fn instances(&self) -> Option<&Arc<InstanceRegistry>> {
         self.instances.as_ref()
+    }
+
+    /// Shares the global enable switches used for per-instance policy resolution.
+    pub fn with_toggles(mut self, toggles: Arc<ToggleStore>) -> Self {
+        self.toggles = Some(toggles);
+        self
+    }
+
+    /// Shares the MCP pool so its tools join plugin tools in the same router.
+    pub fn with_mcp_pool(mut self, mcp: Arc<McpPool>) -> Self {
+        self.mcp = Some(mcp);
+        self
     }
 
     /// Attaches an LLM [`ToolRouter`] snapshot to enable multi-turn reasoning and tool calling.
@@ -346,7 +366,9 @@ impl PipelineEngine {
                 let response = host.deliver_message(request).await.map_err(|status| {
                     AdapterError::Delivery {
                         platform: platform.clone(),
-                        reason: format!("plugin '{plugin_id}' on host '{host_id}' failed: {status}"),
+                        reason: format!(
+                            "plugin '{plugin_id}' on host '{host_id}' failed: {status}"
+                        ),
                     }
                 })?;
 
@@ -374,7 +396,8 @@ impl PipelineEngine {
     /// protected by the platform's adaptive circuit breaker and cold-storage dead-letter queue.
     pub async fn dispatch_outbound_request(&self, request: DeliverMessageRequest) {
         let breaker = self.platform_circuit_breaker(&request.platform).await;
-        self.dispatch_outbound_request_with_breaker(request, &breaker).await;
+        self.dispatch_outbound_request_with_breaker(request, &breaker)
+            .await;
     }
 
     /// Delivers a single outbound message using the given platform circuit breaker.
@@ -473,7 +496,9 @@ impl PipelineEngine {
                 // Workers retire after 30 seconds of inactivity to reclaim resources.
                 match tokio::time::timeout(std::time::Duration::from_secs(30), rx.recv()).await {
                     Ok(Some(req)) => {
-                        engine.dispatch_outbound_request_with_breaker(req, &breaker).await;
+                        engine
+                            .dispatch_outbound_request_with_breaker(req, &breaker)
+                            .await;
                     }
                     Ok(None) => {
                         // All channel senders dropped (shutting down).
@@ -636,6 +661,33 @@ impl PipelineEngine {
             None => None,
         };
 
+        // Phase 0b: Per-instance plugin policy.
+        //
+        // Filtering here (rather than inside each later phase) means a plugin this instance
+        // disabled cannot pre-filter, answer commands or offer tools — one decision covers the
+        // whole pipeline. Without a toggle store or an instance the node behaves as before.
+        let hosts: Vec<Arc<crate::supervisor::ManagedHost>> =
+            match (&self.toggles, instance.as_ref()) {
+                (Some(toggles), Some(instance)) => {
+                    let mut allowed = Vec::with_capacity(hosts.len());
+                    for host in hosts {
+                        let plugin_id = host.primary_plugin_id().unwrap_or_default();
+                        let globally_enabled = toggles.is_enabled(PLUGIN_SECTION, &plugin_id).await;
+                        if instance.allows_plugin(&plugin_id, globally_enabled) {
+                            allowed.push(host);
+                        } else {
+                            tracing::debug!(
+                                instance_id = %instance.id,
+                                plugin_id = %plugin_id,
+                                "Plugin skipped for this instance by its plugin policy"
+                            );
+                        }
+                    }
+                    allowed
+                }
+                _ => hosts,
+            };
+
         // Phase 1: PreFilter Interception Chain
         self.observe(PipelineStage::PreFilterStarted {
             event_id: event_id.clone(),
@@ -789,10 +841,12 @@ impl PipelineEngine {
                 sessions.set_persona(&session_id, persona_id);
             }
             // Filter hosts whose circuit breaker is Open to fast-skip them and protect LLM throughput
-            let mut active_hosts = Vec::new();
+            // Plugin hosts and MCP servers are both tool sources; the router sees one slice.
+            let mut active_hosts: Vec<Arc<dyn kanon_llm::tool_router::ToolHost>> = Vec::new();
             for host in &hosts {
                 if host.circuit_breaker.allow_request() {
-                    active_hosts.push(Arc::clone(host));
+                    active_hosts
+                        .push(Arc::clone(host) as Arc<dyn kanon_llm::tool_router::ToolHost>);
                 } else {
                     tracing::warn!(
                         host_id = %host.host_id,
@@ -812,7 +866,15 @@ impl PipelineEngine {
                 }
             }
 
-            match router.execute(&session_id, &text_candidate, &active_hosts).await {
+            // MCP servers contribute their tools under the same policy rules as plugins.
+            if let (Some(mcp), Some(toggles)) = (&self.mcp, &self.toggles) {
+                active_hosts.extend(mcp.hosts_for_instance(toggles, instance.as_ref()).await);
+            }
+
+            match router
+                .execute(&session_id, &text_candidate, &active_hosts)
+                .await
+            {
                 Ok(output) => {
                     // The model's reasoning channel arrives folded into the completion text as a
                     // `<think>` block (a console display convention). Chat platforms must never
@@ -952,7 +1014,9 @@ impl PipelineEngine {
                         "Pipeline generated LLM reply"
                     );
                 }
-                PipelineResult::CommandExecuted { command, success, .. } => {
+                PipelineResult::CommandExecuted {
+                    command, success, ..
+                } => {
                     tracing::info!(
                         platform = %platform,
                         channel_id = %channel_id,
@@ -1041,7 +1105,9 @@ impl PipelineEngine {
                         );
                         let dead_letter = Arc::clone(&self.dead_letter);
                         tokio::spawn(async move {
-                            let _ = dead_letter.write_record(&dropped, "outbound queue is full").await;
+                            let _ = dead_letter
+                                .write_record(&dropped, "outbound queue is full")
+                                .await;
                         });
                         self.observe(PipelineStage::OutboundFailed {
                             platform,

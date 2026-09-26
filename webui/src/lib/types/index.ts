@@ -87,6 +87,14 @@ export interface AdapterStatus {
   kind: 'builtin' | 'plugin' | null;
 }
 
+/**
+ * Per-instance override for a toggleable item (plugin, skill or MCP server).
+ *
+ * `inherit` follows the node-wide switch, `enable` documents an explicit opt-in (the global switch
+ * still wins), and `disable` never uses the item for this instance.
+ */
+export type ItemPolicy = 'inherit' | 'enable' | 'disable';
+
 export interface BotInstanceView {
   id: string;
   name: string;
@@ -95,6 +103,9 @@ export interface BotInstanceView {
   persona_id: string | null;
   system_prompt: string | null;
   model: string | null;
+  plugins: Record<string, ItemPolicy>;
+  skills: Record<string, ItemPolicy>;
+  mcp: Record<string, ItemPolicy>;
   adapter_status: AdapterStatus[];
 }
 
@@ -111,6 +122,9 @@ export interface InstanceRequest {
   persona_id?: string | null;
   system_prompt?: string | null;
   model?: string | null;
+  plugins?: Record<string, ItemPolicy>;
+  skills?: Record<string, ItemPolicy>;
+  mcp?: Record<string, ItemPolicy>;
 }
 
 export interface InstanceMutationResponse {
@@ -216,6 +230,71 @@ export interface PluginMeta {
   health?: HostHealth | null;
   commands: CommandDescriptor[];
   tools: ToolDescriptor[];
+}
+
+/** An installed skill and its node-wide switch. */
+export interface SkillItem {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+}
+
+export interface SkillCatalog {
+  skills: SkillItem[];
+}
+
+export interface SkillStateResponse {
+  applied: boolean;
+  message: string;
+  skill_id: string;
+  enabled: boolean;
+}
+
+/** How the node reaches one MCP server. */
+export type McpTransport =
+  | {
+      type: 'stdio';
+      command: string;
+      args: string[];
+      env: Record<string, string>;
+    }
+  | { type: 'http'; url: string; headers: Record<string, string> };
+
+export interface McpHealth {
+  /** `connecting`, `connected`, `reconnecting`, `failed` or `disabled`. */
+  state: string;
+  /** Tools the server currently advertises. */
+  tools: number;
+  /** Consecutive failed watchdog probes. */
+  failures: number;
+  last_error: string | null;
+}
+
+export interface McpServerView {
+  id: string;
+  name: string;
+  transport: McpTransport;
+  /** Host identifier used in tool metadata (`mcp_<id>`). */
+  host_id: string;
+  enabled: boolean;
+  health: McpHealth;
+}
+
+export interface McpCatalog {
+  servers: McpServerView[];
+}
+
+export interface McpStateResponse {
+  applied: boolean;
+  message: string;
+  server_id: string;
+  enabled: boolean;
+}
+
+export interface UpsertMcpServerRequest {
+  name?: string | null;
+  transport: McpTransport;
 }
 
 export interface PluginStateResponse {

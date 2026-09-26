@@ -9,31 +9,41 @@ pub mod adapter;
 pub mod instance;
 pub mod ipc;
 pub mod manifest;
+pub mod mcp;
 pub mod pipeline;
-pub mod plugin_state;
+pub mod skill;
 pub mod supervisor;
+pub mod toggle;
 
 pub use adapter::{
     AdapterDescriptor, AdapterError, AdapterKind, AdapterRegistry, EventIngress, IngestError,
     PlatformAdapter,
 };
 pub use instance::{
-    BotInstance, InstanceDraft, InstanceError, InstanceRegistry, instance_persona_id,
-    sync_instance_personas, DEFAULT_INSTANCE_CATALOG,
+    BotInstance, DEFAULT_INSTANCE_CATALOG, InstanceDraft, InstanceError, InstanceRegistry,
+    instance_persona_id, sync_instance_personas,
 };
 pub use ipc::{CoreApiService, CoreIpcServer};
 pub use manifest::{
     AdapterSection, DiscoveredPlugin, PluginManifest, PluginScanner, PluginSection,
     ToolDefinitionEntry,
 };
-pub use plugin_state::{PluginStateStore, DEFAULT_PLUGIN_STATE};
+pub use mcp::{
+    DEFAULT_MCP_CONFIG, MCP_WATCHDOG_INTERVAL, McpConfigStore, McpError, McpHealth, McpPool,
+    McpServer, McpServerConfig, McpTransport,
+};
 pub use pipeline::{
-    CommandRouter, DeliveryOutcome, MatchedCommand, PipelineEngine, PipelineObserver,
-    PipelineResult, PipelineStage, PreFilterChain, PreFilterOutcome, NEW_SESSION_COMMAND,
-    DEFAULT_OUTBOUND_QUEUE_CAPACITY,
+    CommandRouter, DEFAULT_OUTBOUND_QUEUE_CAPACITY, DeliveryOutcome, MatchedCommand,
+    NEW_SESSION_COMMAND, PipelineEngine, PipelineObserver, PipelineResult, PipelineStage,
+    PreFilterChain, PreFilterOutcome,
+};
+pub use skill::{
+    DEFAULT_SKILLS_DIR, MAX_SKILL_BYTES, ReadSkillTool, SkillCatalogHook, SkillError, SkillMeta,
+    SkillStore, allowed_skills, catalog_prompt,
 };
 pub use supervisor::{
+    AdapterRoute, HOST_WATCHDOG_INTERVAL, HOST_WATCHDOG_MAX_RESTARTS, HostHealth, LaunchSpec,
+    ManagedHost, Supervisor, SupervisorError, UnavailablePlugin,
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState},
-    AdapterRoute, HostHealth, LaunchSpec, ManagedHost, Supervisor, SupervisorError,
-    UnavailablePlugin, HOST_WATCHDOG_INTERVAL, HOST_WATCHDOG_MAX_RESTARTS,
 };
+pub use toggle::{DEFAULT_TOGGLE_STATE, MCP_SECTION, PLUGIN_SECTION, SKILL_SECTION, ToggleStore};

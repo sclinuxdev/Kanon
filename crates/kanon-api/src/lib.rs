@@ -51,12 +51,12 @@ pub mod ws;
 
 pub use adapters::WebhookAdapter;
 pub use error::ApiError;
+pub use kanon_core::ToggleStore;
 pub use llm_config::{LlmProviderConfig, SystemConfigStore};
 pub use metrics::{MetricsRegistry, RuntimeGauges};
 pub use observability::{
     LogLevel, LogRecord, Observability, TraceEvent, TraceEventBus, TraceRecord,
 };
-pub use kanon_core::PluginStateStore;
 pub use plugin_config::PluginConfigStore;
 pub use server::{ApiServer, app};
 pub use state::{ApiState, ApiStateBuilder, default_agent_config};

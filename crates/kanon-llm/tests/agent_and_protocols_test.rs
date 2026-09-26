@@ -1,21 +1,23 @@
 //! Comprehensive unit tests for Kanon Agent engine, pluggable Memory, and Protocol Providers.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
 use async_trait::async_trait;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 
 use kanon_llm::agent::{Agent, AgentConfig, AgentHook, NativeTool};
+use kanon_llm::gateway::LlmProvider;
 use kanon_llm::gateway::providers::{
     AnthropicMessagesProvider, OpenAiChatProvider, OpenAiResponsesProvider,
 };
-use kanon_llm::gateway::types::{ChatMessage, ChatRequest, ChatResponse, Role, ToolCall, ToolDefinition};
-use kanon_llm::gateway::LlmProvider;
+use kanon_llm::gateway::types::{
+    ChatMessage, ChatRequest, ChatResponse, Role, ToolCall, ToolDefinition,
+};
 use kanon_llm::memory::Memory;
-use kanon_llm::tool_router::{json_to_prost_struct, prost_struct_to_json, ToolHost};
+use kanon_llm::tool_router::{ToolHost, json_to_prost_struct, prost_struct_to_json};
 use kanon_llm::{AgentError, GatewayError, MemoryError};
 use kanon_proto::v1::{
-    tool_call_request, tool_call_response, PluginMeta, ToolCallRequest, ToolCallResponse, ToolMeta,
+    PluginMeta, ToolCallRequest, ToolCallResponse, ToolMeta, tool_call_request, tool_call_response,
 };
 
 // =========================================================================
@@ -62,13 +64,14 @@ struct MockHost {
 }
 
 #[async_trait]
+#[async_trait::async_trait]
 impl ToolHost for MockHost {
     fn host_id(&self) -> &str {
         &self.host_id
     }
 
-    fn plugin_metas(&self) -> &[PluginMeta] {
-        &self.plugins
+    fn plugin_metas(&self) -> Vec<PluginMeta> {
+        self.plugins.clone()
     }
 
     async fn call_tool(&self, req: ToolCallRequest) -> Result<ToolCallResponse, tonic::Status> {
@@ -120,12 +123,20 @@ impl CustomPluginMemory {
 
 #[async_trait]
 impl Memory for CustomPluginMemory {
-    async fn push_message(&self, _session_key: &str, message: ChatMessage) -> Result<(), MemoryError> {
+    async fn push_message(
+        &self,
+        _session_key: &str,
+        message: ChatMessage,
+    ) -> Result<(), MemoryError> {
         self.stored_messages.write().await.push(message);
         Ok(())
     }
 
-    async fn set_system_prompt(&self, _session_key: &str, prompt: String) -> Result<(), MemoryError> {
+    async fn set_system_prompt(
+        &self,
+        _session_key: &str,
+        prompt: String,
+    ) -> Result<(), MemoryError> {
         *self.system_prompt.write().await = Some(prompt);
         Ok(())
     }
@@ -167,17 +178,29 @@ struct TracingHook {
 
 #[async_trait]
 impl AgentHook for TracingHook {
-    async fn on_llm_request(&self, _session_id: &str, _request: &mut ChatRequest) -> Result<(), AgentError> {
+    async fn on_llm_request(
+        &self,
+        _session_id: &str,
+        _request: &mut ChatRequest,
+    ) -> Result<(), AgentError> {
         self.request_intercepted.store(true, Ordering::SeqCst);
         Ok(())
     }
 
-    async fn on_llm_response(&self, _session_id: &str, _response: &mut ChatResponse) -> Result<(), AgentError> {
+    async fn on_llm_response(
+        &self,
+        _session_id: &str,
+        _response: &mut ChatResponse,
+    ) -> Result<(), AgentError> {
         self.response_intercepted.store(true, Ordering::SeqCst);
         Ok(())
     }
 
-    async fn on_before_tool_call(&self, _session_id: &str, _call: &ToolCall) -> Result<bool, AgentError> {
+    async fn on_before_tool_call(
+        &self,
+        _session_id: &str,
+        _call: &ToolCall,
+    ) -> Result<bool, AgentError> {
         self.tool_authorized.store(true, Ordering::SeqCst);
         if self.should_veto {
             Ok(false)
@@ -258,7 +281,7 @@ async fn test_agent_builder_and_execution_with_custom_memory() {
         }],
     });
 
-    let hosts = vec![host];
+    let hosts: Vec<Arc<dyn ToolHost>> = vec![host];
 
     let output = agent
         .run("sess_custom", "Please reverse 'kanon'", &hosts)
@@ -367,7 +390,9 @@ async fn test_agent_lifecycle_hooks_and_veto() {
     };
 
     let turn2 = ChatResponse {
-        content: Some("I was unable to perform the deletion because permission was denied.".to_string()),
+        content: Some(
+            "I was unable to perform the deletion because permission was denied.".to_string(),
+        ),
         tool_calls: vec![],
         finish_reason: Some("stop".to_string()),
         usage: None,
@@ -375,9 +400,7 @@ async fn test_agent_lifecycle_hooks_and_veto() {
 
     let provider = Arc::new(ScriptedLlmProvider::new(vec![turn1, turn2]));
 
-    let agent = Agent::builder("safety_agent", provider)
-        .hook(hook)
-        .build();
+    let agent = Agent::builder("safety_agent", provider).hook(hook).build();
 
     let output = agent
         .run_standalone("sess_guardrail", "Delete all database tables")
@@ -400,37 +423,44 @@ fn test_openai_responses_provider_endpoints_and_headers() {
     let p1 = OpenAiResponsesProvider::new("sk-test");
     assert_eq!(p1.endpoint(), "https://api.openai.com/v1/responses");
 
-    let p2 = OpenAiResponsesProvider::new("sk-test")
-        .with_base_url("https://api.openai.com");
+    let p2 = OpenAiResponsesProvider::new("sk-test").with_base_url("https://api.openai.com");
     assert_eq!(p2.endpoint(), "https://api.openai.com/v1/responses");
 
-    let p3 = OpenAiResponsesProvider::new("sk-test")
-        .with_base_url("https://custom.ai/v1");
+    let p3 = OpenAiResponsesProvider::new("sk-test").with_base_url("https://custom.ai/v1");
     assert_eq!(p3.endpoint(), "https://custom.ai/v1/responses");
 
-    let p4 = OpenAiResponsesProvider::new("sk-test")
-        .with_base_url("https://custom.ai/responses/");
+    let p4 = OpenAiResponsesProvider::new("sk-test").with_base_url("https://custom.ai/responses/");
     assert_eq!(p4.endpoint(), "https://custom.ai/responses");
 
-    let p5 = OpenAiResponsesProvider::new("sk-test")
-        .with_header("x-trace-id", "trace-abc");
+    let p5 = OpenAiResponsesProvider::new("sk-test").with_header("x-trace-id", "trace-abc");
     assert_eq!(p5.custom_headers().len(), 1);
-    assert_eq!(p5.custom_headers()[0], ("x-trace-id".to_string(), "trace-abc".to_string()));
+    assert_eq!(
+        p5.custom_headers()[0],
+        ("x-trace-id".to_string(), "trace-abc".to_string())
+    );
 }
 
 #[test]
 fn test_openai_chat_provider_endpoint_and_headers() {
-    let provider = OpenAiChatProvider::new("http://localhost:8000/v1", Some("sk-test".to_string()), "gpt-4o")
-        .with_header("x-org-id", "org_123");
+    let provider = OpenAiChatProvider::new(
+        "http://localhost:8000/v1",
+        Some("sk-test".to_string()),
+        "gpt-4o",
+    )
+    .with_header("x-org-id", "org_123");
 
     let _ = provider;
 }
 
 #[test]
 fn test_anthropic_messages_provider_endpoint_and_headers() {
-    let provider = AnthropicMessagesProvider::new("https://api.anthropic.com", Some("sk-ant-test".to_string()), "claude-3-5-sonnet")
-        .with_version("2023-06-01")
-        .with_header("x-custom-env", "sandbox");
+    let provider = AnthropicMessagesProvider::new(
+        "https://api.anthropic.com",
+        Some("sk-ant-test".to_string()),
+        "claude-3-5-sonnet",
+    )
+    .with_version("2023-06-01")
+    .with_header("x-custom-env", "sandbox");
 
     let _ = provider;
 }

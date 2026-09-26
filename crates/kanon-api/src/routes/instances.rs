@@ -26,7 +26,10 @@ use crate::state::ApiState;
 /// Registers the instance endpoints.
 pub fn routes() -> Router<ApiState> {
     Router::new()
-        .route("/api/v1/instances", get(list_instances).post(create_instance))
+        .route(
+            "/api/v1/instances",
+            get(list_instances).post(create_instance),
+        )
         .route(
             "/api/v1/instances/:id",
             put(update_instance).delete(delete_instance),
@@ -65,6 +68,12 @@ pub struct InstanceView {
     pub system_prompt: Option<String>,
     /// Model override; `null` means the node's default model.
     pub model: Option<String>,
+    /// Per-plugin overrides.
+    pub plugins: std::collections::HashMap<String, kanon_core::instance::ItemPolicy>,
+    /// Per-skill overrides.
+    pub skills: std::collections::HashMap<String, kanon_core::instance::ItemPolicy>,
+    /// Per-MCP-server overrides.
+    pub mcp: std::collections::HashMap<String, kanon_core::instance::ItemPolicy>,
     /// Live state of every claimed adapter.
     pub adapter_status: Vec<AdapterStatus>,
 }
@@ -111,6 +120,15 @@ pub struct InstanceRequest {
     /// Optional model override; omit or `null` to use the node's default.
     #[serde(default)]
     pub model: Option<String>,
+    /// Per-plugin overrides (`inherit` | `enable` | `disable`).
+    #[serde(default)]
+    pub plugins: std::collections::HashMap<String, kanon_core::instance::ItemPolicy>,
+    /// Per-skill overrides (`inherit` | `enable` | `disable`).
+    #[serde(default)]
+    pub skills: std::collections::HashMap<String, kanon_core::instance::ItemPolicy>,
+    /// Per-MCP-server overrides (`inherit` | `enable` | `disable`).
+    #[serde(default)]
+    pub mcp: std::collections::HashMap<String, kanon_core::instance::ItemPolicy>,
 }
 
 impl From<InstanceRequest> for InstanceDraft {
@@ -122,6 +140,9 @@ impl From<InstanceRequest> for InstanceDraft {
             persona_id: request.persona_id,
             system_prompt: request.system_prompt,
             model: request.model,
+            plugins: request.plugins,
+            skills: request.skills,
+            mcp: request.mcp,
         }
     }
 }
@@ -163,6 +184,9 @@ async fn view(state: &ApiState, instance: &BotInstance) -> InstanceView {
         persona_id: instance.persona_id.clone(),
         system_prompt: instance.system_prompt.clone(),
         model: instance.model.clone(),
+        plugins: instance.plugins.clone(),
+        skills: instance.skills.clone(),
+        mcp: instance.mcp.clone(),
         adapter_status: instance
             .adapters
             .iter()
@@ -174,7 +198,9 @@ async fn view(state: &ApiState, instance: &BotInstance) -> InstanceView {
 /// Maps catalog failures onto management-gateway semantics.
 fn map_error(err: InstanceError) -> ApiError {
     match err {
-        InstanceError::NotFound(id) => ApiError::NotFound(format!("instance '{id}' does not exist")),
+        InstanceError::NotFound(id) => {
+            ApiError::NotFound(format!("instance '{id}' does not exist"))
+        }
         InstanceError::Conflict { platform, owner } => ApiError::Conflict(format!(
             "adapter '{platform}' is already enabled by instance '{owner}'; disable it there first"
         )),
@@ -229,11 +255,7 @@ async fn create_instance(
     let draft: InstanceDraft = payload.into();
     validate_persona(&state, &draft)?;
 
-    let instance = state
-        .instances()
-        .create(draft)
-        .await
-        .map_err(map_error)?;
+    let instance = state.instances().create(draft).await.map_err(map_error)?;
     publish_personas(&state).await;
 
     tracing::info!(

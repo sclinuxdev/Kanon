@@ -65,6 +65,34 @@ pub enum InstanceError {
     Io(String),
 }
 
+/// Per-instance override for a toggleable item (plugin, skill or MCP server).
+///
+/// The global switch always wins: `Enable` cannot resurrect something the operator disabled
+/// node-wide, it only documents an explicit opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemPolicy {
+    /// Follow the node-wide switch (default).
+    Inherit,
+    /// Use the item, provided it is enabled node-wide.
+    Enable,
+    /// Never use the item for this instance.
+    Disable,
+}
+
+impl Default for ItemPolicy {
+    fn default() -> Self {
+        Self::Inherit
+    }
+}
+
+impl ItemPolicy {
+    /// Resolves the policy against the node-wide switch.
+    pub fn allows(self, globally_enabled: bool) -> bool {
+        globally_enabled && self != Self::Disable
+    }
+}
+
 /// One bot instance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BotInstance {
@@ -86,6 +114,15 @@ pub struct BotInstance {
     /// Model override; `None` means "use the node's default model".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Per-plugin overrides; absent identifiers inherit the node-wide switch.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub plugins: HashMap<String, ItemPolicy>,
+    /// Per-skill overrides; absent identifiers inherit the node-wide switch.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub skills: HashMap<String, ItemPolicy>,
+    /// Per-MCP-server overrides; absent identifiers inherit the node-wide switch.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub mcp: HashMap<String, ItemPolicy>,
     /// Conversation key -> session generation, rotated by the built-in `/new` command.
     ///
     /// Kept on the instance so a restart does not silently continue the conversation an operator
@@ -114,6 +151,15 @@ pub struct InstanceDraft {
     /// Optional model override.
     #[serde(default)]
     pub model: Option<String>,
+    /// Per-plugin overrides.
+    #[serde(default)]
+    pub plugins: HashMap<String, ItemPolicy>,
+    /// Per-skill overrides.
+    #[serde(default)]
+    pub skills: HashMap<String, ItemPolicy>,
+    /// Per-MCP-server overrides.
+    #[serde(default)]
+    pub mcp: HashMap<String, ItemPolicy>,
 }
 
 impl BotInstance {
@@ -128,7 +174,48 @@ impl BotInstance {
 
     /// Current session generation for a conversation (0 until `/new` is used).
     pub fn session_generation(&self, conversation: &str) -> u64 {
-        self.session_generations.get(conversation).copied().unwrap_or(0)
+        self.session_generations
+            .get(conversation)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether this instance may use a plugin, given the node-wide switch.
+    pub fn allows_plugin(&self, plugin_id: &str, globally_enabled: bool) -> bool {
+        self.plugins
+            .get(plugin_id)
+            .copied()
+            .unwrap_or_default()
+            .allows(globally_enabled)
+    }
+
+    /// Whether this instance may use a skill, given the node-wide switch.
+    pub fn allows_skill(&self, skill_id: &str, globally_enabled: bool) -> bool {
+        self.skills
+            .get(skill_id)
+            .copied()
+            .unwrap_or_default()
+            .allows(globally_enabled)
+    }
+
+    /// Whether this instance may use an MCP server, given the node-wide switch.
+    pub fn allows_mcp(&self, server_id: &str, globally_enabled: bool) -> bool {
+        self.mcp
+            .get(server_id)
+            .copied()
+            .unwrap_or_default()
+            .allows(globally_enabled)
+    }
+
+    /// Resolves the instance identifier encoded in a session key, if any.
+    ///
+    /// Sessions are namespaced as `instance:<id>:<conversation>#<generation>`, which is what lets
+    /// hooks and native tools enforce per-instance policy without carrying extra state.
+    pub fn instance_id_from_session(session_id: &str) -> Option<&str> {
+        session_id
+            .strip_prefix("instance:")
+            .and_then(|rest| rest.split(':').next())
+            .filter(|id| !id.is_empty())
     }
 
     /// Persona that sessions of this instance must use, if any.
@@ -137,7 +224,11 @@ impl BotInstance {
     /// generated persona (see [`instance_persona_id`]) so the existing prompt-composition path
     /// applies it without a special case in the agent.
     pub fn effective_persona_id(&self) -> Option<String> {
-        if self.system_prompt.as_ref().is_some_and(|p| !p.trim().is_empty()) {
+        if self
+            .system_prompt
+            .as_ref()
+            .is_some_and(|p| !p.trim().is_empty())
+        {
             return Some(instance_persona_id(&self.id));
         }
         self.persona_id.clone()
@@ -163,7 +254,10 @@ pub fn sync_instance_personas(instances: &[BotInstance], personas: &PersonaRegis
             .map(str::trim)
             .filter(|p| !p.is_empty())
         {
-            desired.insert(instance_persona_id(&instance.id), (instance.name.as_str(), prompt));
+            desired.insert(
+                instance_persona_id(&instance.id),
+                (instance.name.as_str(), prompt),
+            );
         }
     }
 
@@ -274,7 +368,8 @@ impl InstanceRegistry {
 
     /// Every instance, ordered by name then id for stable console output.
     pub async fn list(&self) -> Vec<BotInstance> {
-        let mut instances: Vec<BotInstance> = self.instances.read().await.values().cloned().collect();
+        let mut instances: Vec<BotInstance> =
+            self.instances.read().await.values().cloned().collect();
         instances.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         instances
     }
@@ -310,7 +405,11 @@ impl InstanceRegistry {
     }
 
     /// Replaces the editable fields of an instance, keeping its identity and session history.
-    pub async fn update(&self, id: &str, draft: InstanceDraft) -> Result<BotInstance, InstanceError> {
+    pub async fn update(
+        &self,
+        id: &str,
+        draft: InstanceDraft,
+    ) -> Result<BotInstance, InstanceError> {
         let mut instances = self.instances.write().await;
 
         if !instances.contains_key(id) {
@@ -432,10 +531,12 @@ impl InstanceRegistry {
             return Ok(None);
         }
 
-        let raw = std::fs::read_to_string(path)
-            .map_err(|err| InstanceError::Io(format!("failed to read {}: {err}", path.display())))?;
-        let document: InstanceCatalogDocument = serde_json::from_str(&raw)
-            .map_err(|err| InstanceError::Io(format!("failed to parse {}: {err}", path.display())))?;
+        let raw = std::fs::read_to_string(path).map_err(|err| {
+            InstanceError::Io(format!("failed to read {}: {err}", path.display()))
+        })?;
+        let document: InstanceCatalogDocument = serde_json::from_str(&raw).map_err(|err| {
+            InstanceError::Io(format!("failed to parse {}: {err}", path.display()))
+        })?;
 
         Ok(Some(document))
     }
@@ -539,6 +640,9 @@ fn build_instance(
         persona_id,
         system_prompt,
         model,
+        plugins: draft.plugins,
+        skills: draft.skills,
+        mcp: draft.mcp,
         session_generations: HashMap::new(),
     })
 }
@@ -555,7 +659,11 @@ fn unique_id(instances: &HashMap<String, BotInstance>, name: &str) -> String {
     }
     let slug = slug.trim_matches('-').to_string();
     // Non-ASCII names (e.g. 黑猪AI) slugify to nothing, so fall back to a stable prefix.
-    let base = if slug.is_empty() { "bot".to_string() } else { slug };
+    let base = if slug.is_empty() {
+        "bot".to_string()
+    } else {
+        slug
+    };
 
     if !instances.contains_key(&base) {
         return base;

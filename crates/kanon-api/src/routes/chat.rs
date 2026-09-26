@@ -20,10 +20,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::StreamExt;
-use kanon_core::ManagedHost;
-use kanon_llm::{
-    Agent, AgentError, tool_router::ExecutedToolCall,
-};
+use kanon_llm::{Agent, AgentError, tool_router::ExecutedToolCall};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
@@ -133,7 +130,22 @@ async fn completions(
 
     // Plugin tools are aggregated from the live supervisor registry on every request so a
     // hot-reloaded plugin becomes callable without restarting the gateway.
-    let hosts: Vec<Arc<ManagedHost>> = state.supervisor().get_all_hosts().await;
+    let mut hosts: Vec<Arc<dyn kanon_llm::tool_router::ToolHost>> = state
+        .supervisor()
+        .get_all_hosts()
+        .await
+        .into_iter()
+        .map(|host| host as Arc<dyn kanon_llm::tool_router::ToolHost>)
+        .collect();
+
+    // MCP servers reach the agent through the same slice. A sandbox session carries no instance
+    // identifier, so the node-wide switch alone decides which servers are offered.
+    hosts.extend(
+        state
+            .mcp()
+            .hosts_for_instance(state.plugin_state(), None)
+            .await,
+    );
 
     if request.stream {
         stream_completion(
@@ -176,7 +188,7 @@ async fn stream_completion(
     session_id: String,
     message: String,
     tools: bool,
-    hosts: Vec<Arc<ManagedHost>>,
+    hosts: Vec<Arc<dyn kanon_llm::tool_router::ToolHost>>,
 ) -> Result<Response, ApiError> {
     let stream = if tools {
         agent.run_stream(&session_id, &message, &hosts).await
@@ -265,7 +277,10 @@ fn map_agent_error(err: AgentError) -> ApiError {
 /// If dynamic provider coordinates are specified (`protocol` and `base_url`), an ephemeral
 /// agent sharing the node's session manager, memory, and persona registry is constructed.
 /// Otherwise, falls back to the node's configured agent, applying an optional model override.
-fn resolve_agent(state: &ApiState, request: &ChatCompletionRequest) -> Result<Arc<Agent>, ApiError> {
+fn resolve_agent(
+    state: &ApiState,
+    request: &ChatCompletionRequest,
+) -> Result<Arc<Agent>, ApiError> {
     if let (Some(proto), Some(url)) = (&request.protocol, &request.base_url) {
         let trimmed_url = url.trim().trim_end_matches('/').to_string();
         if !trimmed_url.is_empty() {
@@ -301,17 +316,16 @@ fn resolve_agent(state: &ApiState, request: &ChatCompletionRequest) -> Result<Ar
     if let Some(agent) = state.agent() {
         // Console model keys may carry a provider prefix (`deepseek/deepseek-chat`); the agent
         // only ever needs the model tag itself.
-        let model = request.model.as_deref().map(|raw| {
-            match raw.split_once('/') {
+        let model = request
+            .model
+            .as_deref()
+            .map(|raw| match raw.split_once('/') {
                 Some((_prov, actual)) if !actual.trim().is_empty() => actual.trim().to_string(),
                 _ => raw.trim().to_string(),
-            }
-        });
+            });
         // A per-request model override never rebuilds memory, personas or hooks: the factory
         // derives an agent that differs only by the model tag.
-        return Ok(state
-            .agent_for_model(model.as_deref())
-            .unwrap_or(agent));
+        return Ok(state.agent_for_model(model.as_deref()).unwrap_or(agent));
     }
 
     Err(ApiError::Unavailable(

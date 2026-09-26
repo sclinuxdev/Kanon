@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kanon_core::{EventIngress, InstanceRegistry, PluginStateStore, Supervisor};
+use kanon_core::{
+    EventIngress, InstanceRegistry, McpConfigStore, McpPool, SkillStore, Supervisor, ToggleStore,
+};
 use kanon_llm::{
     Agent, AgentConfig, AgentFactory, AgentSlot, LlmProvider, Memory, PersonaRegistry,
     SessionManager, SlidingWindowMemory,
@@ -53,8 +55,14 @@ struct ApiStateInner {
     factory: Arc<AgentFactory>,
     /// Catalog of bot instances deciding whether and how inbound events are answered.
     instances: Arc<InstanceRegistry>,
-    /// Persisted enable/disable state for discovered plugins.
-    plugin_state: Arc<PluginStateStore>,
+    /// Persisted enable/disable state for discovered plugins, skills and MCP servers.
+    plugin_state: Arc<ToggleStore>,
+    /// MCP client pool contributing tools to the very same router as plugin hosts.
+    mcp: Arc<McpPool>,
+    /// Persisted MCP server definitions backing the console's server editor.
+    mcp_config: Arc<McpConfigStore>,
+    /// Installed skills backing the catalog hook and the `read_skill` tool.
+    skills: Arc<SkillStore>,
     /// Persistence for per-plugin configuration values.
     config_store: Arc<PluginConfigStore>,
     /// Persistence for node-level system settings, including the console-selected provider.
@@ -141,8 +149,23 @@ impl ApiState {
     }
 
     /// Persisted plugin enable/disable state.
-    pub fn plugin_state(&self) -> &Arc<PluginStateStore> {
+    pub fn plugin_state(&self) -> &Arc<ToggleStore> {
         &self.inner.plugin_state
+    }
+
+    /// MCP client pool shared with the pipeline worker.
+    pub fn mcp(&self) -> &Arc<McpPool> {
+        &self.inner.mcp
+    }
+
+    /// Persisted MCP server definitions.
+    pub fn mcp_config(&self) -> &Arc<McpConfigStore> {
+        &self.inner.mcp_config
+    }
+
+    /// Installed skills backing the console's skill management endpoints.
+    pub fn skills(&self) -> &Arc<SkillStore> {
+        &self.inner.skills
     }
 
     /// Installs a model provider on the running node and returns the resulting agent.
@@ -199,8 +222,13 @@ pub struct ApiStateBuilder {
     agent: Option<Arc<Agent>>,
     pending_llm: Option<PendingLlm>,
     agent_slot: Option<Arc<AgentSlot>>,
+    native_tools: Vec<Arc<dyn kanon_llm::AgentTool>>,
+    hooks: Vec<Arc<dyn kanon_llm::AgentHook>>,
     instances: Option<Arc<InstanceRegistry>>,
-    plugin_state: Option<Arc<PluginStateStore>>,
+    plugin_state: Option<Arc<ToggleStore>>,
+    mcp: Option<Arc<McpPool>>,
+    mcp_config: Option<Arc<McpConfigStore>>,
+    skills: Option<Arc<SkillStore>>,
     system_config: Option<Arc<SystemConfigStore>>,
     config_base_dir: Option<PathBuf>,
     observability: Option<Arc<Observability>>,
@@ -227,8 +255,13 @@ impl ApiStateBuilder {
             agent: None,
             pending_llm: None,
             agent_slot: None,
+            native_tools: Vec::new(),
+            hooks: Vec::new(),
             instances: None,
             plugin_state: None,
+            mcp: None,
+            mcp_config: None,
+            skills: None,
             system_config: None,
             config_base_dir: None,
             observability: None,
@@ -306,9 +339,42 @@ impl ApiStateBuilder {
         self
     }
 
+    /// Registers native in-process tools that every agent may call (e.g. `read_skill`).
+    pub fn with_native_tools(mut self, tools: Vec<Arc<dyn kanon_llm::AgentTool>>) -> Self {
+        self.native_tools = tools;
+        self
+    }
+
+    /// Registers lifecycle hooks every agent runs on the node (e.g. the skill catalog).
+    ///
+    /// Hooks registered here run after the built-in trace hook, so an operator-visible hook never
+    /// hides the observability stream.
+    pub fn with_hooks(mut self, hooks: Vec<Arc<dyn kanon_llm::AgentHook>>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
     /// Shares the persisted plugin enable/disable state.
-    pub fn with_plugin_state(mut self, state: Arc<PluginStateStore>) -> Self {
+    pub fn with_plugin_state(mut self, state: Arc<ToggleStore>) -> Self {
         self.plugin_state = Some(state);
+        self
+    }
+
+    /// Shares the MCP client pool used by both the console and the pipeline.
+    pub fn with_mcp_pool(mut self, mcp: Arc<McpPool>) -> Self {
+        self.mcp = Some(mcp);
+        self
+    }
+
+    /// Shares the persisted MCP server definitions.
+    pub fn with_mcp_config(mut self, config: Arc<McpConfigStore>) -> Self {
+        self.mcp_config = Some(config);
+        self
+    }
+
+    /// Shares the installed-skill store.
+    pub fn with_skill_store(mut self, skills: Arc<SkillStore>) -> Self {
+        self.skills = Some(skills);
         self
     }
 
@@ -372,13 +438,16 @@ impl ApiStateBuilder {
         let slot = self
             .agent_slot
             .unwrap_or_else(|| Arc::new(AgentSlot::new()));
+        let mut hooks: Vec<Arc<dyn kanon_llm::AgentHook>> = vec![observability.events.clone()];
+        hooks.extend(self.hooks);
         let factory = Arc::new(AgentFactory::new(
             "kanon-core",
             slot.clone(),
             memory,
             sessions.clone(),
             personas.clone(),
-            Some(observability.events.clone()),
+            hooks,
+            self.native_tools.clone(),
         ));
 
         // A provider the builder was handed is installed into the shared slot; dropping it
@@ -391,6 +460,11 @@ impl ApiStateBuilder {
 
         let instances = self.instances.unwrap_or_default();
         let plugin_state = self.plugin_state.unwrap_or_default();
+        let mcp = self.mcp.unwrap_or_default();
+        let mcp_config = self.mcp_config.unwrap_or_default();
+        let skills = self
+            .skills
+            .unwrap_or_else(|| Arc::new(SkillStore::new(kanon_core::DEFAULT_SKILLS_DIR)));
 
         let config_store = Arc::new(match self.config_base_dir {
             Some(dir) => PluginConfigStore::new(dir),
@@ -401,7 +475,9 @@ impl ApiStateBuilder {
             .system_config
             .unwrap_or_else(|| Arc::new(SystemConfigStore::default()));
 
-        let plugins_dir = self.plugins_dir.unwrap_or_else(|| PathBuf::from("./plugins"));
+        let plugins_dir = self
+            .plugins_dir
+            .unwrap_or_else(|| PathBuf::from("./plugins"));
 
         ApiState {
             inner: Arc::new(ApiStateInner {
@@ -413,6 +489,9 @@ impl ApiStateBuilder {
                 factory,
                 instances,
                 plugin_state,
+                mcp,
+                mcp_config,
+                skills,
                 config_store,
                 system_config,
                 observability,

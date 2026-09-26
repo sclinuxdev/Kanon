@@ -11,8 +11,32 @@ import {
   Trash2,
   X,
 } from 'lucide-svelte';
-import { instancesStore } from '../../stores/instances.svelte';
 import { t } from '../../stores/i18n.svelte';
+import type { PolicyKind } from '../../stores/instances.svelte';
+import { instancesStore } from '../../stores/instances.svelte';
+import type { ItemPolicy } from '../../types';
+
+/** Policy kinds in the order the form renders them. */
+const policyKinds: PolicyKind[] = ['plugins', 'skills', 'mcp'];
+
+/** Three-way choices offered per item. */
+const policyChoices: { value: ItemPolicy; labelKey: string }[] = [
+  { value: 'inherit', labelKey: 'instances.policy_inherit' },
+  { value: 'enable', labelKey: 'instances.policy_enable' },
+  { value: 'disable', labelKey: 'instances.policy_disable' },
+];
+
+/** Section heading key for one policy kind. */
+function policyTitleKey(kind: PolicyKind): string {
+  switch (kind) {
+    case 'plugins':
+      return 'instances.section_plugins';
+    case 'skills':
+      return 'instances.section_skills';
+    case 'mcp':
+      return 'instances.section_mcp';
+  }
+}
 
 // Load once when the view mounts; the catalog is small and changes only through this view.
 $effect(() => {
@@ -166,6 +190,15 @@ $effect(() => {
                   {/if}
                   {#if instance.system_prompt}
                     <span>· {t('instances.custom_prompt')}</span>
+                  {/if}
+                  {#if instancesStore.overrideCount(instance) > 0}
+                    <span>
+                      ·
+                      {t('instances.overrides').replace(
+                        '{count}',
+                        String(instancesStore.overrideCount(instance)),
+                      )}
+                    </span>
                   {/if}
                 </div>
               </div>
@@ -340,6 +373,53 @@ $effect(() => {
               />
               <span class="text-xs text-zinc-400">{t('instances.model_hint')}</span>
             {/if}
+          </div>
+
+          <!-- Per-item policy: the node-wide switch still wins; these only restrict further or
+               document an explicit opt-in for this instance. -->
+          <div class="space-y-3 border-t border-zinc-200 dark:border-zinc-800 pt-4">
+            <div>
+              <span class="text-xs font-medium text-zinc-500">{t('instances.items_title')}</span>
+              <p class="text-xs text-zinc-400 mt-0.5">{t('instances.items_hint')}</p>
+            </div>
+
+            {#each policyKinds as kind (kind)}
+              {@const items = instancesStore.itemsOf(kind)}
+              <div class="space-y-1.5">
+                <span class="text-xs font-semibold text-zinc-600 dark:text-zinc-300">
+                  {t(policyTitleKey(kind))}
+                </span>
+                {#if items.length === 0}
+                  <p class="text-xs text-zinc-400">{t('instances.no_items')}</p>
+                {:else}
+                  <div class="space-y-1">
+                    {#each items as item (item.id)}
+                      <div class="flex items-center justify-between gap-3">
+                        <span class="text-xs text-zinc-600 dark:text-zinc-300 truncate" title={item.id}>
+                          {item.name}
+                        </span>
+                        <div class="flex rounded-lg bg-zinc-100 dark:bg-zinc-800/80 p-0.5 shrink-0">
+                          {#each policyChoices as choice (choice.value)}
+                            <button
+                              type="button"
+                              onclick={() => instancesStore.setPolicy(kind, item.id, choice.value)}
+                              class="px-2 py-0.5 text-[11px] rounded-md transition cursor-pointer {instancesStore.policyOf(
+                                kind,
+                                item.id,
+                              ) === choice.value
+                                ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-2xs'
+                                : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}"
+                            >
+                              {t(choice.labelKey)}
+                            </button>
+                          {/each}
+                        </div>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/each}
           </div>
 
           {#if instancesStore.formEnabled && instancesStore.formAdapters.length === 0}

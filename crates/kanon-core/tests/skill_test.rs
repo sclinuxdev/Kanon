@@ -1,0 +1,222 @@
+//! Tests for skill storage and the two policy layers that gate it.
+//!
+//! A skill is installed on disk but only reaches the model when both the node-wide switch and the
+//! instance's own override allow it. These tests cover the store, the catalog hook that injects
+//! only descriptions, and the `read_skill` tool that refuses a skill the caller may not use.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use kanon_core::instance::{InstanceDraft, InstanceRegistry, ItemPolicy};
+use kanon_core::skill::{MAX_SKILL_BYTES, ReadSkillTool, SkillCatalogHook, SkillError, SkillStore};
+use kanon_core::toggle::{SKILL_SECTION, ToggleStore};
+use kanon_llm::agent::AgentHook;
+use kanon_llm::agent::AgentTool;
+use kanon_llm::gateway::types::{ChatMessage, ChatRequest, Role};
+
+/// Writes one installable skill and returns the store root.
+fn write_skill(root: &Path, id: &str, description: &str, body: &str) {
+    let dir = root.join(id);
+    std::fs::create_dir_all(&dir).expect("skill dir");
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {id}\ndescription: {description}\n---\n\n{body}\n"),
+    )
+    .expect("skill body");
+}
+
+/// Creates an instance carrying one skill override.
+async fn instance_with_policy(
+    registry: &InstanceRegistry,
+    skill_id: &str,
+    policy: ItemPolicy,
+    adapter: &str,
+) -> String {
+    registry
+        .create(InstanceDraft {
+            name: format!("Skill Bot {adapter}"),
+            enabled: true,
+            adapters: vec![adapter.to_string()],
+            persona_id: None,
+            system_prompt: None,
+            model: None,
+            plugins: Default::default(),
+            skills: HashMap::from([(skill_id.to_string(), policy)]),
+            mcp: Default::default(),
+        })
+        .await
+        .expect("create instance")
+        .id
+}
+
+#[tokio::test]
+async fn install_read_and_remove_round_trip() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source = dir.path().join("source");
+    write_skill(dir.path(), "source", "Source skill", "Body text");
+
+    let store = SkillStore::new(dir.path().join("skills"));
+    let meta = store
+        .install_from_dir(&source, "installed")
+        .expect("install");
+    assert_eq!(meta.id, "installed");
+    assert_eq!(meta.description, "Source skill");
+    assert!(store.read("installed").expect("read").contains("Body text"));
+
+    assert_eq!(store.list().expect("list").len(), 1);
+
+    store.remove("installed").expect("remove");
+    assert_eq!(store.list().expect("list").len(), 0);
+    assert!(matches!(
+        store.read("installed").err(),
+        Some(SkillError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn identifiers_are_rejected_before_touching_the_filesystem() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let source = dir.path().join("source");
+    write_skill(dir.path(), "source", "Source skill", "Body");
+    let store = SkillStore::new(dir.path().join("skills"));
+
+    for bad in ["", "../escape", ".hidden", "bad id", "a/b"] {
+        assert!(
+            matches!(store.read(bad).err(), Some(SkillError::InvalidId(_))),
+            "'{bad}' must be refused"
+        );
+    }
+
+    // A directory without SKILL.md is a client mistake, reported as such.
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).expect("dir");
+    assert!(matches!(
+        store.install_from_dir(&empty, "empty").err(),
+        Some(SkillError::InvalidSource(_))
+    ));
+    assert!(source.is_dir(), "the fixture source must still exist");
+}
+
+#[tokio::test]
+async fn an_oversized_skill_body_is_refused_when_read() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    write_skill(
+        dir.path(),
+        "big",
+        "Big skill",
+        &"x".repeat(MAX_SKILL_BYTES + 1),
+    );
+    let store = SkillStore::new(dir.path());
+
+    assert!(matches!(
+        store.read("big").err(),
+        Some(SkillError::TooLarge { .. })
+    ));
+}
+
+#[tokio::test]
+async fn the_catalog_hook_injects_descriptions_into_an_instance_session() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    write_skill(
+        dir.path(),
+        "alpha",
+        "Alpha description",
+        "Alpha body with secret detail",
+    );
+    let store = Arc::new(SkillStore::new(dir.path()));
+    let toggles = Arc::new(ToggleStore::in_memory());
+    let registry = Arc::new(InstanceRegistry::default());
+    let instance_id =
+        instance_with_policy(&registry, "alpha", ItemPolicy::Inherit, "qqofficial").await;
+
+    let hook = SkillCatalogHook::new(store.clone(), toggles.clone(), registry.clone());
+    let mut request = ChatRequest {
+        model: "test".to_string(),
+        messages: vec![ChatMessage::system("You are a bot")],
+        tools: Vec::new(),
+        temperature: None,
+        max_tokens: None,
+    };
+
+    hook.on_llm_request(
+        &format!("instance:{instance_id}:group:1:user:1#0"),
+        &mut request,
+    )
+    .await
+    .expect("hook");
+
+    let injected = request
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::System)
+        .map(|message| message.content.clone().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(injected.contains("Alpha description"), "{injected}");
+    // Progressive disclosure: the body must not be spent from the context window up front.
+    assert!(
+        !injected.contains("Alpha body with secret detail"),
+        "only the description may enter the prompt"
+    );
+
+    // The global switch removes it from the catalog entirely.
+    toggles
+        .set_enabled(SKILL_SECTION, "alpha", false)
+        .await
+        .expect("disable");
+    let mut disabled = ChatRequest {
+        model: "test".to_string(),
+        messages: vec![ChatMessage::system("You are a bot")],
+        tools: Vec::new(),
+        temperature: None,
+        max_tokens: None,
+    };
+    hook.on_llm_request(
+        &format!("instance:{instance_id}:group:1:user:1#0"),
+        &mut disabled,
+    )
+    .await
+    .expect("hook");
+    assert_eq!(
+        disabled.messages.len(),
+        1,
+        "no catalog when nothing is enabled"
+    );
+}
+
+#[tokio::test]
+async fn read_skill_enforces_the_instance_override() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    write_skill(dir.path(), "alpha", "Alpha description", "Alpha body");
+    write_skill(dir.path(), "beta", "Beta description", "Beta body");
+    let store = Arc::new(SkillStore::new(dir.path()));
+    let toggles = Arc::new(ToggleStore::in_memory());
+    let registry = Arc::new(InstanceRegistry::default());
+    let instance_id =
+        instance_with_policy(&registry, "alpha", ItemPolicy::Disable, "qqofficial").await;
+
+    let tool = ReadSkillTool::new(store, toggles, registry);
+    let session = format!("instance:{instance_id}:group:1:user:1#0");
+
+    // A disabled skill is refused even though the model guessed the right name.
+    let err = tool
+        .call(&session, serde_json::json!({ "name": "alpha" }))
+        .await
+        .err()
+        .expect("disabled skill must be refused");
+    assert!(err.contains("not available"), "{err}");
+
+    let body = tool
+        .call(&session, serde_json::json!({ "name": "beta" }))
+        .await
+        .expect("allowed skill");
+    assert!(body.contains("Beta body"));
+
+    let missing = tool
+        .call(&session, serde_json::json!({}))
+        .await
+        .err()
+        .expect("name is required");
+    assert!(missing.contains("name"), "{missing}");
+}

@@ -13,19 +13,17 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock};
 use tonic::transport::Channel;
 
+use crate::adapter::{AdapterDescriptor, AdapterKind, AdapterRegistry};
+use crate::manifest::PluginManifest;
+use crate::toggle::{PLUGIN_SECTION, ToggleStore};
 use kanon_proto::v1::message_pipeline_service_client::MessagePipelineServiceClient;
 use kanon_proto::v1::plugin_host_service_client::PluginHostServiceClient;
 use kanon_proto::v1::{
-    CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest,
-    DeliverMessageResponse, GetPluginMetaRequest, PipelineEventRequest, PluginMeta, PreFilterResult,
+    CommandExecuteRequest, CommandExecuteResponse, DeliverMessageRequest, DeliverMessageResponse,
+    GetPluginMetaRequest, PipelineEventRequest, PluginMeta, PreFilterResult,
     ReloadPluginConfigRequest, ReloadPluginConfigResponse, ToolCallRequest, ToolCallResponse,
 };
-use kanon_transport::{
-    connect_ipc, core_socket_path, default_run_dir, host_socket_path,
-};
-use crate::adapter::{AdapterDescriptor, AdapterKind, AdapterRegistry};
-use crate::plugin_state::PluginStateStore;
-use crate::manifest::PluginManifest;
+use kanon_transport::{connect_ipc, core_socket_path, default_run_dir, host_socket_path};
 
 pub mod circuit_breaker;
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState};
@@ -74,7 +72,9 @@ pub enum SupervisorError {
         reason: String,
     },
     /// Stale or out-of-order configuration update rejected by optimistic concurrency control.
-    #[error("Stale configuration version for plugin '{plugin_id}': current is {current_version}, requested {requested_version}")]
+    #[error(
+        "Stale configuration version for plugin '{plugin_id}': current is {current_version}, requested {requested_version}"
+    )]
     StaleConfigVersion {
         plugin_id: String,
         current_version: u64,
@@ -285,7 +285,10 @@ impl std::fmt::Debug for ManagedHost {
 #[allow(clippy::result_large_err)]
 impl ManagedHost {
     /// Dispatches an event through this host's pre-filter pipeline.
-    pub async fn pre_filter(&self, req: PipelineEventRequest) -> Result<PreFilterResult, tonic::Status> {
+    pub async fn pre_filter(
+        &self,
+        req: PipelineEventRequest,
+    ) -> Result<PreFilterResult, tonic::Status> {
         let mut client = self.pipeline_client.lock().await;
         let response = client.on_pre_filter(req).await?;
         Ok(response.into_inner())
@@ -464,19 +467,17 @@ impl ManagedHost {
 }
 
 #[tonic::async_trait]
+#[tonic::async_trait]
 impl kanon_llm::tool_router::ToolHost for ManagedHost {
     fn host_id(&self) -> &str {
         &self.host_id
     }
 
-    fn plugin_metas(&self) -> &[PluginMeta] {
-        &self.meta
+    fn plugin_metas(&self) -> Vec<PluginMeta> {
+        self.meta.clone()
     }
 
-    async fn call_tool(
-        &self,
-        req: ToolCallRequest,
-    ) -> Result<ToolCallResponse, tonic::Status> {
+    async fn call_tool(&self, req: ToolCallRequest) -> Result<ToolCallResponse, tonic::Status> {
         self.on_call_tool(req).await
     }
 }
@@ -683,7 +684,12 @@ impl Supervisor {
 
     /// Returns all plugins currently recorded as unavailable.
     pub async fn get_unavailable_plugins(&self) -> Vec<UnavailablePlugin> {
-        self.unavailable_plugins.read().await.values().cloned().collect()
+        self.unavailable_plugins
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Removes a recorded unavailable plugin entry (e.g. after a successful launch).
@@ -693,7 +699,12 @@ impl Supervisor {
 
     /// Returns the currently applied configuration version for a plugin (0 if never configured).
     pub async fn config_version(&self, plugin_id: &str) -> u64 {
-        self.config_versions.read().await.get(plugin_id).copied().unwrap_or(0)
+        self.config_versions
+            .read()
+            .await
+            .get(plugin_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Returns the built-in adapter registry owned by this supervisor.
@@ -797,7 +808,8 @@ impl Supervisor {
         executable_path: impl AsRef<Path>,
         args: &[&str],
     ) -> Result<Arc<ManagedHost>, SupervisorError> {
-        self.spawn_plugin_with_priority(host_id, executable_path, args, 500).await
+        self.spawn_plugin_with_priority(host_id, executable_path, args, 500)
+            .await
     }
 
     /// Spawns a plugin host sub-process with explicit execution priority,
@@ -815,8 +827,15 @@ impl Supervisor {
             args: args.iter().map(|a| (*a).to_string()).collect(),
             priority,
         };
-        self.launch_host(host_id, executable_path.as_ref(), args, priority, spec, None)
-            .await
+        self.launch_host(
+            host_id,
+            executable_path.as_ref(),
+            args,
+            priority,
+            spec,
+            None,
+        )
+        .await
     }
 
     /// Core host launch routine shared by every spawn path.
@@ -860,7 +879,10 @@ impl Supervisor {
 
         // Wait for child process to bind the socket and become ready.
         // We poll every 50ms with a 5-second deadline.
-        let channel = match self.wait_for_readiness(&mut child, host_id, &socket_path, Duration::from_secs(5)).await {
+        let channel = match self
+            .wait_for_readiness(&mut child, host_id, &socket_path, Duration::from_secs(5))
+            .await
+        {
             Ok(ch) => ch,
             Err(e) => {
                 // The process never became usable, so there is nothing to unload gracefully:
@@ -893,21 +915,19 @@ impl Supervisor {
             "Handshake completed successfully with plugin host"
         );
 
-        let managed_host = Arc::new(
-            ManagedHost {
-                host_id: host_id.to_string(),
-                socket_path: socket_path.clone(),
-                child: Mutex::new(Some(child)),
-                host_client: Mutex::new(host_client),
-                pipeline_client: Mutex::new(pipeline_client),
-                meta: plugins,
-                priority,
-                launch_spec: Some(spec),
-                manifest,
-                circuit_breaker: Arc::new(CircuitBreaker::with_defaults()),
-                health: Mutex::new(HostHealth::default()),
-            },
-        );
+        let managed_host = Arc::new(ManagedHost {
+            host_id: host_id.to_string(),
+            socket_path: socket_path.clone(),
+            child: Mutex::new(Some(child)),
+            host_client: Mutex::new(host_client),
+            pipeline_client: Mutex::new(pipeline_client),
+            meta: plugins,
+            priority,
+            launch_spec: Some(spec),
+            manifest,
+            circuit_breaker: Arc::new(CircuitBreaker::with_defaults()),
+            health: Mutex::new(HostHealth::default()),
+        });
 
         self.hosts
             .write()
@@ -955,8 +975,15 @@ impl Supervisor {
             match manifest.plugin.runtime.as_str() {
                 "rust" => {
                     let exec_path = parent.join(&manifest.plugin.entrypoint);
-                    self.launch_host(&host_id, &exec_path, &[], priority, spec, Some(manifest.clone()))
-                        .await
+                    self.launch_host(
+                        &host_id,
+                        &exec_path,
+                        &[],
+                        priority,
+                        spec,
+                        Some(manifest.clone()),
+                    )
+                    .await
                 }
                 "python" => {
                     let python_bin = std::env::var("KANON_PYTHON_BIN")
@@ -978,20 +1005,24 @@ impl Supervisor {
                         .or_else(|| find_file_upwards(parent, "kanon_host/main.py"))
                         .ok_or_else(|| SupervisorError::RuntimeUnavailable {
                             runtime: "python".to_string(),
-                            reason: "Could not locate Python host runner script (kanon_host/main.py)"
-                                .to_string(),
+                            reason:
+                                "Could not locate Python host runner script (kanon_host/main.py)"
+                                    .to_string(),
                         })?;
 
                     let host_script_str = host_script.to_string_lossy();
                     let manifest_str = manifest_path_ref.to_string_lossy();
-                    let args = [
-                        host_script_str.as_ref(),
-                        "--plugin",
-                        manifest_str.as_ref(),
-                    ];
+                    let args = [host_script_str.as_ref(), "--plugin", manifest_str.as_ref()];
 
-                    self.launch_host(&host_id, &python_bin, &args, priority, spec, Some(manifest.clone()))
-                        .await
+                    self.launch_host(
+                        &host_id,
+                        &python_bin,
+                        &args,
+                        priority,
+                        spec,
+                        Some(manifest.clone()),
+                    )
+                    .await
                 }
                 "typescript" | "ts" => {
                     let node_bin = std::env::var("KANON_NODE_BIN")
@@ -1017,14 +1048,17 @@ impl Supervisor {
 
                     let host_script_str = host_script.to_string_lossy();
                     let manifest_str = manifest_path_ref.to_string_lossy();
-                    let args = [
-                        host_script_str.as_ref(),
-                        "--plugin",
-                        manifest_str.as_ref(),
-                    ];
+                    let args = [host_script_str.as_ref(), "--plugin", manifest_str.as_ref()];
 
-                    self.launch_host(&host_id, &node_bin, &args, priority, spec, Some(manifest.clone()))
-                        .await
+                    self.launch_host(
+                        &host_id,
+                        &node_bin,
+                        &args,
+                        priority,
+                        spec,
+                        Some(manifest.clone()),
+                    )
+                    .await
                 }
                 other => Err(SupervisorError::RuntimeUnavailable {
                     runtime: other.to_string(),
@@ -1073,7 +1107,11 @@ impl Supervisor {
         self.stop_host(host_id).await?;
 
         match &spec {
-            LaunchSpec::Direct { executable, args, priority } => {
+            LaunchSpec::Direct {
+                executable,
+                args,
+                priority,
+            } => {
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
                 self.launch_host(
                     host_id,
@@ -1085,7 +1123,11 @@ impl Supervisor {
                 )
                 .await
             }
-            LaunchSpec::Manifest { manifest_path, executable_override, .. } => {
+            LaunchSpec::Manifest {
+                manifest_path,
+                executable_override,
+                ..
+            } => {
                 self.spawn_from_manifest(manifest_path, executable_override.as_deref())
                     .await
             }
@@ -1175,10 +1217,7 @@ impl Supervisor {
 
     /// Directly registers an externally created or mocked `ManagedHost` (useful for unit tests).
     pub async fn register_managed_host(&self, host: Arc<ManagedHost>) {
-        self.hosts
-            .write()
-            .await
-            .insert(host.host_id.clone(), host);
+        self.hosts.write().await.insert(host.host_id.clone(), host);
     }
 
     /// Binds an external or gRPC-registered plugin host endpoint into the unified Supervisor registry.
@@ -1272,7 +1311,7 @@ impl Supervisor {
     /// Disabled plugins are never restarted: their absence is intentional.
     pub fn spawn_host_watchdog(
         self: &Arc<Self>,
-        plugin_state: Arc<PluginStateStore>,
+        plugin_state: Arc<ToggleStore>,
         interval: Duration,
     ) -> tokio::task::JoinHandle<()> {
         let supervisor = Arc::clone(self);
@@ -1295,7 +1334,7 @@ impl Supervisor {
     /// One watchdog pass: inspects every host with a child process.
     async fn watchdog_tick(
         &self,
-        plugin_state: &PluginStateStore,
+        plugin_state: &ToggleStore,
         budgets: &mut HashMap<String, RestartBudget>,
     ) {
         for host in self.get_all_hosts().await {
@@ -1308,7 +1347,7 @@ impl Supervisor {
                 .map(|budget| budget.attempts)
                 .unwrap_or(0);
 
-            if !plugin_state.is_enabled(&plugin_id).await {
+            if !plugin_state.is_enabled(PLUGIN_SECTION, &plugin_id).await {
                 // The control plane stops disabled hosts; if one is still present, mark it so the
                 // console shows why it is not serving.
                 host.report_health("disabled", attempts, None).await;
@@ -1555,4 +1594,3 @@ fn find_file_upwards(start: &Path, rel_path: &str) -> Option<PathBuf> {
     }
     None
 }
-

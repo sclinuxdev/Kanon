@@ -27,17 +27,27 @@
 //! | `GET` | `/api/v1/providers` | Provider catalog plus the node's effective provider |
 //! | `PUT` | `/api/v1/providers/active` | Configure the node's provider (persisted, live) |
 //! | `DELETE` | `/api/v1/providers/active` | Clear the node's provider |
+//! | `GET` | `/api/v1/skills` | Installed skills with their node-wide switch |
+//! | `POST` | `/api/v1/skills` | Install a skill from a zip archive or local directory |
+//! | `DELETE` | `/api/v1/skills/:id` | Remove an installed skill |
+//! | `PUT` | `/api/v1/skills/:id/enabled` | Enable or disable a skill node-wide |
+//! | `GET` | `/api/v1/mcp/servers` | Configured MCP servers with health |
+//! | `PUT` | `/api/v1/mcp/servers/:id` | Create or replace an MCP server definition |
+//! | `DELETE` | `/api/v1/mcp/servers/:id` | Remove an MCP server definition |
+//! | `PUT` | `/api/v1/mcp/servers/:id/enabled` | Enable or disable an MCP server node-wide |
 //! | `POST` | `/api/v1/chat/completions` | Sandbox chat with JSON or SSE responses |
 
 pub mod adapters;
 pub mod chat;
 pub mod health;
 pub mod instances;
+pub mod mcp;
 pub mod metrics;
 pub mod personas;
 pub mod plugins;
 pub mod providers;
 pub mod sessions;
+pub mod skills;
 pub mod system;
 
 use axum::Router;
@@ -54,6 +64,8 @@ pub fn api_router() -> Router<ApiState> {
         .merge(instances::routes())
         .merge(plugins::routes())
         .merge(sessions::routes())
+        .merge(skills::routes())
+        .merge(mcp::routes())
         .merge(personas::routes())
         .merge(chat::routes())
         .merge(system::routes())

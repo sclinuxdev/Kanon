@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::agent::{Agent, AgentConfig, AgentHook};
+use crate::agent::{Agent, AgentConfig, AgentHook, AgentTool};
 use crate::gateway::LlmProvider;
 use crate::memory::Memory;
 use crate::prompt::PersonaRegistry;
@@ -34,8 +34,10 @@ pub struct AgentFactory {
     sessions: Arc<SessionManager>,
     /// Persona catalog shared by every agent.
     personas: Arc<PersonaRegistry>,
-    /// Optional lifecycle hook publishing traces for LLM and tool-calling stages.
-    hook: Option<Arc<dyn AgentHook>>,
+    /// Lifecycle hooks shared by every agent: trace publishing, skill catalogs, ...
+    hooks: Vec<Arc<dyn AgentHook>>,
+    /// Native in-process tools available to every agent (e.g. `read_skill`).
+    tools: Vec<Arc<dyn AgentTool>>,
     /// Agents built for per-instance model overrides, keyed by model identifier.
     ///
     /// Bounded by the number of distinct models operators configure, and dropped wholesale when
@@ -60,7 +62,8 @@ impl AgentFactory {
         memory: Arc<dyn Memory>,
         sessions: Arc<SessionManager>,
         personas: Arc<PersonaRegistry>,
-        hook: Option<Arc<dyn AgentHook>>,
+        hooks: Vec<Arc<dyn AgentHook>>,
+        tools: Vec<Arc<dyn AgentTool>>,
     ) -> Self {
         Self {
             name: name.into(),
@@ -68,7 +71,8 @@ impl AgentFactory {
             memory,
             sessions,
             personas,
-            hook,
+            hooks,
+            tools,
             overrides: RwLock::new(HashMap::new()),
         }
     }
@@ -166,11 +170,7 @@ impl AgentFactory {
     /// Used by the console sandbox, which may run a one-off request against credentials the
     /// operator typed without persisting them; such an agent must still see the same memory,
     /// sessions, personas and trace bus as the node's own.
-    pub fn build_with(
-        &self,
-        provider: Arc<dyn LlmProvider>,
-        config: AgentConfig,
-    ) -> Arc<Agent> {
+    pub fn build_with(&self, provider: Arc<dyn LlmProvider>, config: AgentConfig) -> Arc<Agent> {
         Arc::new(self.build_agent(provider, config))
     }
 
@@ -196,8 +196,11 @@ impl AgentFactory {
             .max_iterations(config.max_iterations)
             .stop_on_tool_failure(config.stop_on_tool_failure);
 
-        if let Some(hook) = &self.hook {
+        for hook in &self.hooks {
             builder = builder.hook_arc(hook.clone());
+        }
+        for tool in &self.tools {
+            builder = builder.tool_arc(tool.clone());
         }
         if let Some(temperature) = config.temperature {
             builder = builder.temperature(temperature);
@@ -208,5 +211,4 @@ impl AgentFactory {
 
         builder.build()
     }
-
 }

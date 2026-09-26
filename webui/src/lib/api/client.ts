@@ -2,15 +2,18 @@ import type {
   ActivateProviderRequest,
   ActivateProviderResponse,
   AdaptersResponse,
-  InstanceMutationResponse,
-  InstanceRequest,
-  InstancesResponse,
   CallPluginToolResponse,
   ChatCompletionRequest,
   ChatCompletionResponse,
   FetchModelsRequest,
   FetchModelsResponse,
   InstallPluginResponse,
+  InstanceMutationResponse,
+  InstanceRequest,
+  InstancesResponse,
+  McpCatalog,
+  McpServerView,
+  McpStateResponse,
   NodeHealth,
   PersonasResponse,
   PluginConfigResponse,
@@ -20,9 +23,12 @@ import type {
   QQOfficialPollLoginResponse,
   QQOfficialQrLoginResponse,
   SessionsResponse,
+  SkillCatalog,
+  SkillStateResponse,
   SystemConfig,
   TestProviderRequest,
   TestProviderResponse,
+  UpsertMcpServerRequest,
 } from '../types';
 
 export class ApiError extends Error {
@@ -34,6 +40,30 @@ export class ApiError extends Error {
     super(message);
     this.name = 'ApiError';
   }
+}
+
+/**
+ * Sends a multipart body and decodes the structured error envelope on failure.
+ *
+ * Uploads cannot use [`request`] because the browser must set the multipart boundary itself.
+ */
+async function sendMultipart<T>(path: string, body: FormData): Promise<T> {
+  const res = await fetch(path, { method: 'POST', body });
+  if (!res.ok) {
+    let code = 'error';
+    let message = `HTTP ${res.status}: ${res.statusText}`;
+    try {
+      const errJson = await res.json();
+      if (errJson.error?.code) code = errJson.error.code;
+      else if (errJson.code) code = errJson.code;
+      if (errJson.error?.message) message = errJson.error.message;
+      else if (errJson.message) message = errJson.message;
+    } catch {
+      // ignore json parse error
+    }
+    throw new ApiError(res.status, code, message);
+  }
+  return res.json() as Promise<T>;
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
@@ -102,14 +132,20 @@ export const api = {
       body: JSON.stringify(req),
     }),
   updateInstance: (id: string, req: InstanceRequest) =>
-    request<InstanceMutationResponse>(`/api/v1/instances/${encodeURIComponent(id)}`, {
-      method: 'PUT',
-      body: JSON.stringify(req),
-    }),
+    request<InstanceMutationResponse>(
+      `/api/v1/instances/${encodeURIComponent(id)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(req),
+      },
+    ),
   deleteInstance: (id: string) =>
-    request<InstanceMutationResponse>(`/api/v1/instances/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-    }),
+    request<InstanceMutationResponse>(
+      `/api/v1/instances/${encodeURIComponent(id)}`,
+      {
+        method: 'DELETE',
+      },
+    ),
 
   getPlugins: () => request<PluginsResponse>('/api/v1/plugins'),
   // Enabling spawns the plugin host; disabling stops it, so the plugin leaves routing entirely.
@@ -124,28 +160,13 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ path }),
     }),
-  installPluginArchive: async (file: File) => {
+  installPluginArchive: (file: File) => {
     const formData = new FormData();
     formData.append('file', file);
-    const res = await fetch('/api/v1/plugins/install', {
-      method: 'POST',
-      body: formData,
-    });
-    if (!res.ok) {
-      let code = 'error';
-      let message = `HTTP ${res.status}: ${res.statusText}`;
-      try {
-        const errJson = await res.json();
-        if (errJson.error?.code) code = errJson.error.code;
-        else if (errJson.code) code = errJson.code;
-        if (errJson.error?.message) message = errJson.error.message;
-        else if (errJson.message) message = errJson.message;
-      } catch {
-        // ignore json parse error
-      }
-      throw new ApiError(res.status, code, message);
-    }
-    return res.json() as Promise<InstallPluginResponse>;
+    return sendMultipart<InstallPluginResponse>(
+      '/api/v1/plugins/install',
+      formData,
+    );
   },
   getPluginConfig: (pluginId: string) =>
     request<PluginConfigResponse>(
@@ -166,6 +187,56 @@ export const api = {
         }),
       },
     ),
+  // Skills: installed instruction bundles the model pulls in through `read_skill`.
+  getSkills: () => request<SkillCatalog>('/api/v1/skills'),
+  setSkillEnabled: (skillId: string, enabled: boolean) =>
+    request<SkillStateResponse>(
+      `/api/v1/skills/${encodeURIComponent(skillId)}/enabled`,
+      { method: 'PUT', body: JSON.stringify({ enabled }) },
+    ),
+  removeSkill: (skillId: string) =>
+    request<SkillStateResponse>(
+      `/api/v1/skills/${encodeURIComponent(skillId)}`,
+      {
+        method: 'DELETE',
+      },
+    ),
+  installSkillArchive: async (file: File, id?: string) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (id?.trim()) formData.append('id', id.trim());
+    return sendMultipart<SkillCatalog['skills'][number]>(
+      '/api/v1/skills',
+      formData,
+    );
+  },
+  installSkillPath: (path: string, id?: string) =>
+    request<SkillCatalog['skills'][number]>('/api/v1/skills', {
+      method: 'POST',
+      body: JSON.stringify({ path, id: id?.trim() || null }),
+    }),
+
+  // MCP servers: definitions are edited here, the pool turns them into tool hosts.
+  getMcpServers: () => request<McpCatalog>('/api/v1/mcp/servers'),
+  upsertMcpServer: (serverId: string, req: UpsertMcpServerRequest) =>
+    request<McpServerView>(
+      `/api/v1/mcp/servers/${encodeURIComponent(serverId)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(req),
+      },
+    ),
+  removeMcpServer: (serverId: string) =>
+    request<McpStateResponse>(
+      `/api/v1/mcp/servers/${encodeURIComponent(serverId)}`,
+      { method: 'DELETE' },
+    ),
+  setMcpServerEnabled: (serverId: string, enabled: boolean) =>
+    request<McpStateResponse>(
+      `/api/v1/mcp/servers/${encodeURIComponent(serverId)}/enabled`,
+      { method: 'PUT', body: JSON.stringify({ enabled }) },
+    ),
+
   restartPlugin: (pluginId: string) =>
     request<{ success: boolean; message: string }>(
       `/api/v1/plugins/${encodeURIComponent(pluginId)}/restart`,

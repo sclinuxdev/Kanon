@@ -295,7 +295,10 @@ async fn list_plugins(State(state): State<ApiState>) -> Json<PluginCatalog> {
     // a missing host. This must run last: a plugin with no host is not necessarily disabled (its
     // launch may have failed), and only the state store knows the operator's intent.
     for view in &mut plugin_views {
-        let enabled = state.plugin_state().is_enabled(&view.id).await;
+        let enabled = state
+            .plugin_state()
+            .is_enabled(kanon_core::PLUGIN_SECTION, &view.id)
+            .await;
         view.enabled = enabled;
         view.health = match hosts.iter().find(|host| host.host_id == view.host_id) {
             Some(host) => Some(host.health().await),
@@ -357,7 +360,11 @@ fn discovered_plugin_views(
 
     discovered
         .into_iter()
-        .filter(|plugin| !existing.iter().any(|view| view.id == plugin.manifest.plugin.id))
+        .filter(|plugin| {
+            !existing
+                .iter()
+                .any(|view| view.id == plugin.manifest.plugin.id)
+        })
         .map(|plugin| {
             let manifest = plugin.manifest;
             let host_id = format!("host_{}", manifest.plugin.id.replace('.', "_"));
@@ -481,7 +488,11 @@ async fn restart_plugin(
 ) -> Result<Json<RestartResponse>, ApiError> {
     // Checked before the host lookup: a disabled plugin has no host by design, and "enable it
     // first" is far more useful than "not loaded by any active host".
-    if !state.plugin_state().is_enabled(&plugin_id).await {
+    if !state
+        .plugin_state()
+        .is_enabled(kanon_core::PLUGIN_SECTION, &plugin_id)
+        .await
+    {
         return Err(ApiError::Conflict(format!(
             "Plugin '{plugin_id}' is disabled; enable it before restarting its host"
         )));
@@ -570,10 +581,9 @@ async fn call_plugin_tool(
         )),
     };
 
-    let response = host
-        .on_call_tool(req)
-        .await
-        .map_err(|status| ApiError::Internal(format!("Tool execution failed: {}", status.message())))?;
+    let response = host.on_call_tool(req).await.map_err(|status| {
+        ApiError::Internal(format!("Tool execution failed: {}", status.message()))
+    })?;
 
     let result = match response.payload {
         Some(kanon_proto::v1::tool_call_response::Payload::StructuredResult(res)) => {
@@ -638,7 +648,10 @@ async fn invoke_plugin_action(
 
     Ok(Json(CallPluginToolResponse {
         success: response.success,
-        result: response.result.map(prost_struct_to_json).unwrap_or(Value::Null),
+        result: response
+            .result
+            .map(prost_struct_to_json)
+            .unwrap_or(Value::Null),
         error: if response.error_message.is_empty() {
             None
         } else {
@@ -677,7 +690,7 @@ async fn set_plugin_enabled(
 
     let changed = state
         .plugin_state()
-        .set_enabled(&plugin_id, body.enabled)
+        .set_enabled(kanon_core::PLUGIN_SECTION, &plugin_id, body.enabled)
         .await
         .map_err(ApiError::Internal)?;
 
@@ -758,10 +771,7 @@ fn find_manifest_path(
     plugin_id: &str,
 ) -> Result<std::path::PathBuf, ApiError> {
     let discovered = kanon_core::PluginScanner::scan(plugins_dir).map_err(|err| {
-        ApiError::Internal(format!(
-            "Could not scan {}: {err}",
-            plugins_dir.display()
-        ))
+        ApiError::Internal(format!("Could not scan {}: {err}", plugins_dir.display()))
     })?;
 
     discovered
@@ -804,7 +814,10 @@ async fn install_plugin(
             let file_name = field.file_name().map(ToString::to_string);
 
             if name == "path" {
-                let text = field.text().await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
                 if !text.trim().is_empty() {
                     path_str = Some(text.trim().to_string());
                 }
@@ -813,7 +826,10 @@ async fn install_plugin(
                     .as_ref()
                     .is_some_and(|f| f.ends_with(".kpk") || f.ends_with(".zip"))
             {
-                let bytes = field.bytes().await.map_err(|e| ApiError::BadRequest(e.to_string()))?;
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
                 archive_bytes = Some(bytes.to_vec());
             }
         }
@@ -856,30 +872,27 @@ async fn install_from_path(
         )));
     }
 
-    let manifest_file = if source_path.is_file()
-        && source_path
-            .file_name()
-            .is_some_and(|n| n == "plugin.toml")
-    {
-        source_path.to_path_buf()
-    } else if source_path.is_dir() {
-        let candidate = source_path.join("plugin.toml");
-        if candidate.is_file() {
-            candidate
-        } else if let Some(found) = PluginScanner::find_manifest_in_dir(source_path) {
-            found
+    let manifest_file =
+        if source_path.is_file() && source_path.file_name().is_some_and(|n| n == "plugin.toml") {
+            source_path.to_path_buf()
+        } else if source_path.is_dir() {
+            let candidate = source_path.join("plugin.toml");
+            if candidate.is_file() {
+                candidate
+            } else if let Some(found) = PluginScanner::find_manifest_in_dir(source_path) {
+                found
+            } else {
+                return Err(ApiError::BadRequest(format!(
+                    "No plugin.toml found in directory: {}",
+                    source_path.display()
+                )));
+            }
         } else {
             return Err(ApiError::BadRequest(format!(
-                "No plugin.toml found in directory: {}",
+                "Source path is neither a directory nor a plugin.toml file: {}",
                 source_path.display()
             )));
-        }
-    } else {
-        return Err(ApiError::BadRequest(format!(
-            "Source path is neither a directory nor a plugin.toml file: {}",
-            source_path.display()
-        )));
-    };
+        };
 
     let manifest = PluginManifest::load_from_file(&manifest_file)
         .map_err(|e| ApiError::BadRequest(format!("Invalid plugin manifest: {e}")))?;
@@ -894,11 +907,12 @@ async fn install_from_path(
     std::fs::create_dir_all(&plugins_root).map_err(|e| ApiError::Internal(e.to_string()))?;
     let dest_dir = plugins_root.join(&manifest.plugin.id);
 
-    let is_same = if let (Ok(c1), Ok(c2)) = (plugin_source_dir.canonicalize(), dest_dir.canonicalize()) {
-        c1 == c2
-    } else {
-        false
-    };
+    let is_same =
+        if let (Ok(c1), Ok(c2)) = (plugin_source_dir.canonicalize(), dest_dir.canonicalize()) {
+            c1 == c2
+        } else {
+            false
+        };
 
     let host_id = manifest.plugin.id.replace('.', "_");
     // Terminate existing host if running
@@ -923,10 +937,13 @@ async fn install_from_path(
 
     match spawn_result {
         Ok(host) => {
-            state.observability().events.publish(TraceEvent::PluginInstalled {
-                plugin_id: manifest.plugin.id.clone(),
-                host_id: host.host_id.clone(),
-            });
+            state
+                .observability()
+                .events
+                .publish(TraceEvent::PluginInstalled {
+                    plugin_id: manifest.plugin.id.clone(),
+                    host_id: host.host_id.clone(),
+                });
 
             let p_views = plugin_views_for(&host);
             let (commands, tools) = p_views
@@ -972,7 +989,9 @@ async fn install_from_path(
                 commands: declared.commands,
                 tools: declared.tools,
                 status: "RuntimeUnavailable".to_string(),
-                message: Some(format!("Plugin installed but runtime is unavailable: {reason}")),
+                message: Some(format!(
+                    "Plugin installed but runtime is unavailable: {reason}"
+                )),
             })
         }
         Err(err) => Err(ApiError::BadRequest(format!(
@@ -1027,7 +1046,8 @@ async fn install_from_archive(
             {
                 use std::os::unix::fs::PermissionsExt;
                 if let Some(mode) = file.unix_mode() {
-                    let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode));
+                    let _ =
+                        std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode));
                 }
             }
         }
@@ -1036,7 +1056,10 @@ async fn install_from_archive(
     let source_dir = if temp_dir.path().join("plugin.toml").is_file() {
         temp_dir.path().to_path_buf()
     } else if let Some(manifest_path) = PluginScanner::find_manifest_in_dir(temp_dir.path()) {
-        manifest_path.parent().unwrap_or(temp_dir.path()).to_path_buf()
+        manifest_path
+            .parent()
+            .unwrap_or(temp_dir.path())
+            .to_path_buf()
     } else {
         return Err(ApiError::BadRequest(
             "Uploaded archive does not contain a valid plugin.toml file".to_string(),

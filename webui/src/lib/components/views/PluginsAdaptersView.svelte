@@ -25,11 +25,22 @@ import {
 import { api } from '../../api/client';
 import { t } from '../../stores/i18n.svelte';
 import type {
-  PluginMeta,
   AdapterItem,
   PluginConfigResponse,
   PluginHost,
+  PluginMeta,
 } from '../../types';
+import McpView from './McpView.svelte';
+import SkillsView from './SkillsView.svelte';
+
+/**
+ * Top-level section of the extension console.
+ *
+ * Plugins, MCP servers and skills are three providers of the same thing — prompts, tools and
+ * adapters the node can offer — so they live behind one page with three tabs instead of three
+ * navigation entries.
+ */
+let activeTab = $state<'plugins' | 'mcp' | 'skills'>('plugins');
 
 let hosts = $state<PluginHost[]>([]);
 // Plugins without a host process. They would otherwise be invisible, and a disabled plugin is
@@ -253,9 +264,13 @@ async function loadData() {
     ]);
     hosts = pluginsRes.hosts;
     const hostedIds = new Set(
-      pluginsRes.hosts.flatMap((host) => host.plugins.map((plugin) => plugin.id)),
+      pluginsRes.hosts.flatMap((host) =>
+        host.plugins.map((plugin) => plugin.id),
+      ),
     );
-    orphanPlugins = pluginsRes.plugins.filter((plugin) => !hostedIds.has(plugin.id));
+    orphanPlugins = pluginsRes.plugins.filter(
+      (plugin) => !hostedIds.has(plugin.id),
+    );
     adapters = adaptersRes.adapters;
     if (
       adapters.length > 0 &&
@@ -284,7 +299,9 @@ async function togglePlugin(pluginId: string, enabled: boolean) {
     await api.setPluginEnabled(pluginId, enabled);
     await loadData();
   } catch (e) {
-    alert(`Failed to change plugin state: ${e instanceof Error ? e.message : String(e)}`);
+    alert(
+      `Failed to change plugin state: ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
 }
 
@@ -367,6 +384,42 @@ $effect(() => {
 </script>
 
 <div class="p-6 space-y-6 max-w-7xl mx-auto">
+  <!-- Section tabs -->
+  <div class="flex items-center gap-1 p-1 rounded-xl bg-zinc-100 dark:bg-zinc-800/80 w-fit">
+    <button
+      type="button"
+      onclick={() => (activeTab = 'plugins')}
+      class="px-3.5 py-1.5 text-xs sm:text-sm font-medium rounded-lg transition cursor-pointer {activeTab === 'plugins'
+        ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-2xs'
+        : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}"
+    >
+      {t('plugins.tab_plugins')}
+    </button>
+    <button
+      type="button"
+      onclick={() => (activeTab = 'mcp')}
+      class="px-3.5 py-1.5 text-xs sm:text-sm font-medium rounded-lg transition cursor-pointer {activeTab === 'mcp'
+        ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-2xs'
+        : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}"
+    >
+      {t('plugins.tab_mcp')}
+    </button>
+    <button
+      type="button"
+      onclick={() => (activeTab = 'skills')}
+      class="px-3.5 py-1.5 text-xs sm:text-sm font-medium rounded-lg transition cursor-pointer {activeTab === 'skills'
+        ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 shadow-2xs'
+        : 'text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'}"
+    >
+      {t('plugins.tab_skills')}
+    </button>
+  </div>
+
+  {#if activeTab === 'mcp'}
+    <McpView />
+  {:else if activeTab === 'skills'}
+    <SkillsView />
+  {:else}
   <!-- Top bar -->
   <div class="flex items-center justify-between">
     <div>
@@ -638,6 +691,7 @@ $effect(() => {
         </div>
       </div>
     </div>
+  {/if}
   {/if}
 </div>
 

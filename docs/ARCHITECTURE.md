@@ -594,7 +594,23 @@ Rust 核心全权主导 LLM 的生命周期与推理编排，确保高并发下�
 - **`actions`（仅控制台可见）**：运维操作通过 `PluginHostService.InvokeAction` 暴露（Python SDK 用 `@action(...)` 声明，不会出现在 `Plugin.meta()` 中）。控制台走 `POST /api/v1/plugins/{id}/actions/{action}`，核心内部流程（如 QQ 扫码绑定）同样走该 RPC，因此这类能力永远不会进入模型的函数列表。
 - 判定规则：**模型可以主动调用的 → tool；只能由人/控制台触发的 → action**。
 
-### 8.4 Tool Calling 跨语言执行状态机闭环
+### 8.4 扩展能力：MCP 服务器与技能 (MCP & Skills)
+
+核心自身不内置任何业务工具，但允许两类**外部能力来源**与插件工具共用同一套 Tool Calling 状态机：
+
+- **MCP 服务器**：核心内置 MCP 客户端（`stdio` 子进程与 `http` 端点两种传输），在 `tools/list` 后把每个工具注册为 `mcp__<server>__<tool>`。MCP 服务器与插件宿主一样实现 `ToolHost`，因此路由、审计追踪与熔断逻辑完全复用；连接按需建立，独立看门狗每 30 秒以 `tools/list` 作为存活探针，连续失败则标记为 `failed` 并在下一轮重连。
+- **技能 (Skills)**：`data/skills/<id>/SKILL.md` 中的指令包。**只有 `name` 与 `description` 进入系统提示词**（`SkillCatalogHook`），完整正文由模型通过内置 `read_skill` 工具按需读取——这样上下文开销与实际需要成正比，而不是把全部技能塞进每次请求。单个技能正文上限 64 KiB。
+
+两类能力与插件共享**同一套开关模型**，且全局开关优先：
+
+| 层级 | 载体 | 语义 |
+| :--- | :--- | :--- |
+| 全局 | `data/toggles.json` 的 `plugins` / `skills` / `mcp` 分区 | 运维总闸；停用即彻底不可用 |
+| 实例 | `BotInstance` 的 `plugins` / `skills` / `mcp` 覆盖表（`inherit` / `enable` / `disable`） | 仅能进一步限制，**不能**复活被全局停用的项 |
+
+流水线在实例门禁之后立即按该策略过滤插件宿主（`PreFilter`、内置/插件命令、工具聚合因此同时生效），MCP 与技能策略则在聚合工具与构建技能目录时求值。策略通过会话键中的实例标识解析，因此共享同一 Agent 的不同实例不会串用彼此的工具与技能。
+
+### 8.5 Tool Calling 跨语言执行状态机闭环
 
 ```mermaid
 sequenceDiagram
@@ -651,6 +667,14 @@ sequenceDiagram
 | `POST` | `/api/v1/chat/completions` | 在线沙盒对话调试，支持标准 JSON 与 `text/event-stream` 流式输出 |
 | `GET` | `/api/v1/adapters` | 查询已注册的平台适配器（内置 + 插件声明）及其连接存活状态与断路器状态 (`circuit_state`) |
 | `POST` | `/api/v1/adapters/{platform}/ingest` | 平台入站数据面：Fast-ACK 接收外部消息并推入核心流水线 |
+| `GET` | `/api/v1/skills` | 查询已安装技能及其全局开关状态 |
+| `POST` | `/api/v1/skills` | 安装技能（上传 zip 压缩包或指定本地目录，目录内必须含 `SKILL.md`） |
+| `DELETE` | `/api/v1/skills/{id}` | 卸载技能 |
+| `PUT` | `/api/v1/skills/{id}/enabled` | 全局启用/停用技能（实例级覆盖见 `/api/v1/instances`） |
+| `GET` | `/api/v1/mcp/servers` | 查询已配置的 MCP 服务器及其连接健康度与工具数量 |
+| `PUT` | `/api/v1/mcp/servers/{id}` | 新增或替换 MCP 服务器定义（`stdio` 子进程或 `http` 端点），保存后立即同步连接池 |
+| `DELETE` | `/api/v1/mcp/servers/{id}` | 删除 MCP 服务器定义并断开连接 |
+| `PUT` | `/api/v1/mcp/servers/{id}/enabled` | 全局启用/停用 MCP 服务器（停用即刻断开，释放子进程或连接） |
 
 ### 9.3 实时数据流 (WebSocket)
 

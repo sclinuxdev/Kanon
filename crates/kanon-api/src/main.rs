@@ -26,12 +26,14 @@ use kanon_api::{
     ApiServer, ApiState, LlmProviderConfig, Observability, SystemConfigStore, WebhookAdapter,
 };
 use kanon_core::ipc::{CoreApiService, CoreIpcServer, DEFAULT_INGEST_QUEUE_CAPACITY};
-use kanon_core::{
-    EventIngress, InstanceRegistry, PluginStateStore, sync_instance_personas,
-    DEFAULT_INSTANCE_CATALOG, DEFAULT_PLUGIN_STATE, HOST_WATCHDOG_INTERVAL,
-};
 use kanon_core::pipeline::PipelineEngine;
 use kanon_core::supervisor::Supervisor;
+use kanon_core::{
+    DEFAULT_INSTANCE_CATALOG, DEFAULT_MCP_CONFIG, DEFAULT_SKILLS_DIR, DEFAULT_TOGGLE_STATE,
+    EventIngress, HOST_WATCHDOG_INTERVAL, InstanceRegistry, MCP_WATCHDOG_INTERVAL, McpConfigStore,
+    McpPool, PLUGIN_SECTION, ReadSkillTool, SkillCatalogHook, SkillStore, ToggleStore,
+    sync_instance_personas,
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
@@ -59,10 +61,7 @@ async fn main() -> StartupResult<()> {
     let default_ipc = CoreIpcServer::with_default_path(CoreApiService::new(ingress.clone()));
     let socket_path = default_ipc.socket_path().to_path_buf();
 
-    let supervisor = Arc::new(Supervisor::new(
-        None,
-        Some(socket_path.clone()),
-    ));
+    let supervisor = Arc::new(Supervisor::new(None, Some(socket_path.clone())));
 
     // --- Bot instances ----------------------------------------------------------------
     // Instances decide whether inbound platform traffic is answered at all: with no enabled
@@ -86,13 +85,40 @@ async fn main() -> StartupResult<()> {
     // Toggling a plugin must not rewrite files inside the user's plugin directory, so the state
     // lives beside the node's other settings and is applied at startup and on every toggle.
     let plugin_state = Arc::new(
-        PluginStateStore::open(DEFAULT_PLUGIN_STATE)
+        ToggleStore::open(DEFAULT_TOGGLE_STATE)
             .await
             .map_err(|err| format!("Failed to load the plugin state store: {err}"))?,
     );
-    let disabled_plugins = plugin_state.disabled_ids().await;
+    let disabled_plugins = plugin_state.disabled_ids(PLUGIN_SECTION).await;
     if !disabled_plugins.is_empty() {
         tracing::info!(plugins = ?disabled_plugins, "Plugins disabled by the operator");
+    }
+
+    // --- MCP servers ------------------------------------------------------------------
+    // MCP tools are offered through exactly the same router as plugin tools, so the pool is
+    // created here and shared with both the console and the pipeline worker.
+    let mcp_config = Arc::new(
+        McpConfigStore::open(DEFAULT_MCP_CONFIG)
+            .await
+            .map_err(|err| format!("Failed to load the MCP configuration: {err}"))?,
+    );
+    let mcp_pool = Arc::new(McpPool::new());
+    mcp_pool.sync_from_config(&mcp_config).await;
+    let mcp_server_count = mcp_pool.describe().await.len();
+    if mcp_server_count > 0 {
+        tracing::info!(count = mcp_server_count, "MCP servers configured");
+    }
+
+    // --- Skills -----------------------------------------------------------------------
+    // Skills are plain directories on disk; the store only reads them, and the catalog hook plus
+    // the `read_skill` tool enforce the node-wide and per-instance switches at call time.
+    let skills = Arc::new(SkillStore::new(DEFAULT_SKILLS_DIR));
+    match skills.list() {
+        Ok(installed) if !installed.is_empty() => {
+            tracing::info!(count = installed.len(), "Skills installed");
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(error = %err, "Failed to enumerate the skills directory"),
     }
 
     // --- Management gateway state & agent engine --------------------------------------
@@ -104,6 +130,19 @@ async fn main() -> StartupResult<()> {
         .with_ingress(ingress.clone())
         .with_instances(instances.clone())
         .with_plugin_state(plugin_state.clone())
+        .with_mcp_pool(mcp_pool.clone())
+        .with_mcp_config(mcp_config.clone())
+        .with_skill_store(skills.clone())
+        .with_native_tools(vec![Arc::new(ReadSkillTool::new(
+            skills.clone(),
+            plugin_state.clone(),
+            instances.clone(),
+        ))])
+        .with_hooks(vec![Arc::new(SkillCatalogHook::new(
+            skills.clone(),
+            plugin_state.clone(),
+            instances.clone(),
+        ))])
         .build();
 
     // Publish instance prompts as personas before the first message can arrive.
@@ -141,7 +180,9 @@ async fn main() -> StartupResult<()> {
         PipelineEngine::new(supervisor.clone())
             .with_observer(observability.events.clone())
             .with_agent_factory(state.agent_factory().clone())
-            .with_instances(instances.clone()),
+            .with_instances(instances.clone())
+            .with_toggles(plugin_state.clone())
+            .with_mcp_pool(mcp_pool.clone()),
     );
     let pipeline_worker = engine.clone().start_worker(event_rx);
     let outbound_dispatcher = engine.clone().start_outbound_dispatcher();
@@ -187,7 +228,13 @@ async fn main() -> StartupResult<()> {
 
     // A crashed host is otherwise invisible: the supervisor would keep advertising a dead process
     // as healthy and route events into a closed socket. The watchdog prunes and restarts it.
-    let host_watchdog = supervisor.spawn_host_watchdog(plugin_state.clone(), HOST_WATCHDOG_INTERVAL);
+    let host_watchdog =
+        supervisor.spawn_host_watchdog(plugin_state.clone(), HOST_WATCHDOG_INTERVAL);
+    let mcp_watchdog = mcp_pool.spawn_watchdog(
+        mcp_config.clone(),
+        plugin_state.clone(),
+        MCP_WATCHDOG_INTERVAL,
+    );
     tracing::info!(
         interval_secs = HOST_WATCHDOG_INTERVAL.as_secs(),
         "Plugin host watchdog started"
@@ -233,6 +280,7 @@ async fn main() -> StartupResult<()> {
         tracing::warn!(platform = %platform, error = %error, "Adapter failed to stop cleanly");
     }
     host_watchdog.abort();
+    mcp_watchdog.abort();
     supervisor.stop_all().await?;
 
     tracing::info!("Kanon node shut down gracefully");
@@ -264,8 +312,8 @@ fn bootstrap_provider() -> StartupResult<Option<(LlmProviderConfig, &'static str
 /// driven by `curl`), while outbound delivery stays explicitly disabled until a callback URL is
 /// provided, which the console reports as `connected: false`.
 async fn register_webhook_adapter(supervisor: &Arc<Supervisor>) -> StartupResult<()> {
-    let platform =
-        std::env::var("KANON_WEBHOOK_PLATFORM").unwrap_or_else(|_| DEFAULT_WEBHOOK_PLATFORM.to_string());
+    let platform = std::env::var("KANON_WEBHOOK_PLATFORM")
+        .unwrap_or_else(|_| DEFAULT_WEBHOOK_PLATFORM.to_string());
     let callback_url = std::env::var("KANON_WEBHOOK_CALLBACK_URL")
         .ok()
         .filter(|url| !url.trim().is_empty());
@@ -279,10 +327,7 @@ async fn register_webhook_adapter(supervisor: &Arc<Supervisor>) -> StartupResult
         adapter = adapter.with_secret(sec);
     }
 
-    supervisor
-        .adapters()
-        .register(Arc::new(adapter))
-        .await?;
+    supervisor.adapters().register(Arc::new(adapter)).await?;
 
     if callback_url.is_some() {
         tracing::info!(platform = %platform, "Webhook adapter registered with outbound callback");
@@ -324,7 +369,7 @@ fn resolve_api_addr() -> StartupResult<SocketAddr> {
 async fn load_plugins_from_directory(
     supervisor: &Arc<Supervisor>,
     dir: impl AsRef<std::path::Path>,
-    plugin_state: &Arc<PluginStateStore>,
+    plugin_state: &Arc<ToggleStore>,
 ) {
     let plugins = match kanon_core::PluginScanner::scan(dir.as_ref()) {
         Ok(p) => p,
@@ -334,14 +379,17 @@ async fn load_plugins_from_directory(
         }
     };
 
-    tracing::info!(count = plugins.len(), "Discovered plugins during startup scan");
+    tracing::info!(
+        count = plugins.len(),
+        "Discovered plugins during startup scan"
+    );
 
     for discovered in plugins {
         let plugin_id = discovered.manifest.plugin.id.clone();
         let runtime = discovered.manifest.plugin.runtime.clone();
 
         // A disabled plugin is not spawned at all: no host process, no routing, no adapter.
-        if !plugin_state.is_enabled(&plugin_id).await {
+        if !plugin_state.is_enabled(PLUGIN_SECTION, &plugin_id).await {
             tracing::info!(
                 plugin_id = %plugin_id,
                 "Plugin is disabled by the operator; skipping launch"
@@ -349,7 +397,10 @@ async fn load_plugins_from_directory(
             continue;
         }
 
-        match supervisor.spawn_from_manifest(&discovered.manifest_path, None).await {
+        match supervisor
+            .spawn_from_manifest(&discovered.manifest_path, None)
+            .await
+        {
             Ok(host) => {
                 tracing::info!(
                     plugin_id = %plugin_id,

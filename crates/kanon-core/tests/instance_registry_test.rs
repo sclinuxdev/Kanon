@@ -10,6 +10,9 @@ fn draft(name: &str, enabled: bool, adapters: &[&str]) -> InstanceDraft {
         persona_id: None,
         system_prompt: None,
         model: None,
+        plugins: Default::default(),
+        skills: Default::default(),
+        mcp: Default::default(),
     }
 }
 
@@ -142,7 +145,10 @@ async fn ambiguous_ownership_is_reported_instead_of_guessed() {
     let err = InstanceRegistry::open(&path)
         .await
         .expect_err("ambiguous catalog must be rejected");
-    assert!(matches!(err, InstanceError::Conflict { .. }), "unexpected: {err}");
+    assert!(
+        matches!(err, InstanceError::Conflict { .. }),
+        "unexpected: {err}"
+    );
 }
 
 #[tokio::test]
@@ -167,9 +173,15 @@ async fn new_command_rotates_only_its_conversation_and_keeps_history() {
     assert_ne!(rotated, initial, "rotation must move to a new session key");
 
     // Only the issuing conversation moves; other conversations keep their session.
-    let current = registry.get(&instance.id).await.expect("instance still present");
+    let current = registry
+        .get(&instance.id)
+        .await
+        .expect("instance still present");
     assert_eq!(current.conversation_session_id(conversation), rotated);
-    assert_eq!(current.conversation_session_id(other), other_session(&current, other));
+    assert_eq!(
+        current.conversation_session_id(other),
+        other_session(&current, other)
+    );
 
     // The catalog remembers the rotation across a restart.
     let restored = registry.get(&instance.id).await.expect("instance");
@@ -205,6 +217,9 @@ async fn update_preserves_session_history_and_validates_input() {
                 persona_id: Some("assistant".to_string()),
                 system_prompt: Some("  be nice  ".to_string()),
                 model: Some("  deepseek-flash ".to_string()),
+                plugins: Default::default(),
+                skills: Default::default(),
+                mcp: Default::default(),
             },
         )
         .await
@@ -215,7 +230,10 @@ async fn update_preserves_session_history_and_validates_input() {
     assert_eq!(updated.system_prompt.as_deref(), Some("be nice"));
     assert_eq!(updated.model.as_deref(), Some("deepseek-flash"));
     // A custom prompt wins over the selected catalog persona.
-    assert_eq!(updated.effective_persona_id().as_deref(), Some("instance:bot"));
+    assert_eq!(
+        updated.effective_persona_id().as_deref(),
+        Some("instance:bot")
+    );
 
     let blank = registry
         .update(&instance.id, draft("   ", true, &[]))

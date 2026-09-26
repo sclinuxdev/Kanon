@@ -7,14 +7,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use kanon_core::instance::{InstanceDraft, InstanceRegistry};
-use kanon_core::pipeline::{PipelineEngine, PipelineResult};
-use kanon_core::supervisor::Supervisor;
+use kanon_core::instance::{InstanceDraft, InstanceRegistry, ItemPolicy};
+use kanon_core::pipeline::{PipelineEngine, PipelineObserver, PipelineResult, PipelineStage};
+use kanon_core::supervisor::{ManagedHost, Supervisor};
+use kanon_core::toggle::{PLUGIN_SECTION, ToggleStore};
 use kanon_llm::gateway::types::{ChatRequest, ChatResponse};
 use kanon_llm::memory::{Memory, SlidingWindowMemory};
 use kanon_llm::tool_router::ToolRouter;
 use kanon_llm::{Agent, GatewayError, LlmProvider};
-use kanon_proto::v1::PipelineEventRequest;
+use kanon_proto::v1::{PipelineEventRequest, PluginMeta};
 
 /// Provider that answers every turn and counts how often it was asked.
 struct CountingProvider {
@@ -63,6 +64,55 @@ async fn harness(
     (engine, calls, memory)
 }
 
+/// Observer that records how many hosts survived the per-instance policy filter.
+#[derive(Default)]
+struct HostCounter {
+    host_counts: std::sync::Mutex<Vec<usize>>,
+}
+
+impl PipelineObserver for HostCounter {
+    fn on_stage(&self, stage: &PipelineStage) {
+        if let PipelineStage::PreFilterStarted { host_count, .. } = stage {
+            self.host_counts
+                .lock()
+                .expect("host counts lock")
+                .push(*host_count);
+        }
+    }
+}
+
+impl HostCounter {
+    /// Returns the host count reported by the last pipeline start.
+    fn last(&self) -> Option<usize> {
+        self.host_counts
+            .lock()
+            .expect("host counts lock")
+            .last()
+            .copied()
+    }
+}
+
+/// Registers a plugin host with one command, mirroring a real out-of-process host.
+async fn register_plugin_host(supervisor: &Supervisor, plugin_id: &str) {
+    let host_id = plugin_id.replace('.', "_");
+    let host = Arc::new(ManagedHost::new(
+        host_id.clone(),
+        std::path::PathBuf::from(format!("/tmp/{host_id}.sock")),
+        tonic::transport::Channel::from_static("http://127.0.0.1:9").connect_lazy(),
+        vec![PluginMeta {
+            id: plugin_id.to_string(),
+            name: plugin_id.to_string(),
+            version: "1.0.0".to_string(),
+            author: "Tester".to_string(),
+            description: "Policy fixture host".to_string(),
+            commands: Vec::new(),
+            tools: Vec::new(),
+        }],
+        100,
+    ));
+    supervisor.register_managed_host(host).await;
+}
+
 /// Inbound event fixture.
 fn event(platform: &str, event_id: &str, text: &str) -> PipelineEventRequest {
     PipelineEventRequest {
@@ -86,6 +136,9 @@ async fn instance(registry: &InstanceRegistry, enabled: bool, adapters: &[&str])
             persona_id: None,
             system_prompt: None,
             model: None,
+            plugins: Default::default(),
+            skills: Default::default(),
+            mcp: Default::default(),
         })
         .await
         .expect("create instance")
@@ -106,7 +159,11 @@ async fn inbound_events_are_dropped_when_no_instance_claims_the_platform() {
         matches!(result, PipelineResult::NoInstance { .. }),
         "unclaimed platform must be dropped, got {result:?}"
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 0, "the model must not be called");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the model must not be called"
+    );
 }
 
 #[tokio::test]
@@ -144,8 +201,14 @@ async fn an_enabled_instance_answers_and_namespaces_the_session() {
 
     // The conversation lives in a session namespaced by the instance.
     let session_id = format!("instance:{id}:group:1:user:1#0");
-    let history = memory.get_messages(&session_id).await.expect("session history");
-    assert!(!history.is_empty(), "the instance session must hold the turn");
+    let history = memory
+        .get_messages(&session_id)
+        .await
+        .expect("session history");
+    assert!(
+        !history.is_empty(),
+        "the instance session must hold the turn"
+    );
 }
 
 #[tokio::test]
@@ -195,7 +258,10 @@ async fn new_command_rotates_the_session_without_touching_the_model() {
         .await;
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     let new_history = memory.get_messages(&session_id).await.expect("new session");
-    assert!(!new_history.is_empty(), "the new session must receive the turn");
+    assert!(
+        !new_history.is_empty(),
+        "the new session must receive the turn"
+    );
     let retained = memory
         .get_messages(&first_session)
         .await
@@ -204,6 +270,114 @@ async fn new_command_rotates_the_session_without_touching_the_model() {
         retained.len(),
         first_history.len(),
         "the previous session must keep its history unchanged"
+    );
+}
+
+#[tokio::test]
+async fn a_plugin_disabled_for_an_instance_is_removed_before_pre_filter() {
+    const PLUGIN_ID: &str = "org.kanon.plugin.noisy";
+    let registry = Arc::new(InstanceRegistry::default());
+    registry
+        .create(InstanceDraft {
+            name: "Policy Bot".to_string(),
+            enabled: true,
+            adapters: vec!["qqofficial".to_string()],
+            persona_id: None,
+            system_prompt: None,
+            model: None,
+            plugins: std::collections::HashMap::from([(
+                PLUGIN_ID.to_string(),
+                ItemPolicy::Disable,
+            )]),
+            skills: Default::default(),
+            mcp: Default::default(),
+        })
+        .await
+        .expect("create instance");
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let supervisor = Arc::new(Supervisor::new(Some(temp.path().to_path_buf()), None));
+    std::mem::forget(temp);
+    register_plugin_host(&supervisor, PLUGIN_ID).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let memory: Arc<dyn Memory> = Arc::new(SlidingWindowMemory::new(20));
+    let agent = Arc::new(
+        Agent::builder(
+            "policy-test",
+            Arc::new(CountingProvider {
+                calls: calls.clone(),
+            }),
+        )
+        .memory(memory)
+        .model("test-model")
+        .build(),
+    );
+    let observer = Arc::new(HostCounter::default());
+
+    // The store is authoritative for the node-wide switch; the instance policy is what removes the
+    // host here, so the plugin stays enabled globally.
+    let toggles = Arc::new(ToggleStore::in_memory());
+    toggles
+        .set_enabled(PLUGIN_SECTION, PLUGIN_ID, true)
+        .await
+        .expect("enable plugin");
+
+    let engine = PipelineEngine::new(supervisor.clone())
+        .with_tool_router(Arc::new(ToolRouter::from_arc(agent)))
+        .with_instances(registry)
+        .with_toggles(toggles)
+        .with_observer(observer.clone());
+
+    engine
+        .process_event(event("qqofficial", "evt-8", "你好"))
+        .await;
+
+    assert_eq!(
+        observer.last(),
+        Some(0),
+        "a plugin disabled for this instance must never reach pre-filter"
+    );
+}
+
+#[tokio::test]
+async fn an_unspecified_plugin_policy_keeps_the_host_in_the_pipeline() {
+    const PLUGIN_ID: &str = "org.kanon.plugin.quiet";
+    let registry = Arc::new(InstanceRegistry::default());
+    instance(&registry, true, &["qqofficial"]).await;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let supervisor = Arc::new(Supervisor::new(Some(temp.path().to_path_buf()), None));
+    std::mem::forget(temp);
+    register_plugin_host(&supervisor, PLUGIN_ID).await;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent = Arc::new(
+        Agent::builder(
+            "policy-test",
+            Arc::new(CountingProvider {
+                calls: calls.clone(),
+            }),
+        )
+        .memory(Arc::new(SlidingWindowMemory::new(20)))
+        .model("test-model")
+        .build(),
+    );
+    let observer = Arc::new(HostCounter::default());
+    let engine = PipelineEngine::new(supervisor)
+        .with_tool_router(Arc::new(ToolRouter::from_arc(agent)))
+        .with_instances(registry)
+        .with_toggles(Arc::new(ToggleStore::in_memory()))
+        .with_observer(observer.clone());
+
+    engine
+        .process_event(event("qqofficial", "evt-9", "你好"))
+        .await;
+
+    assert_eq!(
+        observer.last(),
+        Some(1),
+        "with no override the host must stay available to the instance"
     );
 }
 

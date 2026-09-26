@@ -24,6 +24,7 @@ if str(_python_sdk_dir) not in sys.path:
     sys.path.insert(0, str(_python_sdk_dir))
 
 from kanon_sdk.context import CoreHandle, PluginContext
+from kanon_sdk.ipc import connect_core_channel
 from kanon_sdk.plugin import Plugin
 from kanon_sdk.proto import pb, pb_grpc
 
@@ -236,8 +237,10 @@ async def main() -> None:
         if core_sock.exists():
             try:
                 # One channel and one stub for the whole process lifetime; adapter
-                # tasks share them through CoreHandle's internal lock.
-                core_channel = grpc.aio.insecure_channel(f"unix:{core_sock}")
+                # tasks share them through CoreHandle's internal lock. Dialing goes
+                # through the SDK helper, which pins the HTTP/2 authority that
+                # Tonic's h2 server requires (see kanon_sdk.ipc).
+                core_channel = connect_core_channel(core_sock)
                 core_stub = pb_grpc.BotApiServiceStub(core_channel)
 
                 # Registration doubles as the reachability probe: only a Core that

@@ -184,6 +184,10 @@ kanon/
    - 将 Windows 安全鉴权封装为标准的 `tonic::service::Interceptor`；
    - 在 gRPC 解包前统一从 HTTP/2 HEADERS 中抽取 `x-kanon-auth-token` 并进行 `constant_time_eq` 恒定时间校验；
    - 鉴权逻辑严格隔离在 Transport 层，禁止将安全握手代码散落侵入至上层业务 RPC Handler。
+3. **跨语言客户端的 HTTP/2 `:authority` 硬性约束**：
+   - Core 服务端基于 Tonic/Hyper（`h2`），会对 `:authority` 做严格语法校验；百分号转义仅允许出现在 userinfo 或 IPv6 zone id 中，出现在 host 段即判定为畸形头，服务端在业务逻辑执行前直接回 `RST_STREAM(PROTOCOL_ERROR)`。
+   - **禁止将 socket 路径写入 `:authority`**：gRPC C-core（Python）在 `unix:/abs/path/core.sock` 目标下会把百分号转义后的路径（如 `run%2Fuser%2F1000%2Fkanon%2Frun%2Fcore.sock`）当作 authority 发送，导致 `BotApiService` 全部 RPC 失败，且客户端只能看到与崩溃相似的误导性错误：`StatusCode.INTERNAL "Stream removed (RST_STREAM (Received RST_STREAM with error code 1))"`。改写为 `unix:///abs/path` 亦无效，必须显式固定合法 authority。
+   - Python SDK 统一通过 `kanon_sdk.ipc.connect_core_channel()` 建链（固定 `grpc.default_authority`），禁止各 Host / 插件自行调用 `grpc.aio.insecure_channel("unix:...")`；Rust SDK（Tonic `http://localhost`）与 TypeScript SDK（gRPC-js unix resolver 固定 `localhost`）天然合规。
 
 ---
 

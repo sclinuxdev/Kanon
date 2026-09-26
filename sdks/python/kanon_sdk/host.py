@@ -10,6 +10,7 @@ from typing import Optional, Union
 import grpc
 
 from kanon_sdk.context import CoreHandle, PluginContext
+from kanon_sdk.ipc import connect_core_channel
 from kanon_sdk.plugin import Plugin
 from kanon_sdk.proto import pb, pb_grpc
 
@@ -184,7 +185,9 @@ class KanonHost:
         if self.core_sock:
             if self.core_sock.exists():
                 try:
-                    core_channel = grpc.aio.insecure_channel(f"unix:{self.core_sock}")
+                    # Dial through the shared helper: it pins the valid HTTP/2 authority that
+                    # Tonic's h2 server requires (see kanon_sdk.ipc for the full rationale).
+                    core_channel = connect_core_channel(self.core_sock)
                     core_stub = pb_grpc.BotApiServiceStub(core_channel)
                     reg_req = pb.RegisterHostRequest(
                         host_id=self.host_id,

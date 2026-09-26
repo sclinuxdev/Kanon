@@ -27,9 +27,9 @@ for p in (str(_current_dir), _sdk_path):
         sys.path.insert(0, p)
 
 import botpy
-from kanon_sdk import Plugin, PluginContext, tool
+from kanon_sdk import CoreHandle, Plugin, PluginContext, connect_core_channel, tool
 from kanon_sdk.host import KanonHost
-from kanon_sdk.proto import pb
+from kanon_sdk.proto import pb, pb_grpc
 
 from auth import (
     poll_qqofficial_login_once,
@@ -176,10 +176,10 @@ class QQOfficialAdapter(Plugin):
             core_sock = Path(core_sock_str).resolve()
             if core_sock.exists():
                 try:
-                    import grpc
-                    from kanon_sdk.context import CoreHandle
-                    from kanon_sdk.proto import pb_grpc
-                    core_channel = grpc.aio.insecure_channel(f"unix:{core_sock}")
+                    # The SDK helper owns channel construction: it pins the HTTP/2 authority
+                    # that Tonic's h2 server requires, without which every RPC is reset with
+                    # an opaque "Stream removed (RST_STREAM ... error code 1)".
+                    core_channel = connect_core_channel(core_sock)
                     core_stub = pb_grpc.BotApiServiceStub(core_channel)
                     self.context.core = CoreHandle(core_stub)
                     print(f"[QQOfficial] Lazily connected to Kanon Core at {core_sock}", flush=True)

@@ -36,6 +36,40 @@ pub trait ToolHost: Send + Sync {
     async fn call_tool(&self, req: ToolCallRequest) -> Result<ToolCallResponse, tonic::Status>;
 }
 
+/// Rich media produced by a tool call, ready to be attached to an outbound message.
+///
+/// Kept free of the protobuf type on purpose: the pipeline reasons about "an image to send", not
+/// about the wire representation a plugin host happened to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolAttachment {
+    /// MIME type of the payload (e.g. `image/png`).
+    pub mime_type: String,
+    /// Absolute path of a file holding the bytes, when the core materialized them.
+    pub file_path: Option<String>,
+    /// Remote URL, when the tool referenced one instead of embedding bytes.
+    pub url: Option<String>,
+}
+
+impl ToolAttachment {
+    /// Converts the wire representation into the domain type.
+    pub fn from_proto(proto: kanon_proto::v1::ToolAttachment) -> Self {
+        Self {
+            mime_type: proto.mime_type,
+            file_path: proto.file_path,
+            url: proto.url,
+        }
+    }
+
+    /// Converts the domain type into its wire representation.
+    pub fn to_proto(&self) -> kanon_proto::v1::ToolAttachment {
+        kanon_proto::v1::ToolAttachment {
+            mime_type: self.mime_type.clone(),
+            file_path: self.file_path.clone(),
+            url: self.url.clone(),
+        }
+    }
+}
+
 /// Record of an executed tool call, useful for audit logging and verification.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutedToolCall {
@@ -58,6 +92,8 @@ pub struct ToolRouterOutput {
     pub content: String,
     /// Audit sequence of all tool calls executed across reasoning turns.
     pub executed_tools: Vec<ExecutedToolCall>,
+    /// Rich media produced by those tool calls, in execution order.
+    pub attachments: Vec<ToolAttachment>,
 }
 
 /// Sanitizes a plugin identifier so it is compliant with model tool naming constraints.
@@ -266,6 +302,7 @@ impl ToolRouter {
             Ok(output) => Ok(ToolRouterOutput {
                 content: output.content,
                 executed_tools: output.executed_tools,
+                attachments: output.attachments,
             }),
             Err(AgentError::Gateway(e)) => Err(ToolRouterError::Gateway(e)),
             Err(AgentError::Rpc(s)) => Err(ToolRouterError::Rpc(s)),

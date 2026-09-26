@@ -149,12 +149,25 @@ fn segment_to_json(segment: &MessageSegment) -> Value {
             "type": "text",
             "content": t.content,
         }),
-        Some(Segment::Image(img)) => serde_json::json!({
-            "type": "image",
-            "mime_type": img.mime_type,
-            "filename": img.filename,
-            "has_bytes": img.source.as_ref().is_some_and(|s| matches!(s, kanon_proto::v1::image_segment::Source::RawBytes(_))),
-        }),
+        Some(Segment::Image(img)) => {
+            // The location travels with the record: an operator diagnosing an undelivered picture
+            // needs to know which file the adapter could not send (raw bytes stay out of the log).
+            let (file_path, url) = match img.source.as_ref() {
+                Some(kanon_proto::v1::image_segment::Source::FilePath(path)) => {
+                    (Some(path.clone()), None)
+                }
+                Some(kanon_proto::v1::image_segment::Source::Url(url)) => (None, Some(url.clone())),
+                _ => (None, None),
+            };
+            serde_json::json!({
+                "type": "image",
+                "mime_type": img.mime_type,
+                "filename": img.filename,
+                "file_path": file_path,
+                "url": url,
+                "has_bytes": img.source.as_ref().is_some_and(|s| matches!(s, kanon_proto::v1::image_segment::Source::RawBytes(_))),
+            })
+        }
         Some(Segment::Audio(aud)) => serde_json::json!({
             "type": "audio",
             "duration_seconds": aud.duration_seconds,

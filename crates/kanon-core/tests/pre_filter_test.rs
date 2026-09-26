@@ -72,6 +72,7 @@ impl MessagePipelineService for MockPipeline {
             success: true,
             error_message: String::new(),
             payload: None,
+            attachments: Vec::new(),
         }))
     }
 

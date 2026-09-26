@@ -25,7 +25,8 @@ use crate::gateway::types::{
 use crate::gateway::{ChatChunk, ChatChunkStream, LlmProvider};
 use crate::memory::{Memory, SlidingWindowMemory};
 use crate::tool_router::{
-    ExecutedToolCall, ToolHost, aggregate_tools, json_to_prost_struct, prost_struct_to_json,
+    ExecutedToolCall, ToolAttachment, ToolHost, aggregate_tools, json_to_prost_struct,
+    prost_struct_to_json,
 };
 use tokio_stream::StreamExt;
 
@@ -67,6 +68,11 @@ pub struct AgentOutput {
     pub turns: usize,
     /// Model-reported finish reason (e.g. `stop`, `tool_calls`, `length`).
     pub finish_reason: Option<String>,
+    /// Rich media produced by the executed tool calls, deduplicated in execution order.
+    ///
+    /// The pipeline turns these into image/file segments on the outbound message, which is how a
+    /// drawing tool's output reaches the chat platform instead of only its text description.
+    pub attachments: Vec<ToolAttachment>,
 }
 
 /// Pluggable tool abstraction for in-process or native agent tools.
@@ -312,6 +318,7 @@ impl Agent {
         tools.extend(aggregate_tools(hosts));
 
         let mut executed_tools = Vec::new();
+        let mut attachments: Vec<ToolAttachment> = Vec::new();
         let mut iterations = 0;
 
         // 4. Reasoning and tool execution loop
@@ -364,6 +371,7 @@ impl Agent {
                     executed_tools,
                     turns: iterations + 1,
                     finish_reason: response.finish_reason,
+                    attachments,
                 });
             }
 
@@ -393,6 +401,7 @@ impl Agent {
                     executed_tools,
                     turns: iterations + 1,
                     finish_reason: Some("max_iterations".to_string()),
+                    attachments,
                 });
             }
 
@@ -538,6 +547,17 @@ impl Agent {
                             host_id: target_host.host_id().to_string(),
                             success: is_success,
                         });
+
+                        // Attachments of a failed call are discarded with it: a partial image from
+                        // an errored tool would be sent to the user as if it were a result.
+                        if is_success {
+                            for attachment in resp.attachments {
+                                let attachment = ToolAttachment::from_proto(attachment);
+                                if !attachments.contains(&attachment) {
+                                    attachments.push(attachment);
+                                }
+                            }
+                        }
 
                         let result_str = if !is_success {
                             format!("Error: {}", resp.error_message)

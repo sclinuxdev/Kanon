@@ -95,6 +95,7 @@ impl ToolHost for MockHost {
                 success: true,
                 error_message: String::new(),
                 payload: Some(tool_call_response::Payload::StructuredResult(result_struct)),
+                attachments: Vec::new(),
             })
         } else {
             Err(tonic::Status::not_found("Tool not found"))

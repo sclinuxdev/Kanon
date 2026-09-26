@@ -10,7 +10,8 @@ use kanon_llm::gateway::types::{ChatRequest, ChatResponse, ToolCall};
 use kanon_llm::memory::ConversationManager;
 use kanon_llm::tool_router::{ToolHost, ToolRouter, json_to_prost_struct, prost_struct_to_json};
 use kanon_proto::v1::{
-    PluginMeta, ToolCallRequest, ToolCallResponse, ToolMeta, tool_call_request, tool_call_response,
+    PluginMeta, ToolAttachment, ToolCallRequest, ToolCallResponse, ToolMeta, tool_call_request,
+    tool_call_response,
 };
 
 /// Mock LLM provider that simulates multi-turn reasoning and tool invocation responses.
@@ -99,6 +100,22 @@ impl ToolHost for MockToolHost {
                 success: true,
                 error_message: String::new(),
                 payload: Some(tool_call_response::Payload::StructuredResult(result_struct)),
+                attachments: Vec::new(),
+            })
+        } else if req.tool_name == "draw_card" {
+            // A drawing tool: the result is a file the platform must deliver, not just text.
+            let result_struct =
+                json_to_prost_struct(&serde_json::json!({ "content": "card rendered" })).unwrap();
+            Ok(ToolCallResponse {
+                call_id: req.call_id,
+                success: true,
+                error_message: String::new(),
+                payload: Some(tool_call_response::Payload::StructuredResult(result_struct)),
+                attachments: vec![ToolAttachment {
+                    mime_type: "image/png".to_string(),
+                    file_path: Some("/tmp/kanon-test/card.png".to_string()),
+                    url: None,
+                }],
             })
         } else if req.tool_name == "add_numbers" {
             let structured_args = match req.payload {
@@ -124,6 +141,7 @@ impl ToolHost for MockToolHost {
                 success: true,
                 error_message: String::new(),
                 payload: Some(tool_call_response::Payload::StructuredResult(result_struct)),
+                attachments: Vec::new(),
             })
         } else {
             Err(tonic::Status::not_found(format!(
@@ -228,6 +246,58 @@ async fn test_tool_router_successful_tool_loop() {
         history[3].content.as_deref(),
         Some("The sum of 15 and 27 is 42.")
     );
+}
+
+#[tokio::test]
+async fn test_tool_router_surfaces_tool_attachments() {
+    let tool = ToolMeta {
+        name: "draw_card".to_string(),
+        description: "Draws a card".to_string(),
+        parameters: None,
+    };
+    let host = Arc::new(MockToolHost::with_plugin(
+        "host_draw",
+        "org.draw",
+        vec![tool],
+    ));
+
+    let provider = Arc::new(MockLlmProvider::new(vec![
+        ChatResponse {
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "call_draw_1".to_string(),
+                name: "draw_card".to_string(),
+                arguments: serde_json::json!({}),
+            }],
+            finish_reason: Some("tool_calls".to_string()),
+            usage: None,
+        },
+        ChatResponse {
+            content: Some("Here is your card.".to_string()),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+        },
+    ]));
+
+    let memory = Arc::new(ConversationManager::new(10));
+    let router = ToolRouter::new(provider, memory, "test-model");
+    let hosts: Vec<Arc<dyn ToolHost>> = vec![host];
+
+    let output = router
+        .execute("session-attach", "draw me a card", &hosts)
+        .await
+        .expect("router execution");
+
+    // The attachment must survive the reasoning loop: the pipeline turns it into a message
+    // segment, so dropping it here would silently reduce a picture to its caption.
+    assert_eq!(output.attachments.len(), 1);
+    assert_eq!(output.attachments[0].mime_type, "image/png");
+    assert_eq!(
+        output.attachments[0].file_path.as_deref(),
+        Some("/tmp/kanon-test/card.png")
+    );
+    assert_eq!(output.content, "Here is your card.");
 }
 
 #[tokio::test]

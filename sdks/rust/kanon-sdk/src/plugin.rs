@@ -59,6 +59,9 @@ pub trait Plugin: Send + Sync + 'static {
             success: true,
             error_message: String::new(),
             payload: None,
+            // Tools that draw or fetch files declare them here; the core forwards them to the
+            // outbound message.
+            attachments: Vec::new(),
         })
     }
 

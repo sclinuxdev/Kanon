@@ -102,6 +102,17 @@ async fn main() -> StartupResult<()> {
             .await
             .map_err(|err| format!("Failed to load the MCP configuration: {err}"))?,
     );
+    // Attachments written by earlier runs are swept here: they only need to outlive the delivery
+    // attempt that follows their tool call, and leaving them would grow the data directory forever.
+    match kanon_core::prune_attachments(
+        std::path::Path::new(kanon_core::DEFAULT_ATTACHMENT_DIR),
+        kanon_core::ATTACHMENT_RETENTION,
+    ) {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(count, "Swept stale tool attachments"),
+        Err(err) => tracing::warn!(error = %err, "Failed to sweep stale tool attachments"),
+    }
+
     let mcp_pool = Arc::new(McpPool::new());
     mcp_pool.sync_from_config(&mcp_config).await;
     let mcp_server_count = mcp_pool.describe().await.len();

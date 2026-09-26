@@ -231,6 +231,19 @@ message ToolCallResponse {
     google.protobuf.Struct structured_result = 4;
     bytes raw_bytes = 5;
   }
+  // Rich media produced by the tool (images, files). The core forwards these to the outbound
+  // message as attachments, so a tool that draws a picture is not reduced to a text description.
+  repeated ToolAttachment attachments = 6;
+}
+
+// One attachment produced by a tool call.
+message ToolAttachment {
+  // MIME type of the payload, e.g. `image/png`.
+  string mime_type = 1;
+  // Absolute path of a file the core wrote the bytes to.
+  optional string file_path = 2;
+  // Remote URL, when the tool referenced one instead of embedding bytes.
+  optional string url = 3;
 }
 
 message EventNotification {

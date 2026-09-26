@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use kanon_core::instance::{InstanceDraft, InstanceRegistry, ItemPolicy};
 use kanon_core::mcp::{
-    McpConfigStore, McpPool, McpServer, McpServerConfig, McpTransport, host_id,
+    McpConfigStore, McpPool, McpServer, McpServerConfig, McpTransport, host_id, prune_attachments,
     qualified_tool_name, unqualified_tool_name,
 };
 use kanon_core::toggle::{MCP_SECTION, ToggleStore};
@@ -32,9 +32,16 @@ while IFS= read -r line; do
     *'"initialize"'*)
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id" ;;
     *'"tools/list"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo a string","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}\n' "$id" ;;
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo a string","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}},{"name":"chart","description":"Draws a chart","inputSchema":{"type":"object"}},{"name":"broken_image","description":"Returns corrupt image data","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
     *'"tools/call"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}]}}\n' "$id" ;;
+      case "$line" in
+        *'"name":"chart"'*)
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"chart text"},{"type":"image","mimeType":"image/png","data":"%s"}]}}\n' "$id" "$FAKE_IMAGE_BASE64" ;;
+        *'"name":"broken_image"'*)
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"image","mimeType":"image/png","data":"not-base64!!"}]}}\n' "$id" ;;
+        *)
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}]}}\n' "$id" ;;
+      esac ;;
   esac
 done
 "#,
@@ -56,7 +63,12 @@ fn fixture_config(script: &Path, id: &str) -> McpServerConfig {
         transport: McpTransport::Stdio {
             command: script.to_string_lossy().to_string(),
             args: Vec::new(),
-            env: HashMap::new(),
+            // A 1x1 PNG, base64 encoded: the smallest real image the attachment path can carry.
+            env: HashMap::from([(
+                "FAKE_IMAGE_BASE64".to_string(),
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+                    .to_string(),
+            )]),
         },
     }
 }
@@ -71,14 +83,14 @@ async fn connect_handshakes_and_exposes_qualified_tools() {
 
     let health = server.health().await;
     assert_eq!(health.state, "connected");
-    assert_eq!(health.tools, 1);
+    assert_eq!(health.tools, 3);
     assert_eq!(health.failures, 0);
     assert_eq!(health.last_error, None);
 
     let metas = server.plugin_metas();
     assert_eq!(metas.len(), 1);
     assert_eq!(metas[0].id, host_id("fake"));
-    assert_eq!(metas[0].tools.len(), 1);
+    assert_eq!(metas[0].tools.len(), 3);
     // The model-facing name is namespaced by server so two servers may expose the same tool.
     assert_eq!(metas[0].tools[0].name, qualified_tool_name("fake", "echo"));
     assert_eq!(
@@ -176,6 +188,120 @@ async fn instance_with_policy(
 }
 
 #[tokio::test]
+async fn stale_attachments_are_swept_but_fresh_ones_survive() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let attachments = dir.path().join("attachments");
+    std::fs::create_dir_all(&attachments).expect("attachments dir");
+
+    let stale = attachments.join("stale.png");
+    let fresh = attachments.join("fresh.png");
+    std::fs::write(&stale, b"old").expect("stale file");
+    std::fs::write(&fresh, b"new").expect("fresh file");
+
+    // Backdate one file beyond the retention window without pulling in a dependency.
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .expect("open stale")
+        .set_times(std::fs::FileTimes::new().set_modified(long_ago))
+        .expect("backdate");
+
+    let removed = prune_attachments(
+        &attachments,
+        std::time::Duration::from_secs(3 * 24 * 60 * 60),
+    )
+    .expect("prune");
+
+    assert_eq!(removed, 1);
+    assert!(!stale.exists(), "the stale attachment must be swept");
+    assert!(fresh.exists(), "a fresh attachment must survive");
+}
+
+#[tokio::test]
+async fn the_watchdog_connects_an_unused_server_instead_of_failing_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = write_fixture_server(dir.path());
+    let server = McpServer::new(fixture_config(&script, "fake"))
+        .with_attachment_dir(dir.path().join("attachments"));
+
+    // A node that just started has not needed any server yet: the first watchdog pass must
+    // establish the connection, not record "not connected" as a failure.
+    server.probe().await.expect("first probe connects");
+    assert!(server.is_connected().await);
+    let health = server.health().await;
+    assert_eq!(health.state, "connected");
+    assert_eq!(health.failures, 0);
+
+    // The next pass probes the live connection.
+    server.probe().await.expect("second probe refreshes");
+    assert_eq!(server.health().await.state, "connected");
+}
+
+#[tokio::test]
+async fn image_content_becomes_a_file_the_platform_can_send() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = write_fixture_server(dir.path());
+    let attachments = dir.path().join("attachments");
+    let server =
+        McpServer::new(fixture_config(&script, "fake")).with_attachment_dir(attachments.clone());
+
+    let response = server
+        .call_tool(ToolCallRequest {
+            call_id: "call-chart".to_string(),
+            tool_name: qualified_tool_name("fake", "chart"),
+            session_id: String::new(),
+            payload: None,
+        })
+        .await
+        .expect("tool call");
+    assert!(response.success, "{}", response.error_message);
+
+    // The text still reaches the model ...
+    let payload = match response.payload {
+        Some(kanon_proto::v1::tool_call_response::Payload::StructuredResult(result)) => {
+            kanon_llm::tool_router::prost_struct_to_json(result)
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    };
+    assert_eq!(payload["content"], serde_json::json!("chart text"));
+
+    // ... and the picture is materialized where the outbound adapter can pick it up.
+    assert_eq!(response.attachments.len(), 1);
+    let attachment = &response.attachments[0];
+    assert_eq!(attachment.mime_type, "image/png");
+    let path = std::path::PathBuf::from(attachment.file_path.as_deref().expect("file path"));
+    assert!(path.is_absolute(), "{}", path.display());
+    assert!(path.starts_with(&attachments), "{}", path.display());
+    let bytes = std::fs::read(&path).expect("attachment bytes");
+    // PNG magic: proves the base64 payload survived decoding intact.
+    assert_eq!(
+        &bytes[..8],
+        &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]
+    );
+}
+
+#[tokio::test]
+async fn an_undecodable_image_is_reported_instead_of_vanishing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = write_fixture_server(dir.path());
+    let server = McpServer::new(fixture_config(&script, "fake"))
+        .with_attachment_dir(dir.path().join("attachments"));
+
+    let outcome = server
+        .call("broken_image", serde_json::json!({}))
+        .await
+        .expect("tool call");
+
+    assert!(outcome.attachments.is_empty());
+    assert!(
+        outcome.text.contains("not valid base64"),
+        "the reason must travel with the result: {}",
+        outcome.text
+    );
+}
+
+#[tokio::test]
 async fn pool_honours_the_global_switch_and_the_instance_policy() {
     let dir = tempfile::tempdir().expect("temp dir");
     let script = write_fixture_server(dir.path());
@@ -249,5 +375,5 @@ async fn a_connected_server_reuses_its_transport() {
     // process per tool call.
     server.connect().await.expect("second connect");
     assert_eq!(server.health().await.state, "connected");
-    assert_eq!(server.health().await.tools, 1);
+    assert_eq!(server.health().await.tools, 3);
 }

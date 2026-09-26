@@ -885,11 +885,41 @@ impl PipelineEngine {
                         return PipelineResult::Passed(filtered_event);
                     }
 
-                    let reply = MessageSegment {
+                    let mut replies = vec![MessageSegment {
                         segment: Some(Segment::Text(kanon_proto::v1::TextSegment {
                             content: answer.to_string(),
                         })),
-                    };
+                    }];
+
+                    // Rich media produced by a tool (an MCP server drawing a B50 card, for example)
+                    // travels as its own segment: the platform then shows the picture instead of a
+                    // sentence describing where it was written.
+                    for attachment in &output.attachments {
+                        let source = match (&attachment.file_path, &attachment.url) {
+                            (Some(path), _) => Some(
+                                kanon_proto::v1::image_segment::Source::FilePath(path.clone()),
+                            ),
+                            (None, Some(url)) => {
+                                Some(kanon_proto::v1::image_segment::Source::Url(url.clone()))
+                            }
+                            (None, None) => None,
+                        };
+                        let Some(source) = source else {
+                            tracing::warn!(
+                                mime_type = %attachment.mime_type,
+                                "Tool attachment has neither a file path nor a URL; dropping it"
+                            );
+                            continue;
+                        };
+                        replies.push(MessageSegment {
+                            segment: Some(Segment::Image(kanon_proto::v1::ImageSegment {
+                                source: Some(source),
+                                mime_type: Some(attachment.mime_type.clone()),
+                                filename: None,
+                            })),
+                        });
+                    }
+
                     self.observe(PipelineStage::LlmReplied {
                         event_id,
                         session_id,
@@ -897,7 +927,7 @@ impl PipelineEngine {
                     });
                     return PipelineResult::LlmReplied {
                         content: answer.to_string(),
-                        replies: vec![reply],
+                        replies,
                     };
                 }
                 Err(e) => {

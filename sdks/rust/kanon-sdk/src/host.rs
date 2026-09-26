@@ -376,6 +376,7 @@ impl<P: Plugin> MessagePipelineService for PipelineServiceImpl<P> {
                 success: false,
                 error_message: e.to_string(),
                 payload: None,
+                attachments: Vec::new(),
             })),
         }
     }

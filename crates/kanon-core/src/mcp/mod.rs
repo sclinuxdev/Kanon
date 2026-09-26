@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use kanon_llm::tool_router::{ToolHost, json_to_prost_struct};
+use kanon_llm::tool_router::{ToolAttachment, ToolHost, json_to_prost_struct};
 use kanon_proto::v1::{PluginMeta, ToolCallRequest, ToolCallResponse, ToolMeta};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -44,6 +44,31 @@ pub const MCP_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Consecutive failed probes before a server is parked as failed.
 pub const MCP_MAX_FAILURES: u32 = 3;
+
+/// Default directory receiving attachments materialized from tool results.
+pub const DEFAULT_ATTACHMENT_DIR: &str = "./data/attachments";
+
+/// How long an attachment file is kept before the next node start sweeps it.
+///
+/// An attachment only needs to outlive the delivery attempt that follows the tool call; keeping
+/// them forever would grow the data directory by one image per call.
+pub const ATTACHMENT_RETENTION: Duration = Duration::from_secs(3 * 24 * 60 * 60);
+
+/// Largest attachment the core forwards to an outbound message.
+///
+/// A tool result is transport for a user-visible file, not a data channel: anything larger would
+/// sit in memory and in the platform upload path for no benefit.
+pub const MCP_MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Largest number of attachments forwarded from one tool result.
+pub const MCP_MAX_ATTACHMENTS: usize = 4;
+
+/// Longest raw JSON fallback handed to the model when a tool replies with neither text nor
+/// attachments.
+///
+/// MCP servers may answer with structured content of any size; passing it through unbounded would
+/// let a single call consume the whole context window.
+pub const MCP_FALLBACK_TEXT_LIMIT: usize = 2000;
 
 /// Failures raised while configuring or talking to MCP servers.
 #[derive(Debug, Error)]
@@ -342,6 +367,15 @@ impl Default for McpHealth {
     }
 }
 
+/// Result of one MCP tool call: the text for the model plus any rich media to deliver.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct McpToolOutcome {
+    /// Text handed to the model as the tool result.
+    pub text: String,
+    /// Files materialized from the result so they can be attached to the reply.
+    pub attachments: Vec<ToolAttachment>,
+}
+
 /// One MCP server, adapted to the [`ToolHost`] contract.
 pub struct McpServer {
     /// Static configuration.
@@ -359,6 +393,10 @@ pub struct McpServer {
     health: Mutex<McpHealth>,
     /// Monotonic JSON-RPC request id.
     next_request_id: std::sync::atomic::AtomicU64,
+    /// Directory receiving attachments materialized from tool results.
+    attachment_dir: PathBuf,
+    /// Monotonic suffix keeping attachment file names unique within one process.
+    attachment_seq: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -380,7 +418,18 @@ impl McpServer {
             meta: std::sync::RwLock::new(Vec::new()),
             health: Mutex::new(McpHealth::default()),
             next_request_id: std::sync::atomic::AtomicU64::new(1),
+            attachment_dir: PathBuf::from(DEFAULT_ATTACHMENT_DIR),
+            attachment_seq: std::sync::atomic::AtomicU64::new(1),
         }
+    }
+
+    /// Overrides where attachments from this server are written.
+    ///
+    /// The pool points every server at the node's data directory; tests point them at a temporary
+    /// directory so a tool result can never litter the repository.
+    pub fn with_attachment_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.attachment_dir = dir.into();
+        self
     }
 
     /// Configuration of this server.
@@ -391,6 +440,35 @@ impl McpServer {
     /// Current health snapshot.
     pub async fn health(&self) -> McpHealth {
         self.health.lock().await.clone()
+    }
+
+    /// Whether a transport is currently open.
+    pub async fn is_connected(&self) -> bool {
+        self.connection.lock().await.is_some()
+    }
+
+    /// One watchdog pass: proves the server still answers and keeps health up to date.
+    ///
+    /// A server that has never been used (or was dropped after a failure) is *connected* rather
+    /// than probed: reporting "not connected" as a failure would park a perfectly healthy server
+    /// as broken simply because no conversation had needed it yet. Health bookkeeping happens
+    /// exactly once per pass, inside [`McpServer::connect`] or here.
+    pub async fn probe(&self) -> Result<(), McpError> {
+        if !self.is_connected().await {
+            return self.connect().await;
+        }
+
+        match self.refresh_tools().await {
+            Ok(()) => {
+                self.record_success().await;
+                Ok(())
+            }
+            Err(err) => {
+                self.disconnect().await;
+                self.record_failure(&err).await;
+                Err(err)
+            }
+        }
     }
 
     /// Connects (if needed), performs the MCP handshake and refreshes the tool list.
@@ -572,7 +650,11 @@ impl McpServer {
     }
 
     /// Calls one tool by its *MCP* name (unqualified).
-    pub async fn call(&self, tool: &str, arguments: serde_json::Value) -> Result<String, McpError> {
+    pub async fn call(
+        &self,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<McpToolOutcome, McpError> {
         self.connect().await?;
 
         let response = self
@@ -582,20 +664,120 @@ impl McpServer {
             )
             .await?;
 
-        // MCP returns `content: [{type: "text", text: ...}]`; anything else is passed through as
-        // JSON so the model still sees a result instead of an empty string.
+        let mut texts: Vec<String> = Vec::new();
+        // Reasons an attachment was dropped travel with the text: a missing picture must be
+        // visible to the operator instead of silently vanishing from the conversation.
+        let mut notes: Vec<String> = Vec::new();
+        let mut attachments: Vec<ToolAttachment> = Vec::new();
+
         if let Some(items) = response.get("content").and_then(|value| value.as_array()) {
-            let text: Vec<String> = items
-                .iter()
-                .filter_map(|item| item.get("text").and_then(|text| text.as_str()))
-                .map(str::to_string)
-                .collect();
-            if !text.is_empty() {
-                return Ok(text.join("\n"));
+            for item in items {
+                match item.get("type").and_then(|value| value.as_str()) {
+                    Some("text") => {
+                        if let Some(text) = item.get("text").and_then(|value| value.as_str()) {
+                            texts.push(text.to_string());
+                        }
+                    }
+                    Some("image") => {
+                        let mime = item
+                            .get("mimeType")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("application/octet-stream");
+                        let Some(data) = item.get("data").and_then(|value| value.as_str()) else {
+                            notes
+                                .push(format!("[attachment skipped: {mime} item carries no data]"));
+                            continue;
+                        };
+                        if attachments.len() >= MCP_MAX_ATTACHMENTS {
+                            notes.push(format!(
+                                "[attachment skipped: at most {MCP_MAX_ATTACHMENTS} attachments are forwarded per call]"
+                            ));
+                            continue;
+                        }
+                        match self.store_attachment(mime, data) {
+                            Ok(attachment) => attachments.push(attachment),
+                            Err(reason) => notes.push(format!("[attachment skipped: {reason}]")),
+                        }
+                    }
+                    // Unsupported content kinds (audio, resources, ...) are ignored rather than
+                    // guessed at; the text items still describe the result.
+                    _ => {}
+                }
             }
         }
 
-        Ok(response.to_string())
+        texts.extend(notes);
+        let text = if !texts.is_empty() {
+            texts.join("\n")
+        } else if !attachments.is_empty() {
+            let kinds: Vec<&str> = attachments
+                .iter()
+                .map(|attachment| attachment.mime_type.as_str())
+                .collect();
+            format!(
+                "[tool returned {} attachment(s): {}]",
+                attachments.len(),
+                kinds.join(", ")
+            )
+        } else {
+            // Structured content the model can still read, bounded so one call cannot consume the
+            // whole context window.
+            truncate_for_model(&response.to_string(), MCP_FALLBACK_TEXT_LIMIT)
+        };
+
+        Ok(McpToolOutcome { text, attachments })
+    }
+
+    /// Decodes one base64 attachment and writes it beside the node's data.
+    ///
+    /// Returns a human-readable reason on failure; the caller turns it into a note in the tool
+    /// result so a dropped picture is never mistaken for a successful one.
+    fn store_attachment(&self, mime: &str, data: &str) -> Result<ToolAttachment, String> {
+        use base64::Engine;
+
+        // Some servers inline a full data URL instead of raw base64.
+        let payload = data
+            .split_once(";base64,")
+            .map(|(_, encoded)| encoded)
+            .unwrap_or(data)
+            .trim();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|err| format!("{mime} is not valid base64: {err}"))?;
+
+        if bytes.len() > MCP_MAX_ATTACHMENT_BYTES {
+            return Err(format!(
+                "{mime} is {} bytes, above the {} byte limit",
+                bytes.len(),
+                MCP_MAX_ATTACHMENT_BYTES
+            ));
+        }
+
+        std::fs::create_dir_all(&self.attachment_dir)
+            .map_err(|err| format!("failed to create {}: {err}", self.attachment_dir.display()))?;
+
+        let seq = self
+            .attachment_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or_default();
+        let path = self
+            .attachment_dir
+            .join(format!("{stamp}-{seq}.{}", extension_for_mime(mime)));
+
+        std::fs::write(&path, &bytes)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+
+        // The path crosses a process boundary (the adapter plugin opens it), so it is handed over
+        // absolute: a relative path would resolve against whatever directory that host runs in.
+        let absolute = std::fs::canonicalize(&path).unwrap_or(path);
+        Ok(ToolAttachment {
+            mime_type: mime.to_string(),
+            file_path: Some(absolute.to_string_lossy().to_string()),
+            url: None,
+        })
     }
 
     /// Sends one JSON-RPC request and waits for its response.
@@ -801,6 +983,7 @@ impl ToolHost for McpServer {
                     req.tool_name, self.config.id
                 ),
                 payload: None,
+                attachments: Vec::new(),
             });
         };
 
@@ -812,9 +995,16 @@ impl ToolHost for McpServer {
         };
 
         match self.call(&tool, arguments).await {
-            Ok(text) => {
-                let result = json_to_prost_struct(&serde_json::json!({ "content": text }))
+            Ok(outcome) => {
+                let result = json_to_prost_struct(&serde_json::json!({ "content": outcome.text }))
                     .unwrap_or_default();
+                // Attachments ride beside the text: the router forwards them to the pipeline, which
+                // turns them into message segments the platform can deliver.
+                let attachments = outcome
+                    .attachments
+                    .iter()
+                    .map(ToolAttachment::to_proto)
+                    .collect();
                 Ok(ToolCallResponse {
                     call_id: req.call_id,
                     success: true,
@@ -822,6 +1012,7 @@ impl ToolHost for McpServer {
                     payload: Some(
                         kanon_proto::v1::tool_call_response::Payload::StructuredResult(result),
                     ),
+                    attachments,
                 })
             }
             Err(err) => {
@@ -831,6 +1022,7 @@ impl ToolHost for McpServer {
                     success: false,
                     error_message: err.to_string(),
                     payload: None,
+                    attachments: Vec::new(),
                 })
             }
         }
@@ -838,16 +1030,33 @@ impl ToolHost for McpServer {
 }
 
 /// Every configured MCP server, connected on demand.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct McpPool {
     /// Servers by identifier.
     servers: RwLock<HashMap<String, Arc<McpServer>>>,
+    /// Directory receiving attachments materialized from tool results.
+    attachment_dir: PathBuf,
+}
+
+impl Default for McpPool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl McpPool {
-    /// Creates an empty pool.
+    /// Creates an empty pool writing attachments under the node's data directory.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            servers: RwLock::new(HashMap::new()),
+            attachment_dir: PathBuf::from(DEFAULT_ATTACHMENT_DIR),
+        }
+    }
+
+    /// Overrides where tool attachments are materialized.
+    pub fn with_attachment_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.attachment_dir = dir.into();
+        self
     }
 
     /// Rebuilds the pool from the configuration document.
@@ -861,7 +1070,9 @@ impl McpPool {
             match servers.get(&server.id) {
                 Some(existing) if existing.config() == &server => {}
                 _ => {
-                    servers.insert(server.id.clone(), Arc::new(McpServer::new(server)));
+                    let handle =
+                        McpServer::new(server).with_attachment_dir(self.attachment_dir.clone());
+                    servers.insert(handle.config().id.clone(), Arc::new(handle));
                 }
             }
         }
@@ -941,21 +1152,17 @@ impl McpPool {
                         continue;
                     }
 
-                    // `tools/list` doubles as the liveness probe: it proves the transport, the
-                    // handshake and the server's own dispatch loop are all working.
-                    match server.refresh_tools().await {
-                        Ok(()) => server.record_success().await,
-                        Err(err) => {
-                            server.disconnect().await;
-                            server.record_failure(&err).await;
-                            let failures = server.health.lock().await.failures;
-                            tracing::warn!(
-                                server = %server.config().id,
-                                failures,
-                                error = %err,
-                                "MCP server liveness probe failed; it will be reconnected on the next attempt"
-                            );
-                        }
+                    // `tools/list` (or the handshake, for a server not yet connected) doubles as the
+                    // liveness probe: it proves the transport, the handshake and the server's own
+                    // dispatch loop are all working.
+                    if let Err(err) = server.probe().await {
+                        let failures = server.health.lock().await.failures;
+                        tracing::warn!(
+                            server = %server.config().id,
+                            failures,
+                            error = %err,
+                            "MCP server liveness probe failed; it will be reconnected on the next attempt"
+                        );
                     }
                 }
             }
@@ -980,4 +1187,59 @@ impl McpServer {
             .map(|meta| meta.tools.len())
             .unwrap_or(0)
     }
+}
+
+/// File extension used for one MIME type.
+fn extension_for_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    }
+}
+
+/// Truncates a tool result so it can never flood the model context window.
+///
+/// Truncation happens on a character boundary and marks itself, so the model can tell a clipped
+/// result from a complete one.
+fn truncate_for_model(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let head: String = value.chars().take(limit).collect();
+    format!("{head}… [truncated at {limit} characters]")
+}
+
+/// Deletes attachment files older than `max_age` and reports how many were swept.
+///
+/// Called at node start: a file that has survived its retention window was either never delivered
+/// (and is already recorded in the dead-letter log) or has long since been sent.
+pub fn prune_attachments(dir: &Path, max_age: Duration) -> std::io::Result<usize> {
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+
+    let mut removed = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+            continue;
+        };
+        let Ok(age) = std::time::SystemTime::now().duration_since(modified) else {
+            continue;
+        };
+        if age >= max_age && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
 }

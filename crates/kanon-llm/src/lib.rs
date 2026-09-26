@@ -51,4 +51,6 @@ pub use summary::{ContextSummarizer, SummaryConfig, SummaryHook};
 pub use token::{
     estimate_conversation_tokens, estimate_message_tokens, estimate_text_tokens, estimate_tokens,
 };
-pub use tool_router::{ToolHost, ToolRouter, ToolRouterOutput, aggregate_tools};
+pub use tool_router::{
+    ToolAttachment, ToolHost, ToolRouter, ToolRouterOutput, aggregate_tools, resolve_tools,
+};

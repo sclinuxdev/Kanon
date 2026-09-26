@@ -3,12 +3,7 @@
 import grpc
 import warnings
 
-try:
-    from . import plugin_pb2 as plugin__pb2
-except ImportError:
-    # The generated module is also imported as a top-level module by plugin processes that put
-    # the proto directory itself on sys.path; keep both import styles working.
-    import plugin_pb2 as plugin__pb2
+import plugin_pb2 as plugin__pb2
 
 GRPC_GENERATED_VERSION = '1.84.0'
 GRPC_VERSION = grpc.__version__

@@ -117,6 +117,7 @@ impl Plugin for DemoPlugin {
                         fields: result_fields,
                     },
                 )),
+                attachments: Vec::new(),
             });
         }
 
@@ -125,6 +126,7 @@ impl Plugin for DemoPlugin {
             success: false,
             error_message: format!("Unknown tool: {}", req.tool_name),
             payload: None,
+            attachments: Vec::new(),
         })
     }
 }

@@ -138,6 +138,7 @@ impl MessagePipelineService for MockHostService {
             success: true,
             error_message: String::new(),
             payload: None,
+            attachments: Vec::new(),
         }))
     }
 

@@ -29,8 +29,9 @@ pub use manifest::{
     ToolDefinitionEntry,
 };
 pub use mcp::{
-    DEFAULT_MCP_CONFIG, MCP_WATCHDOG_INTERVAL, McpConfigStore, McpError, McpHealth, McpPool,
-    McpServer, McpServerConfig, McpTransport,
+    ATTACHMENT_RETENTION, DEFAULT_ATTACHMENT_DIR, DEFAULT_MCP_CONFIG, MCP_WATCHDOG_INTERVAL,
+    McpConfigStore, McpError, McpHealth, McpPool, McpServer, McpServerConfig, McpTransport,
+    prune_attachments,
 };
 pub use pipeline::{
     CommandRouter, DEFAULT_OUTBOUND_QUEUE_CAPACITY, DeliveryOutcome, MatchedCommand,
